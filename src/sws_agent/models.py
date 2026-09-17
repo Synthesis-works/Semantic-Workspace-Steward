@@ -19,7 +19,9 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from .constants import (
+    ApprovalStatus,
     AuthorizationDecision,
+    ClaimKind,
     EvidenceBasis,
     ExecutionMode,
     PotentialAction,
@@ -59,7 +61,7 @@ class ResourceRelationship(BaseModel):
     source_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
     relationship_type: str = Field(min_length=1)
-    basis: Any = EvidenceBasis.DETERMINISTIC
+    basis: EvidenceBasis = EvidenceBasis.DETERMINISTIC
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
@@ -143,3 +145,54 @@ class AnalysisReport(BaseModel):
     summary: str = ""
     observations: list[str] = Field(default_factory=list)
     cost_estimates: list[CostEstimate] = Field(default_factory=list)
+
+
+class ApprovalTicket(BaseModel):
+    """A human-approval ticket awaiting a decision.
+
+    Tickets model the human-approval boundary for future side-effecting
+    actions. A ticket enters the store as PENDING and may transition
+    exactly once to GRANTED, DENIED, or EXPIRED. Ticket creation and
+    transition are managed by the approval store (approval.py); this model
+    only validates the ticket's shape and enforces case-insensitive
+    normalization at the construction boundary.
+    """
+
+    ticket_id: str = Field(min_length=1)
+    resource_id: str = Field(min_length=1)
+    action: PotentialAction
+    rationale: str = ""
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    created_at: datetime
+    decided_at: datetime | None = None
+    decided_by: str = ""
+    decision_reason: str = ""
+
+    @field_validator("action", "status", mode="before")
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class ExplanationResult(BaseModel):
+    """Output of the optional natural-language explanation layer.
+
+    A null result carries ``text=None`` with a reason when no LLM provider
+    is configured; the rest of SWS must function fully in that state.
+    Explanations are always ``ClaimKind.INTERPRETED`` and never override
+    derived or observed claims.
+    """
+
+    text: str | None = None
+    claim_kind: ClaimKind = ClaimKind.INTERPRETED
+    provider: str = Field(min_length=1)
+    reason: str = ""
+
+    @field_validator("claim_kind", mode="before")
+    @classmethod
+    def _normalize_claim_kind(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value

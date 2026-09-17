@@ -123,6 +123,38 @@ class EvidenceBasis(str, enum.Enum):
     """Derived from semantic reasoning; never overrides deterministic evidence."""
 
 
+class ClaimKind(str, enum.Enum):
+    """Epistemic classification of any statement SWS produces.
+
+    Observed statements are recorded from authoritative sources, derived
+    statements come from deterministic analysis, and interpreted statements
+    are natural-language explanations from an optional LLM. Interpreted
+    claims never override derived or observed claims.
+    """
+
+    OBSERVED = "observed"
+    """Recorded fact from an authoritative, machine-readable source."""
+
+    DERIVED = "derived"
+    """Result of deterministic rule-based analysis over observed facts."""
+
+    INTERPRETED = "interpreted"
+    """Natural-language interpretation; may be absent when no LLM provider is configured."""
+
+
+class ApprovalStatus(str, enum.Enum):
+    """Lifecycle states of a human-approval ticket.
+
+    Tickets enter the store as PENDING and transition exactly once to
+    GRANTED, DENIED, or EXPIRED; no other transition is valid.
+    """
+
+    PENDING = "pending"
+    GRANTED = "granted"
+    DENIED = "denied"
+    EXPIRED = "expired"
+
+
 # ---------------------------------------------------------------------------
 # Resource-specific limits.
 # Lesson from SMS day one: do not reuse SMS's document-size limits for AWS

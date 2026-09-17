@@ -17,6 +17,7 @@ from typing import Any, Protocol, runtime_checkable
 from .models import (
     AnalysisReport,
     AuthorizationResult,
+    ExplanationResult,
     PolicyDecision,
     ResourceRecord,
 )
@@ -86,3 +87,18 @@ class ActionExecutor(Protocol):
     """
 
     def execute(self, resource: ResourceRecord, action: Any) -> Any: ...
+
+
+@runtime_checkable
+class ExplanationProvider(Protocol):
+    """Optional natural-language explanation of a resource or decision.
+
+    SWS must function fully when no explanation provider is registered;
+    the default NullExplanationProvider returns an ExplanationResult with
+    ``text=None``. Explanations are interpreted claims only and never
+    influence policy, authorization, or risk decisions.
+    """
+
+    def explain(
+        self, resource: ResourceRecord, decision: PolicyDecision
+    ) -> ExplanationResult: ...

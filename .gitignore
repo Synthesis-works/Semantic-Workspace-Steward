@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets (never commit real credentials)
+.env
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Experimental throwaway scripts live under scripts/experiments and are
+# not committed (see docs/reuse-decisions.md, experiments lesson).
+scripts/experiments/*
+!scripts/experiments/.gitkeep

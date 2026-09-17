@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sws-agent"
+version = "0.1.0"
+description = "Semantic Workspace Steward (SWS) - semantic governance and workspace intelligence for an individual AWS account."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Synthesis-works" }]
+keywords = ["aws", "governance", "semantic", "mcp", "inventory"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+
+# Minimal foundation runtime. boto3 and the MCP SDK are deferred until the
+# corresponding AWS collectors and MCP wiring are genuinely implemented.
+dependencies = [
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Synthesis-works/Semantic-Workspace-Steward"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

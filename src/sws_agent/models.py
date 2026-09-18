@@ -31,7 +31,13 @@ from .constants import (
 
 
 class ResourceRecord(BaseModel):
-    """A discovered AWS resource and its collected metrics."""
+    """A discovered AWS resource and its collected metrics.
+
+    ``arn`` and ``account_id`` are additive canonical identity fields added
+    in M2C-A. Collectors do not populate them; the canonicalization layer
+    (canonical.py) derives them deterministically after collection. Both
+    default to ``None`` so existing M2B constructions remain valid.
+    """
 
     resource_id: str = Field(min_length=1)
     resource_type: SWSResourceType
@@ -41,6 +47,8 @@ class ResourceRecord(BaseModel):
     created_at: datetime | None = None
     metrics: dict[str, float] = Field(default_factory=dict)
     raw: dict[str, Any] = Field(default_factory=dict)
+    arn: str | None = Field(default=None, min_length=1)
+    account_id: str | None = Field(default=None, pattern=r"^[0-9]{12}$")
 
     @field_validator("resource_type", mode="before")
     @classmethod

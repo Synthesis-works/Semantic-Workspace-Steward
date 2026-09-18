@@ -155,6 +155,28 @@ class ApprovalStatus(str, enum.Enum):
     EXPIRED = "expired"
 
 
+class CollectionFailureCategory(str, enum.Enum):
+    """Classification of a failed collection step on an inventory run.
+
+    Collectors emit exactly one category on every FAILED inventory event
+    (Option A from the M2C-B design review). The workspace builder trusts
+    the collector's emission; if the metadata is ever absent it defensively
+    falls back on whether the resource type also produced a SUCCEEDED event.
+    """
+
+    PRIMARY = "primary"
+    """The primary list operation for a resource type failed; collection of
+    that type is incomplete, which makes the snapshot ``partial``."""
+
+    ENRICHMENT = "enrichment"
+    """A resource record was preserved but one enrichment lookup (region or
+    tags) failed for it; the resource itself is still reported."""
+
+    PARSE = "parse"
+    """A returned API item was skipped because it could not be parsed (for
+    example a Lambda function with a missing or malformed ARN)."""
+
+
 # ---------------------------------------------------------------------------
 # Resource-specific limits.
 # Lesson from SMS day one: do not reuse SMS's document-size limits for AWS
@@ -216,6 +238,11 @@ SWS_SUPPORTED_RESOURCE_TYPES: Final[frozenset[str]] = frozenset(
     resource.value for resource in SWSResourceType
 )
 """The complete set of canonical resource types."""
+
+SWS_SUPPORTED_COLLECTION_FAILURE_CATEGORIES: Final[frozenset[str]] = frozenset(
+    category.value for category in CollectionFailureCategory
+)
+"""The complete set of canonical collection-failure categories."""
 
 SWS_SUPPORTED_EXECUTION_MODES: Final[frozenset[str]] = frozenset(
     mode.value for mode in ExecutionMode

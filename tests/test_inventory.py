@@ -10,7 +10,12 @@ from datetime import datetime, timezone
 
 import pytest
 
-from sws_agent.constants import SWSResourceType, TraceEventType, TraceStatus
+from sws_agent.constants import (
+    CollectionFailureCategory,
+    SWSResourceType,
+    TraceEventType,
+    TraceStatus,
+)
 from sws_agent.inventory import (
     INVENTORY_COLLECTORS,
     LambdaFunctionCollector,
@@ -18,6 +23,7 @@ from sws_agent.inventory import (
     UnsupportedResourceTypeError,
     collect_all,
     collect_resource_type,
+    normalize_limit,
 )
 from sws_agent.models import ResourceRecord
 from sws_agent.trace import TraceRecorder
@@ -353,6 +359,58 @@ def test_lambda_limit_enforces_early_stop_without_extra_calls():
     assert client.list_calls == 2
 
 
+def test_lambda_truncation_metadata_on_mid_page_and_next_marker_stops():
+    def succeeded(trace):
+        return [
+            e for e in trace
+            if e.event_type is TraceEventType.INVENTORY_QUERY
+            and e.status is TraceStatus.SUCCEEDED
+        ][0]
+
+    mid_page = FakeLambdaClient(pages=[[_function("f1"), _function("f2"), _function("f3")]])
+    trace = TraceRecorder()
+    LambdaFunctionCollector(mid_page, regions=["us-east-1"], trace=trace).collect(limit=2)
+    assert succeeded(trace).metadata.get("truncated") is True
+
+    next_marker = FakeLambdaClient(
+        pages=[[_function("f1"), _function("f2")], [_function("f3"), _function("f4")]]
+    )
+    trace = TraceRecorder()
+    LambdaFunctionCollector(next_marker, regions=["us-east-1"], trace=trace).collect(limit=2)
+    assert succeeded(trace).metadata.get("truncated") is True
+
+
+def test_lambda_exact_count_with_no_more_data_is_not_truncated():
+    client = FakeLambdaClient(pages=[[_function("f1"), _function("f2")]])
+    trace = TraceRecorder()
+    records = LambdaFunctionCollector(client, regions=["us-east-1"], trace=trace).collect(limit=2)
+    assert [r.name for r in records] == ["f1", "f2"]
+    succeed = [
+        e for e in trace
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.SUCCEEDED
+    ][0]
+    assert "truncated" not in succeed.metadata
+
+
+def test_lambda_full_consumption_is_never_truncated():
+    client = FakeLambdaClient(
+        pages=[
+            [_function("f1"), _function("f2")],
+            [_function("f3"), _function("f4")],
+        ]
+    )
+    trace = TraceRecorder()
+    records = LambdaFunctionCollector(client, regions=["us-east-1"], trace=trace).collect(limit=4)
+    assert [r.name for r in records] == ["f1", "f2", "f3", "f4"]
+    succeed = [
+        e for e in trace
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.SUCCEEDED
+    ][0]
+    assert "truncated" not in succeed.metadata
+
+
 def test_lambda_primary_list_failure_returns_empty_fail_closed():
     client = FakeLambdaClient(
         pages=[[_function("f1")]],
@@ -431,6 +489,44 @@ def test_s3_limit_stops_enrichment_too():
     assert set(client.tag_calls) == {"bucket-0", "bucket-1"}
 
 
+def test_s3_truncation_metadata_only_when_more_buckets_than_limit():
+    def succeeded(trace):
+        return [
+            e for e in trace
+            if e.event_type is TraceEventType.INVENTORY_QUERY
+            and e.status is TraceStatus.SUCCEEDED
+        ][0]
+
+    buckets = [_bucket(f"bucket-{i}") for i in range(3)]
+    padded = FakeS3Client(buckets=buckets, locations={})
+    trace = TraceRecorder()
+    assert len(S3BucketCollector(padded, trace=trace).collect(limit=2)) == 2
+    assert succeeded(trace).metadata.get("truncated") is True
+
+    exact = FakeS3Client(buckets=buckets[:2], locations={})
+    trace = TraceRecorder()
+    assert len(S3BucketCollector(exact, trace=trace).collect(limit=2)) == 2
+    assert "truncated" not in succeeded(trace).metadata
+
+    roomy = FakeS3Client(buckets=buckets, locations={})
+    trace = TraceRecorder()
+    assert len(S3BucketCollector(roomy, trace=trace).collect(limit=3)) == 3
+    assert "truncated" not in succeeded(trace).metadata
+
+
+def test_s3_exact_count_with_no_extra_buckets_is_not_truncated():
+    client = FakeS3Client(buckets=[_bucket("a"), _bucket("b")], locations={})
+    trace = TraceRecorder()
+    records = S3BucketCollector(client, trace=trace).collect(limit=2)
+    assert [r.resource_id for r in records] == ["a", "b"]
+    succeed = [
+        e for e in trace
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.SUCCEEDED
+    ][0]
+    assert "truncated" not in succeed.metadata
+
+
 def test_trace_records_start_and_success_with_exact_count():
     client = FakeS3Client(
         buckets=[_bucket("a"), _bucket("b"), _bucket("c")], locations={}
@@ -503,3 +599,89 @@ def test_unsupported_resource_types_raise():
     ):
         with pytest.raises(UnsupportedResourceTypeError):
             collect_resource_type(resource_type, client=client)
+
+
+def _failed_events(trace):
+    return [
+        e for e in trace
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.FAILED
+    ]
+
+
+def test_failure_events_carry_primary_category_for_s3_list_failure():
+    client = FakeS3Client(buckets=[_bucket("x")], list_error=RuntimeError("boom"))
+    trace = TraceRecorder()
+    assert S3BucketCollector(client, trace=trace).collect() == []
+    failures = _failed_events(trace)
+    assert len(failures) == 1
+    assert failures[0].metadata["category"] == CollectionFailureCategory.PRIMARY.value
+
+
+def test_failure_events_carry_enrichment_category_for_s3_lookups():
+    client = FakeS3Client(
+        buckets=[_bucket("denied")],
+        locations={},
+        location_errors={"denied"},
+        tag_errors={"denied"},
+    )
+    trace = TraceRecorder()
+    S3BucketCollector(client, trace=trace).collect()
+    failures = _failed_events(trace)
+    assert len(failures) == 2
+    assert all(
+        f.metadata["category"] == CollectionFailureCategory.ENRICHMENT.value
+        for f in failures
+    )
+    assert {f.metadata["resource_id"] for f in failures} == {"denied"}
+
+
+def test_failure_events_carry_primary_category_for_lambda_list_failure():
+    client = FakeLambdaClient(pages=[[_function("f1")]], list_error=RuntimeError("boom"))
+    trace = TraceRecorder()
+    assert LambdaFunctionCollector(client, regions=["us-east-1"], trace=trace).collect() == []
+    failures = _failed_events(trace)
+    assert len(failures) == 1
+    assert failures[0].metadata["category"] == CollectionFailureCategory.PRIMARY.value
+
+
+def test_failure_events_carry_parse_category_for_lambda_skips():
+    bad_no_arn = _function("noarn")
+    del bad_no_arn["FunctionArn"]
+    client = FakeLambdaClient(
+        pages=[[_function("malformed", "not-an-arn"), bad_no_arn]]
+    )
+    trace = TraceRecorder()
+    LambdaFunctionCollector(client, regions=["us-east-1"], trace=trace).collect()
+    failures = _failed_events(trace)
+    assert len(failures) == 2
+    assert all(
+        f.metadata["category"] == CollectionFailureCategory.PARSE.value
+        for f in failures
+    )
+
+
+def test_failure_events_carry_enrichment_category_for_lambda_tags():
+    arn = "arn:aws:lambda:us-east-1:123456789012:function:denied"
+    client = FakeLambdaClient(
+        pages=[[_function("denied", arn)]],
+        tag_errors={arn},
+    )
+    trace = TraceRecorder()
+    LambdaFunctionCollector(client, regions=["us-east-1"], trace=trace).collect()
+    failures = _failed_events(trace)
+    assert len(failures) == 1
+    assert (
+        failures[0].metadata["category"]
+        == CollectionFailureCategory.ENRICHMENT.value
+    )
+    assert failures[0].metadata["resource_id"] == arn
+
+
+def test_normalize_limit_public_routine_defaults_validates_passthrough():
+    assert normalize_limit(None) == 100
+    assert normalize_limit(5) == 5
+    assert normalize_limit(5000) == 5000  # positive limits pass through unchanged
+    for bad in (0, -1, "5", True, 3.5):
+        with pytest.raises(ValueError):
+            normalize_limit(bad)

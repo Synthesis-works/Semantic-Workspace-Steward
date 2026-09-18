@@ -17,8 +17,10 @@ from sws_agent.constants import (
     MAX_TRACE_EVENTS,
     SMS_DEPRECATED_ACTIONS,
     SWS_SUPPORTED_ACTIONS,
+    SWS_SUPPORTED_COLLECTION_FAILURE_CATEGORIES,
     SWS_SUPPORTED_EXECUTION_MODES,
     SWS_SUPPORTED_RESOURCE_TYPES,
+    CollectionFailureCategory,
     ExecutionMode,
     PotentialAction,
     SWSResourceType,
@@ -38,6 +40,16 @@ def test_resource_types_have_no_duplicate_values():
 def test_execution_modes_have_no_duplicate_values():
     values = [mode.value for mode in ExecutionMode]
     assert len(values) == len(set(values)), "execution mode enum contains duplicate values"
+
+
+def test_collection_failure_categories_have_no_duplicate_values():
+    values = [category.value for category in CollectionFailureCategory]
+    assert len(values) == len(set(values)), (
+        "collection failure category enum contains duplicate values"
+    )
+    assert SWS_SUPPORTED_COLLECTION_FAILURE_CATEGORIES == {
+        category.value for category in CollectionFailureCategory
+    }
 
 
 def test_action_vocabulary_never_drifts_into_sms_lifecycle_states():

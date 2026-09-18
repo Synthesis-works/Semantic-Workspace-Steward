@@ -11,6 +11,12 @@ actually returned. They never fabricate resources, timestamps, metrics,
 or enrichment results, and they never claim enrichment succeeded when the
 call failed.
 
+Trace metadata (M2C-B): every FAILED INVENTORY_QUERY event carries an
+explicit ``category`` (``primary`` / ``enrichment`` / ``parse``), and a
+SUCCEEDED event carries ``truncated: True`` only when collection genuinely
+encountered more data than it returned. ``truncated`` is never inferred
+from ``count == limit`` alone.
+
 Scope (approved M2B):
   - S3:  list_buckets, get_bucket_location, get_bucket_tagging.
          Versioning/encryption/policy/public-access enrichment is deferred.
@@ -24,6 +30,7 @@ from typing import Any, Callable
 
 from .constants import (
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
+    CollectionFailureCategory,
     SWSResourceType,
     TraceEventType,
 )
@@ -35,11 +42,14 @@ class UnsupportedResourceTypeError(ValueError):
     """Raised when dispatch requests a resource type without a collector."""
 
 
-def _normalize_limit(limit: int | None) -> int:
+def normalize_limit(limit: int | None) -> int:
     """Bound a caller-provided limit to the canonical inventory cap.
 
     ``None`` means the canonical default. Zero, negative, and non-integer
     values are rejected (matching the ``ge=1`` convention in config.py).
+    This is the public form of the collector's limit normalization; the
+    workspace builder (workspace.py) uses it so the effective per-type
+    limit is stored on the snapshot.
     """
     if limit is None:
         return MAX_RESOURCES_PER_INVENTORY_REQUEST
@@ -76,20 +86,32 @@ class _InventoryCollectorBase:
                 metadata={"resource_type": self._resource_type.value},
             )
 
-    def _trace_succeed(self, count: int) -> None:
+    def _trace_succeed(self, count: int, *, truncated: bool = False) -> None:
         if self._trace is not None:
+            metadata: dict[str, Any] = {
+                "resource_type": self._resource_type.value,
+                "count": count,
+            }
+            if truncated:
+                metadata["truncated"] = True
             self._trace.succeed(
                 TraceEventType.INVENTORY_QUERY,
                 f"collected {count} {self._resource_type.value} resources",
-                metadata={
-                    "resource_type": self._resource_type.value,
-                    "count": count,
-                },
+                metadata=metadata,
             )
 
-    def _trace_fail(self, message: str, *, resource_id: str | None = None) -> None:
+    def _trace_fail(
+        self,
+        message: str,
+        *,
+        resource_id: str | None = None,
+        category: CollectionFailureCategory = CollectionFailureCategory.PRIMARY,
+    ) -> None:
         if self._trace is not None:
-            metadata: dict[str, Any] = {"resource_type": self._resource_type.value}
+            metadata: dict[str, Any] = {
+                "resource_type": self._resource_type.value,
+                "category": category.value,
+            }
             if resource_id:
                 metadata["resource_id"] = resource_id
             self._trace.fail(
@@ -112,7 +134,7 @@ class S3BucketCollector(_InventoryCollectorBase):
         self._client = client
 
     def collect(self, *, limit: int | None = None) -> list[ResourceRecord]:
-        limit = _normalize_limit(limit)
+        limit = normalize_limit(limit)
         self._trace_start(f"collecting {self._resource_type.value} inventory")
         try:
             response = self._client.list_buckets()
@@ -125,15 +147,17 @@ class S3BucketCollector(_InventoryCollectorBase):
             raw["owner_id"] = owner["ID"]
         if owner.get("DisplayName") is not None:
             raw["owner_display_name"] = owner["DisplayName"]
+        buckets = response.get("Buckets") or []
         records: list[ResourceRecord] = []
-        for bucket in response.get("Buckets") or []:
+        for bucket in buckets:
             if len(records) >= limit:
                 break
             name = bucket.get("Name")
             if not name:
                 continue
             records.append(self._map_bucket(name, bucket, dict(raw)))
-        self._trace_succeed(len(records))
+        truncated = len(records) == limit and len(buckets) > limit
+        self._trace_succeed(len(records), truncated=truncated)
         return records
 
     def _map_bucket(self, name: str, bucket: dict, raw: dict[str, Any]) -> ResourceRecord:
@@ -155,6 +179,7 @@ class S3BucketCollector(_InventoryCollectorBase):
             self._trace_fail(
                 f"failed to read region for bucket '{name}': {exc}",
                 resource_id=name,
+                category=CollectionFailureCategory.ENRICHMENT,
             )
             return None
         location = response.get("LocationConstraint")
@@ -171,6 +196,7 @@ class S3BucketCollector(_InventoryCollectorBase):
             self._trace_fail(
                 f"failed to read tags for bucket '{name}': {exc}",
                 resource_id=name,
+                category=CollectionFailureCategory.ENRICHMENT,
             )
             return None
         for tag in response.get("TagSet") or []:
@@ -209,37 +235,56 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
         self._regions = list(regions)
 
     def collect(self, *, limit: int | None = None) -> list[ResourceRecord]:
-        limit = _normalize_limit(limit)
+        limit = normalize_limit(limit)
         self._trace_start(f"collecting {self._resource_type.value} inventory")
         records: list[ResourceRecord] = []
+        truncated = False
         try:
             for region in self._regions:
-                records.extend(self._collect_region(limit - len(records)))
+                region_records, region_truncated = self._collect_region(
+                    limit - len(records)
+                )
+                records.extend(region_records)
+                truncated = truncated or region_truncated
                 if len(records) >= limit:
                     break
         except Exception as exc:  # primary list operation failure (fail-closed)
             self._trace_fail(f"{self._resource_type.value} inventory failed: {exc}")
             return []
-        self._trace_succeed(len(records))
+        self._trace_succeed(len(records), truncated=truncated)
         return records
 
-    def _collect_region(self, remaining: int) -> list[ResourceRecord]:
+    def _collect_region(self, remaining: int) -> tuple[list[ResourceRecord], bool]:
+        """Collect one region, returning ``(records, truncated)``.
+
+        ``truncated`` is True exactly when this region genuinely had more
+        functions than were returned: either a page was broken mid-way with
+        unconsumed functions, or a ``NextMarker`` was present at the point
+        the limit stopped collection. It is never inferred from
+        ``count == limit`` alone (reaching the limit on the final page with
+        no remaining data is not truncation).
+        """
         records: list[ResourceRecord] = []
         marker: str | None = None
+        truncated = False
         while True:
             response = self._client.list_functions(
                 **({"Marker": marker} if marker else {})
             )
-            for function in response.get("Functions") or []:
+            functions = response.get("Functions") or []
+            for function in functions:
                 if len(records) >= remaining:
+                    truncated = True  # mid-page break with unconsumed functions
                     break
                 record = self._map_function(function)
                 if record is not None:
                     records.append(record)
             marker = response.get("NextMarker")
             if marker is None or len(records) >= remaining:
+                if len(records) >= remaining and marker is not None:
+                    truncated = True  # stopped at the limit with more pages
                 break
-        return records
+        return records, truncated
 
     def _map_function(self, function: dict) -> ResourceRecord | None:
         arn = function.get("FunctionArn")
@@ -248,11 +293,16 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
                 f"Lambda function has no FunctionArn; skipped: "
                 f"{function.get('FunctionName')}",
                 resource_id=str(function.get("FunctionName") or "unknown"),
+                category=CollectionFailureCategory.PARSE,
             )
             return None
         region = _region_from_arn(arn)
         if region is None:
-            self._trace_fail(f"unparseable Lambda FunctionArn; skipped: {arn}")
+            self._trace_fail(
+                f"unparseable Lambda FunctionArn; skipped: {arn}",
+                resource_id=arn,
+                category=CollectionFailureCategory.PARSE,
+            )
             return None
         return ResourceRecord(
             resource_id=arn,
@@ -272,6 +322,7 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
             self._trace_fail(
                 f"failed to read tags for Lambda function '{arn}': {exc}",
                 resource_id=arn,
+                category=CollectionFailureCategory.ENRICHMENT,
             )
             return None
         return (response.get("Tags") or {}).get("Owner")

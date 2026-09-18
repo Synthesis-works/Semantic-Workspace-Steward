@@ -19,9 +19,11 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from .constants import (
+    MAX_RESOURCES_PER_INVENTORY_REQUEST,
     ApprovalStatus,
     AuthorizationDecision,
     ClaimKind,
+    CollectionFailureCategory,
     EvidenceBasis,
     ExecutionMode,
     PotentialAction,
@@ -78,6 +80,96 @@ class ResourceRelationship(BaseModel):
     def _normalize_relationship_type(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.strip().lower()
+        return value
+
+
+class CollectionFailure(BaseModel):
+    """A single failed collection step on an inventory run.
+
+    Built by the workspace builder (workspace.py) from the run-scoped
+    FAILED inventory trace events. ``fatal`` is True exactly when the
+    primary list operation for a resource type failed. Enrichment and parse
+    failures are not fatal, but failure of any kind (fatal or not) makes the
+    enclosing snapshot ``partial``: collection did not run completely clean.
+    On non-fatal failures the resource record is either preserved with a
+    ``None`` field (enrichment) or skipped (parse), and collection continues.
+
+    ``trace_event_id`` links this failure 1:1 to the FAILED trace event it
+    was derived from (M2B trace fail events use a per-recorder sequence, so
+    an event is uniquely identified by its recorder plus its id).
+    """
+
+    resource_type: SWSResourceType
+    source: str = Field(min_length=1)
+    category: CollectionFailureCategory
+    message: str = Field(min_length=1)
+    fatal: bool = False
+    resource_id: str | None = Field(default=None, min_length=1)
+    trace_event_id: int | None = Field(default=None, ge=1)
+
+    @field_validator("resource_type", "category", mode="before")
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class WorkspaceSnapshot(BaseModel):
+    """A deterministic snapshot of a workspace's AWS inventory.
+
+    Produced by the workspace builder (workspace.py) after a hermetic
+    collection run. The snapshot records intent (``resource_types``,
+    ``regions``, the effective per-resource-type ``requested_limit``),
+    the canonical resources collected, per-type counts, and the collection
+    outcome (``truncated`` / ``partial`` / ``failures``).
+
+    Honesty contract: ``truncated`` is only ever True when the collectors
+    observed genuinely more data than they returned (never inferred from
+    ``count == limit``), ``partial`` is True whenever any run-scoped
+    INVENTORY_QUERY FAILED event exists (fatal primary failures and
+    non-fatal enrichment/parse failures alike), and ``failures`` only
+    contains events actually recorded in the trace during this run.
+    """
+
+    snapshot_id: str = Field(min_length=1)
+    created_at: datetime
+    collected_at: datetime | None = None
+    run_id: str | None = Field(default=None, min_length=1)
+    requested_limit: int = Field(
+        default=MAX_RESOURCES_PER_INVENTORY_REQUEST, ge=1
+    )
+    regions: list[str] = Field(min_length=1)
+    resource_types: list[SWSResourceType] = Field(min_length=1)
+    resources: list[ResourceRecord] = Field(default_factory=list)
+    counts: dict[SWSResourceType, int] = Field(default_factory=dict)
+    truncated: bool = False
+    partial: bool = False
+    failures: list[CollectionFailure] = Field(default_factory=list)
+
+    @field_validator("resource_types", mode="before")
+    @classmethod
+    def _normalize_resource_types(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return [
+                item.strip().lower() if isinstance(item, str) else item
+                for item in value
+            ]
+        return value
+
+    @field_validator("created_at", "collected_at", mode="before")
+    @classmethod
+    def _require_aware_datetime(cls, value: Any) -> Any:
+        if isinstance(value, datetime) and value.tzinfo is None:
+            raise ValueError("snapshot timestamps must be timezone-aware")
+        return value
+
+    @field_validator("regions")
+    @classmethod
+    def _regions_must_be_non_empty_strings(cls, value: list[str]) -> list[str]:
+        for region in value:
+            if not isinstance(region, str) or not region.strip():
+                raise ValueError("regions must be non-empty strings")
         return value
 
 

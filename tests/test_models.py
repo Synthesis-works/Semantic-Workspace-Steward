@@ -6,9 +6,11 @@ import pytest
 from pydantic import ValidationError
 
 from sws_agent.constants import (
+    ClaimKind,
     EvidenceBasis,
     ExecutionMode,
     PotentialAction,
+    RelationshipType,
     RiskLevel,
     SWSResourceType,
 )
@@ -79,16 +81,34 @@ def test_cost_estimate_defaults_to_projected():
 
 def test_relationship_defaults_to_deterministic_evidence():
     relationship = ResourceRelationship(
-        source_id="a", target_id="b", relationship_type="uses"
+        source_id="a", target_id="b", relationship_type="same_account"
     )
     assert relationship.basis is EvidenceBasis.DETERMINISTIC
 
 
+def test_relationship_claim_kind_defaults_to_derived():
+    relationship = ResourceRelationship(
+        source_id="a", target_id="b", relationship_type="same_account"
+    )
+    assert relationship.claim_kind is ClaimKind.DERIVED
+
+
 def test_relationship_normalizes_relationship_type():
     relationship = ResourceRelationship(
-        source_id="a", target_id="b", relationship_type="USES"
+        source_id="a", target_id="b", relationship_type="SAME_ACCOUNT"
     )
-    assert relationship.relationship_type == "uses"
+    assert relationship.relationship_type is RelationshipType.SAME_ACCOUNT
+
+
+def test_relationship_rejects_free_form_labels():
+    with pytest.raises(ValidationError):
+        ResourceRelationship(
+            source_id="a", target_id="b", relationship_type="uses"
+        )
+    with pytest.raises(ValidationError):
+        ResourceRelationship(
+            source_id="a", target_id="b", relationship_type="related"
+        )
 
 
 def test_relationship_rejects_confidence_out_of_bounds():
@@ -96,6 +116,6 @@ def test_relationship_rejects_confidence_out_of_bounds():
         ResourceRelationship(
             source_id="a",
             target_id="b",
-            relationship_type="uses",
+            relationship_type="same_account",
             confidence=2.0,
         )

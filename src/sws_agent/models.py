@@ -27,6 +27,7 @@ from .constants import (
     EvidenceBasis,
     ExecutionMode,
     PotentialAction,
+    RelationshipType,
     RiskLevel,
     SWSResourceType,
 )
@@ -63,15 +64,18 @@ class ResourceRecord(BaseModel):
 class ResourceRelationship(BaseModel):
     """A relationship between two AWS resources.
 
-    ``bias`` records whether the relationship rests on deterministic
-    evidence or semantic inference. Deterministic evidence always takes
-    precedence over inferred claims.
+    ``relationship_type`` is a controlled ``RelationshipType`` member;
+    free-form labels are rejected. ``bias`` records whether the relationship
+    rests on deterministic evidence or semantic inference, and ``claim_kind``
+    records whether the relationship is a derived claim. Deterministic
+    evidence always takes precedence over inferred claims.
     """
 
     source_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
-    relationship_type: str = Field(min_length=1)
+    relationship_type: RelationshipType
     basis: EvidenceBasis = EvidenceBasis.DETERMINISTIC
+    claim_kind: ClaimKind = ClaimKind.DERIVED
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 

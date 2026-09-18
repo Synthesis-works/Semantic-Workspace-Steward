@@ -127,7 +127,7 @@ def test_relationship_basis_accepts_evidence_basis_members():
     relationship = ResourceRelationship(
         source_id="a",
         target_id="b",
-        relationship_type="uses",
+        relationship_type="same_account",
         basis=EvidenceBasis.INFERRED,
     )
     assert relationship.basis is EvidenceBasis.INFERRED
@@ -137,7 +137,7 @@ def test_relationship_basis_still_coerces_strings():
     relationship = ResourceRelationship(
         source_id="a",
         target_id="b",
-        relationship_type="uses",
+        relationship_type="same_region",
         basis="deterministic",
     )
     assert relationship.basis is EvidenceBasis.DETERMINISTIC
@@ -145,6 +145,6 @@ def test_relationship_basis_still_coerces_strings():
 
 def test_relationship_basis_default_remains_deterministic():
     relationship = ResourceRelationship(
-        source_id="a", target_id="b", relationship_type="uses"
+        source_id="a", target_id="b", relationship_type="same_owner_tag"
     )
     assert relationship.basis is EvidenceBasis.DETERMINISTIC

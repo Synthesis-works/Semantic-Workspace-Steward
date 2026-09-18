@@ -123,6 +123,28 @@ class EvidenceBasis(str, enum.Enum):
     """Derived from semantic reasoning; never overrides deterministic evidence."""
 
 
+class RelationshipType(str, enum.Enum):
+    """Controlled relationship vocabulary for deterministic resource linking.
+
+    Closed enum with controlled extensibility: a new relationship type is
+    only added after a documented scope decision defining its predicate and
+    evidence contract. Free-form relationship labels are rejected at the
+    model boundary.
+    """
+
+    SAME_ACCOUNT = "same_account"
+    """Both resources expose the same, known 12-digit AWS account ID."""
+
+    SAME_REGION = "same_region"
+    """Both resources are observed in the same, known AWS region."""
+
+    SAME_OWNER_TAG = "same_owner_tag"
+    """Both resources carry the same, known Owner tag value.
+
+    This asserts exact tag-string equality only; it never proves the owning
+    entity is identical."""
+
+
 class ClaimKind(str, enum.Enum):
     """Epistemic classification of any statement SWS produces.
 
@@ -190,6 +212,13 @@ MAX_RESOURCES_PER_INVENTORY_REQUEST: Final[int] = 100
 Chosen to keep a single response bounded for a personal AWS account
 while still being useful; larger inventories use pagination."""
 
+MAX_RESOURCES_FOR_RELATIONSHIP_DERIVATION: Final[int] = 1000
+"""Maximum number of resources a snapshot may contain for relationship derivation.
+
+Pairwise comparison is O(n^2); this cap bounds CPU and output growth for
+personal AWS workspaces while avoiding premature optimization. Snapshots
+with more resources raise WorkspaceSnapshotTooLargeError."""
+
 MAX_COST_WINDOW_DAYS: Final[int] = 92
 """Longest cost window (days) a caller may request from Cost Explorer.
 
@@ -243,6 +272,11 @@ SWS_SUPPORTED_COLLECTION_FAILURE_CATEGORIES: Final[frozenset[str]] = frozenset(
     category.value for category in CollectionFailureCategory
 )
 """The complete set of canonical collection-failure categories."""
+
+SWS_SUPPORTED_RELATIONSHIP_TYPES: Final[frozenset[str]] = frozenset(
+    relationship.value for relationship in RelationshipType
+)
+"""The complete set of canonical relationship types."""
 
 SWS_SUPPORTED_EXECUTION_MODES: Final[frozenset[str]] = frozenset(
     mode.value for mode in ExecutionMode

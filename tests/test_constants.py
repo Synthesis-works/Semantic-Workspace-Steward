@@ -13,16 +13,19 @@ from sws_agent.constants import (
     AWS_API_TIMEOUT_SECONDS,
     MAX_COST_GROUP_BY_KEYS,
     MAX_COST_WINDOW_DAYS,
+    MAX_RESOURCES_FOR_RELATIONSHIP_DERIVATION,
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
     MAX_TRACE_EVENTS,
     SMS_DEPRECATED_ACTIONS,
     SWS_SUPPORTED_ACTIONS,
     SWS_SUPPORTED_COLLECTION_FAILURE_CATEGORIES,
     SWS_SUPPORTED_EXECUTION_MODES,
+    SWS_SUPPORTED_RELATIONSHIP_TYPES,
     SWS_SUPPORTED_RESOURCE_TYPES,
     CollectionFailureCategory,
     ExecutionMode,
     PotentialAction,
+    RelationshipType,
     SWSResourceType,
 )
 
@@ -50,6 +53,20 @@ def test_collection_failure_categories_have_no_duplicate_values():
     assert SWS_SUPPORTED_COLLECTION_FAILURE_CATEGORIES == {
         category.value for category in CollectionFailureCategory
     }
+
+
+def test_relationship_types_have_no_duplicate_values():
+    values = [relationship.value for relationship in RelationshipType]
+    assert len(values) == len(set(values)), (
+        "relationship type enum contains duplicate values"
+    )
+    assert SWS_SUPPORTED_RELATIONSHIP_TYPES == {
+        relationship.value for relationship in RelationshipType
+    }
+
+
+def test_relationship_derivation_safety_cap_is_positive():
+    assert MAX_RESOURCES_FOR_RELATIONSHIP_DERIVATION >= 1
 
 
 def test_action_vocabulary_never_drifts_into_sms_lifecycle_states():

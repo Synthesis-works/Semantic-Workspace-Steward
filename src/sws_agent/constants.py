@@ -278,6 +278,25 @@ SWS_SUPPORTED_RELATIONSHIP_TYPES: Final[frozenset[str]] = frozenset(
 )
 """The complete set of canonical relationship types."""
 
+# ---------------------------------------------------------------------------
+# Deterministic policy rules (M2C-D).
+# Stable identifiers attached to PolicyDecision.rule so every decision is
+# self-describing in audit evidence. A new rule is only added after its
+# predicate and outcome are documented, matching the canonical-label rule.
+# ---------------------------------------------------------------------------
+
+POLICY_RULE_MISSING_OWNER_TAG: Final[str] = "missing_owner_tag"
+"""No Owner tag is recorded on the resource (data assumed complete)."""
+
+POLICY_RULE_OWNER_UNVERIFIABLE: Final[str] = "owner_unverifiable"
+"""Owner-tag absence cannot be treated as fact because the workspace
+inventory is partial or truncated; the resource is flagged for review."""
+
+SWS_SUPPORTED_POLICY_RULES: Final[frozenset[str]] = frozenset(
+    {POLICY_RULE_MISSING_OWNER_TAG, POLICY_RULE_OWNER_UNVERIFIABLE}
+)
+"""The complete set of canonical deterministic policy rule identifiers."""
+
 SWS_SUPPORTED_EXECUTION_MODES: Final[frozenset[str]] = frozenset(
     mode.value for mode in ExecutionMode
 )

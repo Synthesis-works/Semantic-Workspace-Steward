@@ -16,10 +16,13 @@ from sws_agent.constants import (
     MAX_RESOURCES_FOR_RELATIONSHIP_DERIVATION,
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
     MAX_TRACE_EVENTS,
+    POLICY_RULE_MISSING_OWNER_TAG,
+    POLICY_RULE_OWNER_UNVERIFIABLE,
     SMS_DEPRECATED_ACTIONS,
     SWS_SUPPORTED_ACTIONS,
     SWS_SUPPORTED_COLLECTION_FAILURE_CATEGORIES,
     SWS_SUPPORTED_EXECUTION_MODES,
+    SWS_SUPPORTED_POLICY_RULES,
     SWS_SUPPORTED_RELATIONSHIP_TYPES,
     SWS_SUPPORTED_RESOURCE_TYPES,
     CollectionFailureCategory,
@@ -67,6 +70,14 @@ def test_relationship_types_have_no_duplicate_values():
 
 def test_relationship_derivation_safety_cap_is_positive():
     assert MAX_RESOURCES_FOR_RELATIONSHIP_DERIVATION >= 1
+
+
+def test_policy_rule_ids_have_no_duplicate_values():
+    rule_ids = [POLICY_RULE_MISSING_OWNER_TAG, POLICY_RULE_OWNER_UNVERIFIABLE]
+    assert len(rule_ids) == len(set(rule_ids)), (
+        "policy rule identifiers contain duplicates"
+    )
+    assert SWS_SUPPORTED_POLICY_RULES == set(rule_ids)
 
 
 def test_action_vocabulary_never_drifts_into_sms_lifecycle_states():

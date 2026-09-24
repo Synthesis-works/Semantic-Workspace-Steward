@@ -197,6 +197,12 @@ class PolicyDecision(BaseModel):
 
     Produced by the deterministic policy engine (interface in
     interfaces.py), which must never delegate decisions to an LLM.
+
+    ``rule`` records the stable identifier of the deterministic rule that
+    fired (``None`` when no rule triggered), and ``evidence`` carries the
+    machine-readable attribute/value facts that the rule's predicate
+    depended on. Both fields are additive (M2C-D): existing constructions
+    that omit them remain valid, and the engine never executes an action.
     """
 
     resource_id: str = Field(min_length=1)
@@ -205,6 +211,8 @@ class PolicyDecision(BaseModel):
     rationale: str = ""
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     needs_approval: bool = False
+    rule: str | None = Field(default=None, min_length=1)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("recommended_action", "risk_level", mode="before")
     @classmethod

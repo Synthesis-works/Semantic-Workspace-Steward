@@ -231,6 +231,14 @@ MAX_COST_GROUP_BY_KEYS: Final[int] = 4
 Hard ceiling to bound response size; the service itself caps grouping
 well below this."""
 
+MAX_COST_EXPLORER_PAGES: Final[int] = 20
+"""Maximum Cost Explorer response pages the collector will follow.
+
+``get_cost_and_usage`` can paginate via ``NextPageToken`` (each page is a
+separate AWS request). This cap bounds latency and billed requests; when it
+is reached with a token outstanding the collection is honestly marked
+truncated rather than silently reported as complete."""
+
 AWS_API_RETRY_ATTEMPTS: Final[int] = 5
 """Maximum retry attempts for AWS API calls.
 

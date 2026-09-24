@@ -24,6 +24,20 @@ Scope (approved M2C-E):
     enrichment operation: its failure is traced as ENRICHMENT and collection
     still returns whatever succeeded. Unparseable amounts are PARSE failures
     and the affected entries are skipped.
+
+Real AWS contract notes (verified against the botocore ce service model and
+current Cost Explorer documentation):
+  - ``TimePeriod`` is ``[Start, End)``: ``Start`` inclusive, ``End`` exclusive.
+  - TAG grouping returns group keys in the form ``<TagKey>$<TagValue>`` (for
+    example ``Owner$eng``); usage with no value for the tag comes back as
+    ``<TagKey>$`` (empty value). Group keys are normalized against the
+    requested tag key before aggregation, and any key that does not match the
+    requested prefix is a PARSE failure, never silently accepted.
+  - ``get_cost_and_usage`` may paginate via ``NextPageToken``. Both query
+    paths follow tokens until exhaustion or ``MAX_COST_EXPLORER_PAGES``; when
+    the cap is hit with a token outstanding, collection is marked truncated on
+    the SUCCEEDED trace event (matching snapshot ``truncated`` semantics)
+    instead of falsely claiming complete coverage.
 """
 
 from __future__ import annotations
@@ -32,6 +46,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from .constants import (
+    MAX_COST_EXPLORER_PAGES,
     MAX_COST_GROUP_BY_KEYS,
     MAX_COST_WINDOW_DAYS,
     COST_GROUP_DIMENSION_SERVICE,
@@ -50,11 +65,41 @@ CREDIT_EXCLUSION_ASSUMPTION: str = (
 )
 """Surfaced assumption whenever negative (credit) entries were skipped."""
 
+EMPTY_TAG_VALUE_ASSUMPTION: str = (
+    "the empty tag value (untagged usage) is aggregated under '<group key>:'"
+)
+"""Surfaced assumption on the aggregate row for usage with no tag value."""
+
 _COST_GROUP_BY_PARAMS: dict[str, dict[str, str]] = {
     COST_GROUP_DIMENSION_SERVICE: {"Type": "DIMENSION", "Key": "SERVICE"},
     COST_GROUP_TAG_OWNER: {"Type": "TAG", "Key": "Owner"},
 }
 """Client-side GroupBy translation for each supported group-by key."""
+
+
+def _tag_key_for(group_key: str) -> str | None:
+    """The requested tag key when ``group_key`` is a TAG grouping, else None."""
+    definition = _COST_GROUP_BY_PARAMS.get(group_key)
+    if definition is not None and definition.get("Type") == "TAG":
+        return definition["Key"]
+    return None
+
+
+def _interpret_group_key(raw_key: str, tag_key: str | None) -> str | None:
+    """Normalize one Cost Explorer group key against the requested grouping.
+
+    Dimension groups are used verbatim. TAG groups come back as
+    ``<TagKey>$<TagValue>`` (the real SDK shape); the configured tag key's
+    prefix is stripped so ``Owner$eng`` becomes ``eng`` and ``Owner$`` becomes
+    the empty (untagged) value. A key that does not start with the requested
+    prefix is not a valid value for this grouping and is rejected (None).
+    """
+    if tag_key is None:
+        return raw_key
+    prefix = f"{tag_key}$"
+    if not raw_key.startswith(prefix):
+        return None
+    return raw_key[len(prefix):]
 
 
 def normalize_window_days(window_days: int | None) -> int:
@@ -111,7 +156,10 @@ class CostExplorerCollector(_InventoryCollectorBase):
     Cost Explorer shaped response: ``ResultsByTime`` where every entry either
     carries ``Total.UnblendedCost`` (ungrouped query) or ``Groups`` with
     ``Keys`` and ``Metrics.UnblendedCost`` (grouped query). Amounts are
-    numeric strings, matching the real service.
+    numeric strings, matching the real service. TAG group keys use the real
+    ``<TagKey>$<TagValue>`` shape (normalized before aggregation); responses
+    may paginate via ``NextPageToken`` and are followed within the canonical
+    page cap.
     """
 
     def __init__(self, client: Any, *, trace: TraceSink | None = None):
@@ -165,33 +213,53 @@ class CostExplorerCollector(_InventoryCollectorBase):
     # -- queries -------------------------------------------------------------
 
     def _query_total(self, period: dict[str, str]) -> list[CostEstimate] | None:
-        """Run the ungrouped total query; None signals a PRIMARY failure."""
+        """Run the ungrouped total query; None signals a PRIMARY failure.
+
+        Follows ``NextPageToken`` until exhausted or capped at
+        ``MAX_COST_EXPLORER_PAGES``; a cap reached with a token outstanding is
+        marked truncated on the SUCCEEDED trace event, never reported as a
+        complete total without surfacing the truncation.
+        """
+        total = 0.0
+        credits_excluded = False
+        token: str | None = None
+        pages = 0
+        truncated = False
         try:
-            response = self._client.get_cost_and_usage(
-                TimePeriod=period,
-                Granularity="DAILY",
-                Metrics=["UnblendedCost"],
-            )
+            while True:
+                params: dict[str, Any] = {
+                    "TimePeriod": period,
+                    "Granularity": "DAILY",
+                    "Metrics": ["UnblendedCost"],
+                }
+                if token is not None:
+                    params["NextPageToken"] = token
+                response = self._client.get_cost_and_usage(**params)
+                pages += 1
+                for entry in response.get("ResultsByTime") or []:
+                    amount = self._amount(entry.get("Total"))
+                    if amount is None:
+                        self._trace_fail(
+                            f"skipped Cost Explorer entry with an unparseable total",
+                            category=CollectionFailureCategory.PARSE,
+                        )
+                        continue
+                    if amount < 0:
+                        credits_excluded = True
+                        continue
+                    total += amount
+                token = response.get("NextPageToken") or None
+                if token is None:
+                    break
+                if pages >= MAX_COST_EXPLORER_PAGES:
+                    truncated = True
+                    break
         except Exception as exc:
             self._trace_fail(
                 f"cost collection (total) failed: {exc}",
                 category=CollectionFailureCategory.PRIMARY,
             )
             return None
-        total = 0.0
-        credits_excluded = False
-        for entry in response.get("ResultsByTime") or []:
-            amount = self._amount(entry.get("Total"))
-            if amount is None:
-                self._trace_fail(
-                    f"skipped Cost Explorer entry with an unparseable total",
-                    category=CollectionFailureCategory.PARSE,
-                )
-                continue
-            if amount < 0:
-                credits_excluded = True
-                continue
-            total += amount
         estimate = CostEstimate(
             line_item="total",
             amount_usd=total,
@@ -199,64 +267,97 @@ class CostExplorerCollector(_InventoryCollectorBase):
             projected=True,
             assumptions=[CREDIT_EXCLUSION_ASSUMPTION] if credits_excluded else [],
         )
-        self._trace_succeed_estimates(1)
+        self._trace_succeed_estimates(1, truncated=truncated)
         return [estimate]
 
     def _query_grouped(self, period: dict[str, str], key: str) -> list[CostEstimate]:
         """Run one grouped query for a single canonical key.
 
         A failed grouped query is an ENRICHMENT failure: it never discards
-        the totals and never aborts the remaining grouped queries.
+        the totals and never aborts the remaining grouped queries. Group keys
+        are normalized against the requested grouping (TAG keys lose their
+        configured ``<TagKey>$`` prefix); a key that does not match the
+        requested prefix is a PARSE failure and is skipped. Pagination follows
+        ``NextPageToken`` with the same cap/truncation behavior as the total
+        query.
         """
+        tag_key = _tag_key_for(key)
+        by_value: dict[str, float] = {}
+        credits_excluded = False
+        token: str | None = None
+        pages = 0
+        truncated = False
         try:
-            response = self._client.get_cost_and_usage(
-                TimePeriod=period,
-                Granularity="DAILY",
-                Metrics=["UnblendedCost"],
-                GroupBy=[_COST_GROUP_BY_PARAMS[key]],
-            )
+            while True:
+                params: dict[str, Any] = {
+                    "TimePeriod": period,
+                    "Granularity": "DAILY",
+                    "Metrics": ["UnblendedCost"],
+                    "GroupBy": [_COST_GROUP_BY_PARAMS[key]],
+                }
+                if token is not None:
+                    params["NextPageToken"] = token
+                response = self._client.get_cost_and_usage(**params)
+                pages += 1
+                for entry in response.get("ResultsByTime") or []:
+                    for group in entry.get("Groups") or []:
+                        keys = group.get("Keys") or []
+                        if not keys:
+                            self._trace_fail(
+                                f"skipped Cost Explorer group with no keys (grouped by "
+                                f"'{key}')",
+                                category=CollectionFailureCategory.PARSE,
+                            )
+                            continue
+                        value = _interpret_group_key(keys[0], tag_key)
+                        if value is None:
+                            self._trace_fail(
+                                f"skipped Cost Explorer group whose key does not match "
+                                f"the requested '{key}' grouping: {keys[0]!r}",
+                                category=CollectionFailureCategory.PARSE,
+                            )
+                            continue
+                        amount = self._amount(group.get("Metrics"))
+                        if amount is None:
+                            self._trace_fail(
+                                f"skipped Cost Explorer group with an unparseable amount "
+                                f"(grouped by '{key}')",
+                                category=CollectionFailureCategory.PARSE,
+                            )
+                            continue
+                        if amount < 0:
+                            credits_excluded = True
+                            continue
+                        by_value[value] = by_value.get(value, 0.0) + amount
+                token = response.get("NextPageToken") or None
+                if token is None:
+                    break
+                if pages >= MAX_COST_EXPLORER_PAGES:
+                    truncated = True
+                    break
         except Exception as exc:
             self._trace_fail(
                 f"cost collection grouped by '{key}' failed: {exc}",
                 category=CollectionFailureCategory.ENRICHMENT,
             )
             return []
-        by_value: dict[str, float] = {}
-        credits_excluded = False
-        for entry in response.get("ResultsByTime") or []:
-            for group in entry.get("Groups") or []:
-                keys = group.get("Keys") or []
-                if not keys:
-                    self._trace_fail(
-                        f"skipped Cost Explorer group with no keys (grouped by "
-                        f"'{key}')",
-                        category=CollectionFailureCategory.PARSE,
-                    )
-                    continue
-                amount = self._amount(group.get("Metrics"))
-                if amount is None:
-                    self._trace_fail(
-                        f"skipped Cost Explorer group with an unparseable amount "
-                        f"(grouped by '{key}')",
-                        category=CollectionFailureCategory.PARSE,
-                    )
-                    continue
-                if amount < 0:
-                    credits_excluded = True
-                    continue
-                value = keys[0]
-                by_value[value] = by_value.get(value, 0.0) + amount
-        estimates = [
-            CostEstimate(
-                line_item=f"{key}:{value}",
-                amount_usd=amount,
-                basis=_basis(period, group_by_key=key),
-                projected=True,
-                assumptions=[CREDIT_EXCLUSION_ASSUMPTION] if credits_excluded else [],
+        estimates = []
+        for value, amount in sorted(by_value.items()):
+            assumptions: list[str] = []
+            if tag_key is not None and value == "":
+                assumptions.append(EMPTY_TAG_VALUE_ASSUMPTION)
+            if credits_excluded:
+                assumptions.append(CREDIT_EXCLUSION_ASSUMPTION)
+            estimates.append(
+                CostEstimate(
+                    line_item=f"{key}:{value}",
+                    amount_usd=amount,
+                    basis=_basis(period, group_by_key=key),
+                    projected=True,
+                    assumptions=assumptions,
+                )
             )
-            for value, amount in sorted(by_value.items())
-        ]
-        self._trace_succeed_estimates(len(estimates), group=key)
+        self._trace_succeed_estimates(len(estimates), group=key, truncated=truncated)
         return estimates
 
     # -- helpers -------------------------------------------------------------
@@ -278,7 +379,7 @@ class CostExplorerCollector(_InventoryCollectorBase):
             return None
 
     def _trace_succeed_estimates(
-        self, count: int, *, group: str | None = None
+        self, count: int, *, group: str | None = None, truncated: bool = False
     ) -> None:
         """Record a SUCCEEDED event with a cost-appropriate message."""
         if self._trace is not None:
@@ -288,6 +389,8 @@ class CostExplorerCollector(_InventoryCollectorBase):
             }
             if group is not None:
                 metadata["group_by"] = group
+            if truncated:
+                metadata["truncated"] = True
             self._trace.succeed(
                 TraceEventType.INVENTORY_QUERY,
                 f"collected {count} cost estimates",

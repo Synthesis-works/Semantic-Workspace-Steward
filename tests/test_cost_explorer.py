@@ -14,6 +14,7 @@ import pytest
 from sws_agent.constants import (
     COST_GROUP_DIMENSION_SERVICE,
     COST_GROUP_TAG_OWNER,
+    MAX_COST_EXPLORER_PAGES,
     MAX_COST_GROUP_BY_KEYS,
     MAX_COST_WINDOW_DAYS,
     CollectionFailureCategory,
@@ -23,6 +24,7 @@ from sws_agent.constants import (
 )
 from sws_agent.cost_explorer import (
     CostExplorerCollector,
+    EMPTY_TAG_VALUE_ASSUMPTION,
     normalize_group_by,
     normalize_window_days,
 )
@@ -38,9 +40,9 @@ def _period(end_date: date, window_days: int) -> dict[str, str]:
     return {"Start": start.isoformat(), "End": (end + timedelta(days=1)).isoformat()}
 
 
-def _total_response(*amounts):
+def _total_response(*amounts, token=None):
     """A Cost Explorer response with one ResultsByTime entry per amount."""
-    return {
+    response = {
         "ResultsByTime": [
             {
                 "TimePeriod": {"Start": f"2026-01-0{i + 1}", "End": f"2026-01-0{i + 2}"},
@@ -54,11 +56,14 @@ def _total_response(*amounts):
             for i, amount in enumerate(amounts)
         ]
     }
+    if token is not None:
+        response["NextPageToken"] = token
+    return response
 
 
-def _grouped_response(*groups):
+def _grouped_response(*groups, token=None):
     """A Cost Explorer response; groups are ``(key_value, amount)`` pairs."""
-    return {
+    response = {
         "ResultsByTime": [
             {
                 "TimePeriod": {"Start": "2026-01-01", "End": "2026-01-02"},
@@ -74,6 +79,9 @@ def _grouped_response(*groups):
             }
         ]
     }
+    if token is not None:
+        response["NextPageToken"] = token
+    return response
 
 
 class FakeCostClient:
@@ -249,14 +257,15 @@ def test_collect_grouped_by_service_aggregates_per_key():
 
 
 def test_collect_grouped_by_owner_tag_aggregates_per_key_across_days():
-    # two daily entries share one tag value and are summed
+    # two daily entries share one tag value and are summed; real Cost Explorer
+    # TAG group keys are ``Owner$<value>``
     response = {
         "ResultsByTime": [
             {
                 "TimePeriod": {"Start": "2026-01-01", "End": "2026-01-02"},
                 "Groups": [
                     {
-                        "Keys": ["eng"],
+                        "Keys": ["Owner$eng"],
                         "Metrics": {"UnblendedCost": {"Amount": "3.0", "Unit": "USD"}},
                     }
                 ],
@@ -265,11 +274,11 @@ def test_collect_grouped_by_owner_tag_aggregates_per_key_across_days():
                 "TimePeriod": {"Start": "2026-01-02", "End": "2026-01-03"},
                 "Groups": [
                     {
-                        "Keys": ["eng"],
+                        "Keys": ["Owner$eng"],
                         "Metrics": {"UnblendedCost": {"Amount": "4.0", "Unit": "USD"}},
                     },
                     {
-                        "Keys": ["data"],
+                        "Keys": ["Owner$data"],
                         "Metrics": {"UnblendedCost": {"Amount": "2.0", "Unit": "USD"}},
                     },
                 ],
@@ -287,11 +296,161 @@ def test_collect_grouped_by_owner_tag_aggregates_per_key_across_days():
     assert estimates["owner_tag:data"].amount_usd == pytest.approx(2.0)
 
 
+# ---------------------------------------------------------------------------
+# Real Cost Explorer TAG group-key contract (regressions)
+# ---------------------------------------------------------------------------
+
+
+def test_tag_group_key_prefix_is_stripped_to_value():
+    """Real TAG group keys are ``Owner$<value>``; the value is the label."""
+    script = [
+        _total_response(10.0),
+        _grouped_response(("Owner$alice", 7.5)),
+    ]
+    client = FakeCostClient(script=script)
+    estimates = {
+        e.line_item: e
+        for e in CostExplorerCollector(client).collect(
+            group_by=[COST_GROUP_TAG_OWNER], end_date=END
+        )
+    }
+    assert set(estimates) == {"total", "owner_tag:alice"}
+    assert estimates["owner_tag:alice"].amount_usd == pytest.approx(7.5)
+    assert estimates["owner_tag:alice"].assumptions == []
+
+
+def test_tag_group_untagged_empty_value_is_explicit_and_assumed():
+    """``Owner$`` (no tag value) becomes an explicit ``owner_tag:`` row."""
+    script = [
+        _total_response(5.0),
+        _grouped_response(("Owner$alice", 3.0), ("Owner$", 2.0)),
+    ]
+    client = FakeCostClient(script=script)
+    trace = TraceRecorder()
+    estimates = {
+        e.line_item: e
+        for e in CostExplorerCollector(client, trace=trace).collect(
+            group_by=[COST_GROUP_TAG_OWNER], end_date=END
+        )
+    }
+    assert set(estimates) == {"total", "owner_tag:alice", "owner_tag:"}
+    assert estimates["owner_tag:"].amount_usd == pytest.approx(2.0)
+    assert estimates["owner_tag:"].assumptions == [EMPTY_TAG_VALUE_ASSUMPTION]
+    assert estimates["owner_tag:alice"].assumptions == []
+    # an untagged group is a real value, not a failure
+    assert _failed_events(trace) == []
+
+
+def test_tag_group_mismatched_prefix_is_parse_failure_and_skipped():
+    """A key that is not ``Owner$...`` is never accepted as an owner value."""
+    script = [
+        _total_response(4.0),
+        _grouped_response(("Environment$prod", 4.0)),
+    ]
+    client = FakeCostClient(script=script)
+    trace = TraceRecorder()
+    estimates = CostExplorerCollector(client, trace=trace).collect(
+        group_by=[COST_GROUP_TAG_OWNER], end_date=END
+    )
+    assert [e.line_item for e in estimates] == ["total"]
+    failures = _failed_events(trace)
+    assert len(failures) == 1
+    assert (
+        failures[0].metadata["category"] == CollectionFailureCategory.PARSE.value
+    )
+
+
+# ---------------------------------------------------------------------------
+# NextPageToken pagination (regressions)
+# ---------------------------------------------------------------------------
+
+
+def test_total_query_pagination_accumulates_pages():
+    script = [
+        _total_response(10.0, token="page-2"),
+        _total_response(5.0),
+    ]
+    client = FakeCostClient(script=script)
+    trace = TraceRecorder()
+    estimate = CostExplorerCollector(client, trace=trace).collect(end_date=END)[0]
+    assert estimate.amount_usd == pytest.approx(15.0)
+    assert len(client.calls) == 2
+    assert "NextPageToken" not in client.calls[0]
+    assert client.calls[1]["NextPageToken"] == "page-2"
+    assert _failed_events(trace) == []
+    # final page carries no token: collection is complete, not truncated
+    assert "truncated" not in (_succeed_events(trace)[0].metadata or {})
+
+
+def test_grouped_query_pagination_accumulates_pages():
+    script = [
+        _total_response(10.0),
+        _grouped_response(("AmazonS3", 4.0), token="page-2"),
+        _grouped_response(("AmazonS3", 6.0)),
+    ]
+    client = FakeCostClient(script=script)
+    trace = TraceRecorder()
+    estimates = {
+        e.line_item: e
+        for e in CostExplorerCollector(client, trace=trace).collect(
+            group_by=[COST_GROUP_DIMENSION_SERVICE], end_date=END
+        )
+    }
+    assert estimates["service:AmazonS3"].amount_usd == pytest.approx(10.0)
+    assert len(client.calls) == 3
+    assert client.calls[2]["NextPageToken"] == "page-2"
+    assert _failed_events(trace) == []
+
+
+def test_total_query_pagination_bound_marks_truncated_not_complete():
+    """Every page claims more data: stop at the cap and surface truncation."""
+    script = [
+        _total_response(1.0, token="next")
+        for _ in range(MAX_COST_EXPLORER_PAGES + 1)
+    ]
+    client = FakeCostClient(script=script)
+    trace = TraceRecorder()
+    estimate = CostExplorerCollector(client, trace=trace).collect(end_date=END)[0]
+    assert len(client.calls) == MAX_COST_EXPLORER_PAGES  # 21st call never made
+    assert estimate.amount_usd == pytest.approx(float(MAX_COST_EXPLORER_PAGES))
+    successes = _succeed_events(trace)
+    assert successes[0].metadata.get("truncated") is True
+    assert _failed_events(trace) == []
+
+
+def test_grouped_query_pagination_bound_marks_truncated_not_complete():
+    script = [
+        _total_response(1.0),
+        *[
+            _grouped_response(("AmazonS3", 1.0), token="next")
+            for _ in range(MAX_COST_EXPLORER_PAGES + 1)
+        ],
+    ]
+    client = FakeCostClient(script=script)
+    trace = TraceRecorder()
+    estimates = {
+        e.line_item: e
+        for e in CostExplorerCollector(client, trace=trace).collect(
+            group_by=[COST_GROUP_DIMENSION_SERVICE], end_date=END
+        )
+    }
+    assert estimates["service:AmazonS3"].amount_usd == pytest.approx(
+        float(MAX_COST_EXPLORER_PAGES)
+    )
+    grouped_successes = [
+        e
+        for e in _succeed_events(trace)
+        if e.metadata.get("group_by") == COST_GROUP_DIMENSION_SERVICE
+    ]
+    assert grouped_successes[0].metadata.get("truncated") is True
+    assert _failed_events(trace) == []
+
+
 def test_collect_multiple_group_by_keys_runs_separate_queries():
     script = [
         _total_response(10.0),
         _grouped_response(("AmazonS3", 6.0)),
-        _grouped_response(("eng", 4.0)),
+        _grouped_response(("Owner$eng", 4.0)),
     ]
     client = FakeCostClient(script=script)
     collector = CostExplorerCollector(client)
@@ -315,7 +474,7 @@ def test_collect_output_is_sorted_and_deterministic():
     script = [
         _total_response(10.0),
         _grouped_response(("AmazonS3", 6.0)),
-        _grouped_response(("eng", 4.0)),
+        _grouped_response(("Owner$eng", 4.0)),
     ]
     client = FakeCostClient(script=script)
     first = CostExplorerCollector(client).collect(

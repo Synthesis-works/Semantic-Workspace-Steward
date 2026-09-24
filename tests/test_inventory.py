@@ -150,11 +150,11 @@ class FakeLambdaClient:
             response["NextMarker"] = f"marker-{self._page_index}"
         return response
 
-    def list_tags(self, Target):
+    def list_tags(self, Resource):
         self.tag_calls += 1
-        if Target in self._tag_errors:
-            raise ValueError(f"tag access denied for {Target}")
-        return {"Tags": dict(self._tags.get(Target) or {})}
+        if Resource in self._tag_errors:
+            raise ValueError(f"tag access denied for {Resource}")
+        return {"Tags": dict(self._tags.get(Resource) or {})}
 
 
 def test_inventory_collectors_registered_for_supported_types():
@@ -374,6 +374,54 @@ def test_lambda_owner_tag_success_and_failure():
     ]
     assert len(failures) == 1
     assert failures[0].metadata["resource_id"] == denied_arn
+
+
+def test_lambda_untagged_function_is_not_a_failure():
+    """Untagged functions return an empty Tags map (no NoSuchTagSet analog).
+
+    The function must be collected with owner_tag=None and NO FAILED
+    inventory event, so the workspace snapshot is not made partial solely
+    because a function has no tags.
+    """
+    arn = "arn:aws:lambda:us-east-1:123456789012:function:untagged"
+    client = FakeLambdaClient(pages=[[_function("untagged", arn)]])
+    trace = TraceRecorder()
+    records = LambdaFunctionCollector(client, regions=["us-east-1"], trace=trace).collect()
+    assert [r.resource_id for r in records] == [arn]
+    assert records[0].owner_tag is None
+    assert not [
+        e for e in trace
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.FAILED
+    ]
+
+
+def test_lambda_list_tags_uses_real_sdk_resource_keyword():
+    """Regression: the collector must call list_tags with ``Resource``.
+
+    Real boto3 ``list_tags`` has no ``Target`` parameter; this strict fake
+    would blow up on any old-style call, guaranteeing the recovery of the
+    Lambda path against a real Lambda client.
+    """
+    arn = "arn:aws:lambda:us-east-1:123456789012:function:fn"
+
+    class StrictLambdaClient:
+        def __init__(self):
+            self.calls = []
+
+        def list_functions(self, Marker=None):
+            return {"Functions": [_function("fn", arn)]}
+
+        def list_tags(self, **kwargs):
+            self.calls.append(kwargs)
+            assert "Target" not in kwargs, "list_tags must not use old Target kwarg"
+            assert "Resource" in kwargs, "list_tags must use real SDK Resource kwarg"
+            return {"Tags": {"Owner": "carol"}}
+
+    client = StrictLambdaClient()
+    records = LambdaFunctionCollector(client, regions=["us-east-1"]).collect()
+    assert records[0].owner_tag == "carol"
+    assert client.calls == [{"Resource": arn}]
 
 
 def test_lambda_environment_never_in_raw():
@@ -654,15 +702,25 @@ def test_collect_all_returns_supported_types_in_order():
         def list_functions(self, Marker=None):
             return self._lamb.list_functions(Marker)
 
-        def list_tags(self, Target):
-            return self._lamb.list_tags(Target)
+        def list_tags(self, Resource):
+            return self._lamb.list_tags(Resource)
 
-    results = collect_all(client=FakeRootClient(s3, lamb), regions=["us-east-1"])
+    recorder = TraceRecorder()
+    results = collect_all(
+        client=FakeRootClient(s3, lamb), regions=["us-east-1"], trace=recorder
+    )
     assert list(results) == [SWSResourceType.S3_BUCKET, SWSResourceType.LAMBDA_FUNCTION]
     assert [r.resource_type for r in results[SWSResourceType.S3_BUCKET]] == [
         SWSResourceType.S3_BUCKET
     ]
     assert len(results[SWSResourceType.LAMBDA_FUNCTION]) == 1
+    # Clean collection: the Lambda tag lookup must succeed with the real
+    # ``Resource`` keyword (no swallowed TypeError surfaced as ENRICHMENT).
+    assert [
+        e for e in recorder
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.FAILED
+    ] == []
 
 
 def test_unsupported_resource_types_raise():

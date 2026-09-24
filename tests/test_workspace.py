@@ -121,10 +121,10 @@ class FakeLambdaClient:
             response["NextMarker"] = f"marker-{self._page_index}"
         return response
 
-    def list_tags(self, Target):
-        if Target in self._tag_errors:
-            raise ValueError(f"tag access denied for {Target}")
-        return {"Tags": dict(self._tags.get(Target) or {})}
+    def list_tags(self, Resource):
+        if Resource in self._tag_errors:
+            raise ValueError(f"tag access denied for {Resource}")
+        return {"Tags": dict(self._tags.get(Resource) or {})}
 
 
 class FakeCostClient:
@@ -170,8 +170,8 @@ class FakeRootClient:
     def list_functions(self, Marker=None):
         return self._lamb.list_functions(Marker)
 
-    def list_tags(self, Target):
-        return self._lamb.list_tags(Target)
+    def list_tags(self, Resource):
+        return self._lamb.list_tags(Resource)
 
     def get_cost_and_usage(self, **params):
         if self._cost is None:

@@ -344,7 +344,7 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
 
     def _function_owner_tag(self, arn: str) -> str | None:
         try:
-            response = self._client.list_tags(Target=arn)
+            response = self._client.list_tags(Resource=arn)
         except Exception as exc:
             self._trace_fail(
                 f"failed to read tags for Lambda function '{arn}': {exc}",

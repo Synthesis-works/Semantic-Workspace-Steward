@@ -134,6 +134,12 @@ class WorkspaceSnapshot(BaseModel):
     INVENTORY_QUERY FAILED event exists (fatal primary failures and
     non-fatal enrichment/parse failures alike), and ``failures`` only
     contains events actually recorded in the trace during this run.
+
+    ``cost`` carries workspace-level cost estimates (M2C-E). Cost data is
+    deliberately kept separate from ``resources`` (which holds canonical
+    ``ResourceRecord`` inventory) and from ``counts``: it is account-level
+    aggregated data, never per-resource figures, and it never changes
+    ``partial`` semantics on its own beyond the collection-failure contract.
     """
 
     snapshot_id: str = Field(min_length=1)
@@ -150,6 +156,7 @@ class WorkspaceSnapshot(BaseModel):
     truncated: bool = False
     partial: bool = False
     failures: list[CollectionFailure] = Field(default_factory=list)
+    cost: list[CostEstimate] = Field(default_factory=list)
 
     @field_validator("resource_types", mode="before")
     @classmethod

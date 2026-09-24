@@ -7,19 +7,25 @@ model definitions (WorkspaceSnapshot, CollectionFailure).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 from pydantic import ValidationError
 
 from sws_agent.constants import (
+    MAX_COST_WINDOW_DAYS,
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
     CollectionFailureCategory,
     SWSResourceType,
     TraceEventType,
     TraceStatus,
 )
-from sws_agent.models import CollectionFailure, WorkspaceSnapshot
+from sws_agent.models import (
+    CollectionFailure,
+    CostEstimate,
+    ResourceRecord,
+    WorkspaceSnapshot,
+)
 from sws_agent.trace import TraceEvent, TraceRecorder
 from sws_agent.workspace import (
     _failure_from_event,
@@ -121,12 +127,36 @@ class FakeLambdaClient:
         return {"Tags": dict(self._tags.get(Target) or {})}
 
 
-class FakeRootClient:
-    """Composite client exposing every method the collectors require."""
+class FakeCostClient:
+    """In-memory Cost Explorer client with canned scripted responses."""
 
-    def __init__(self, s3=None, lamb=None):
+    def __init__(self, responses=None, error_at=None, error=RuntimeError("boom")):
+        self._responses = [dict(r) for r in (responses or [])]
+        self._error_at = set(error_at or ())
+        self._error = error
+        self.calls = []
+
+    def get_cost_and_usage(self, **params):
+        self.calls.append(dict(params))
+        index = len(self.calls) - 1
+        if index in self._error_at:
+            raise self._error
+        if index >= len(self._responses):
+            return {"ResultsByTime": []}
+        return self._responses[index]
+
+
+class FakeRootClient:
+    """Composite client exposing every method the collectors require.
+
+    ``cost`` is optional: when supplied, the client also exposes
+    ``get_cost_and_usage`` for the M2C-E cost collector.
+    """
+
+    def __init__(self, s3=None, lamb=None, cost=None):
         self._s3 = s3 or FakeS3Client(buckets=[])
         self._lamb = lamb or FakeLambdaClient(pages=[])
+        self._cost = cost
 
     def list_buckets(self):
         return self._s3.list_buckets()
@@ -142,6 +172,11 @@ class FakeRootClient:
 
     def list_tags(self, Target):
         return self._lamb.list_tags(Target)
+
+    def get_cost_and_usage(self, **params):
+        if self._cost is None:
+            raise AssertionError("get_cost_and_usage called without a cost client")
+        return self._cost.get_cost_and_usage(**params)
 
 
 def _run(client: FakeRootClient, **overrides):
@@ -630,3 +665,196 @@ def test_failure_without_resource_type_is_not_attributed():
         metadata={},
     )
     assert _failure_from_event(event, succeeded_types=set()) is None
+
+
+# ---------------------------------------------------------------------------
+# collect_workspace: M2C-E cost integration
+# ---------------------------------------------------------------------------
+
+COST_END = date(2026, 3, 31)
+
+
+def _total_response(amount: str) -> dict:
+    return {
+        "ResultsByTime": [
+            {
+                "TimePeriod": {"Start": "2026-01-01", "End": "2026-01-02"},
+                "Total": {
+                    "UnblendedCost": {"Amount": amount, "Unit": "USD"}
+                },
+            }
+        ]
+    }
+
+
+def test_collect_workspace_without_cost_leaves_cost_empty_and_calls_no_cost_api():
+    snapshot = _run(FakeRootClient())
+    assert snapshot.cost == []
+    # default path never touches get_cost_and_usage
+    client = FakeRootClient()
+    _run(client)
+    assert client._cost is None  # nothing requested get_cost_and_usage
+
+
+def test_collect_workspace_requires_cost_end_date_when_collecting_cost():
+    client = FakeRootClient(cost=FakeCostClient(responses=[_total_response("1.0")]))
+    with pytest.raises(ValueError, match="cost_end_date"):
+        collect_workspace(
+            client=client,
+            regions=["us-east-1"],
+            now=NOW,
+            collect_cost=True,
+        )
+
+
+def test_collect_workspace_collects_cost_estimates_on_snapshot():
+    cost_client = FakeCostClient(responses=[_total_response("12.50")])
+    client = FakeRootClient(cost=cost_client)
+    snapshot = collect_workspace(
+        client=client,
+        regions=["us-east-1"],
+        now=NOW,
+        collect_cost=True,
+        cost_end_date=COST_END,
+    )
+    assert isinstance(snapshot.cost, list)
+    assert len(snapshot.cost) == 1
+    assert isinstance(snapshot.cost[0], CostEstimate)
+    assert snapshot.cost[0].line_item == "total"
+    assert snapshot.cost[0].amount_usd == 12.5
+    assert cost_client.calls and "TimePeriod" in cost_client.calls[0]
+
+
+def test_collect_workspace_cost_never_enters_resources_or_counts():
+    s3 = FakeS3Client(buckets=[_bucket("my-bucket")], locations={})
+    cost_client = FakeCostClient(responses=[_total_response("12.50")])
+    snapshot = collect_workspace(
+        client=FakeRootClient(s3, cost=cost_client),
+        regions=["us-east-1"],
+        now=NOW,
+        collect_cost=True,
+        cost_end_date=COST_END,
+    )
+    assert {r.resource_type for r in snapshot.resources} == {
+        SWSResourceType.S3_BUCKET,
+    }
+    assert SWSResourceType.COST_DATA not in {
+        r.resource_type for r in snapshot.resources
+    }
+    assert set(snapshot.counts) == {
+        SWSResourceType.S3_BUCKET,
+        SWSResourceType.LAMBDA_FUNCTION,
+    }
+    assert SWSResourceType.COST_DATA not in snapshot.counts
+    assert SWSResourceType.COST_DATA not in snapshot.resource_types
+    assert snapshot.counts[SWSResourceType.S3_BUCKET] == 1
+    assert len(snapshot.cost) == 1
+
+
+def test_collect_workspace_cost_primary_failure_marks_partial():
+    cost_client = FakeCostClient(
+        responses=[_total_response("1.0")],
+        error_at={0},
+    )
+    client = FakeRootClient(cost=cost_client)
+    snapshot = collect_workspace(
+        client=client,
+        regions=["us-east-1"],
+        now=NOW,
+        collect_cost=True,
+        cost_end_date=COST_END,
+    )
+    assert snapshot.partial is True
+    assert snapshot.cost == []
+    assert any(
+        f.resource_type is SWSResourceType.COST_DATA
+        for f in snapshot.failures
+    )
+    cost_failure = next(
+        f for f in snapshot.failures if f.resource_type is SWSResourceType.COST_DATA
+    )
+    assert cost_failure.category is CollectionFailureCategory.PRIMARY
+    assert cost_failure.fatal is True
+
+
+def test_collect_workspace_cost_grouped_failure_returns_totals_and_partial():
+    response = {
+        "ResultsByTime": [
+            {
+                "TimePeriod": {"Start": "2026-01-01", "End": "2026-01-02"},
+                "Groups": [
+                    {
+                        "Keys": ["AmazonS3"],
+                        "Metrics": {"UnblendedCost": {"Amount": "5.0", "Unit": "USD"}},
+                    }
+                ],
+            }
+        ]
+    }
+    cost_client = FakeCostClient(
+        responses=[_total_response("9.0"), response],
+        error_at={1},
+    )
+    client = FakeRootClient(cost=cost_client)
+    snapshot = collect_workspace(
+        client=client,
+        regions=["us-east-1"],
+        now=NOW,
+        collect_cost=True,
+        cost_end_date=COST_END,
+        cost_group_by=["service"],
+    )
+    assert snapshot.partial is True  # grouped failure is a run-scoped failure
+    assert [e.line_item for e in snapshot.cost] == ["total"]
+    assert snapshot.cost[0].amount_usd == 9.0
+    cost_failure = next(
+        f for f in snapshot.failures if f.resource_type is SWSResourceType.COST_DATA
+    )
+    assert cost_failure.category is CollectionFailureCategory.ENRICHMENT
+    assert cost_failure.fatal is False
+
+
+def test_collect_workspace_cost_validates_bounds():
+    client = FakeRootClient(cost=FakeCostClient(responses=[_total_response("1.0")]))
+    for window_days in (0, MAX_COST_WINDOW_DAYS + 1, -3):
+        with pytest.raises(ValueError):
+            collect_workspace(
+                client=client,
+                regions=["us-east-1"],
+                now=NOW,
+                collect_cost=True,
+                cost_end_date=COST_END,
+                cost_window_days=window_days,
+            )
+    with pytest.raises(ValueError):
+        collect_workspace(
+            client=client,
+            regions=["us-east-1"],
+            now=NOW,
+            collect_cost=True,
+            cost_end_date=COST_END,
+            cost_group_by=["unknown_key"],
+        )
+
+
+def test_workspace_snapshot_cost_defaults_to_empty():
+    snapshot = _snapshot()
+    assert snapshot.cost == []
+
+
+def test_cost_presence_does_not_change_policy_outcomes():
+    """Policy evaluation is about resources, never about cost figures."""
+    from sws_agent.policy import evaluate_workspace
+
+    snapshot = _snapshot(
+        resources=[
+            ResourceRecord(
+                resource_id="bucket-a",
+                resource_type=SWSResourceType.S3_BUCKET,
+                owner_tag=None,
+            )
+        ],
+        cost=[CostEstimate(line_item="total", amount_usd=999.0, basis="b")],
+    )
+    decisions = evaluate_workspace(snapshot)
+    assert [d.rule for d in decisions] == ["missing_owner_tag"]

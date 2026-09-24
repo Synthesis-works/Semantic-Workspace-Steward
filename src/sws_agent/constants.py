@@ -297,6 +297,23 @@ SWS_SUPPORTED_POLICY_RULES: Final[frozenset[str]] = frozenset(
 )
 """The complete set of canonical deterministic policy rule identifiers."""
 
+# ---------------------------------------------------------------------------
+# Cost collection (M2C-E) controlled group-by vocabulary.
+# These are the only group-by keys the collector may request; anything else
+# is rejected rather than silently translated into an unknown dimension.
+# ---------------------------------------------------------------------------
+
+COST_GROUP_DIMENSION_SERVICE: Final[str] = "service"
+"""Group cost estimates by AWS service (Cost Explorer DIMENSION SERVICE)."""
+
+COST_GROUP_TAG_OWNER: Final[str] = "owner_tag"
+"""Group cost estimates by the ``Owner`` AWS tag value (Cost Explorer TAG)."""
+
+SWS_SUPPORTED_COST_GROUP_BY_KEYS: Final[frozenset[str]] = frozenset(
+    {COST_GROUP_DIMENSION_SERVICE, COST_GROUP_TAG_OWNER}
+)
+"""The complete set of cost group-by keys the collector may request."""
+
 SWS_SUPPORTED_EXECUTION_MODES: Final[frozenset[str]] = frozenset(
     mode.value for mode in ExecutionMode
 )

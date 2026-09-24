@@ -11,6 +11,8 @@ from __future__ import annotations
 from sws_agent.constants import (
     AWS_API_RETRY_ATTEMPTS,
     AWS_API_TIMEOUT_SECONDS,
+    COST_GROUP_DIMENSION_SERVICE,
+    COST_GROUP_TAG_OWNER,
     MAX_COST_GROUP_BY_KEYS,
     MAX_COST_WINDOW_DAYS,
     MAX_RESOURCES_FOR_RELATIONSHIP_DERIVATION,
@@ -21,6 +23,7 @@ from sws_agent.constants import (
     SMS_DEPRECATED_ACTIONS,
     SWS_SUPPORTED_ACTIONS,
     SWS_SUPPORTED_COLLECTION_FAILURE_CATEGORIES,
+    SWS_SUPPORTED_COST_GROUP_BY_KEYS,
     SWS_SUPPORTED_EXECUTION_MODES,
     SWS_SUPPORTED_POLICY_RULES,
     SWS_SUPPORTED_RELATIONSHIP_TYPES,
@@ -112,3 +115,15 @@ def test_limits_are_positive_and_documented_purposes_hold():
 def test_cost_window_never_exceeds_cost_explorer_daily_ceiling():
     """Cost Explorer's daily-granularity history limit is 366 days; SWS caps lower."""
     assert MAX_COST_WINDOW_DAYS <= 366
+
+
+def test_cost_group_by_keys_have_no_duplicate_values():
+    keys = [COST_GROUP_DIMENSION_SERVICE, COST_GROUP_TAG_OWNER]
+    assert len(keys) == len(set(keys)), "cost group-by keys contain duplicates"
+    assert SWS_SUPPORTED_COST_GROUP_BY_KEYS == set(keys)
+    assert len(SWS_SUPPORTED_COST_GROUP_BY_KEYS) <= MAX_COST_GROUP_BY_KEYS
+
+
+def test_cost_group_by_support_set_matches_documented_vocabulary():
+    assert COST_GROUP_DIMENSION_SERVICE in SWS_SUPPORTED_COST_GROUP_BY_KEYS
+    assert COST_GROUP_TAG_OWNER in SWS_SUPPORTED_COST_GROUP_BY_KEYS

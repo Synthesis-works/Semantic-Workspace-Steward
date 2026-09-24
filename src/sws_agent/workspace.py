@@ -26,11 +26,21 @@ Approved M2C-B decisions implemented here:
   exists, whether the failure is fatal (a primary list operation failed) or
   non-fatal (an enrichment lookup failed or a returned item was skipped).
 - No LLM, AWS SDK, network, or destructive operations occur here.
+
+M2C-E cost integration: when ``collect_cost`` is True, the run additionally
+collects account-level cost estimates through ``CostExplorerCollector`` on
+the same injected client and records them on ``snapshot.cost``. Cost data is
+additive and isolated: it never enters ``resources`` or ``counts`` (it is
+account-level aggregated data, not per-resource inventory), and its failures
+flow through the same run-scoped INVENTORY_QUERY ``partial`` / ``failures``
+contract. ``cost_end_date`` is required (and must be an explicit date) so a
+cost run is deterministic with no current-time dependence; ``collect_cost``
+defaults to False, preserving every existing caller.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -41,8 +51,9 @@ from .constants import (
     TraceEventType,
     TraceStatus,
 )
+from .cost_explorer import CostExplorerCollector
 from .inventory import INVENTORY_COLLECTORS, collect_all, normalize_limit
-from .models import CollectionFailure, ResourceRecord, WorkspaceSnapshot
+from .models import CollectionFailure, CostEstimate, ResourceRecord, WorkspaceSnapshot
 from .trace import TraceRecorder
 
 
@@ -124,6 +135,10 @@ def collect_workspace(
     run_id: str | None = None,
     partition: str = "aws",
     now: datetime | None = None,
+    collect_cost: bool = False,
+    cost_window_days: int | None = None,
+    cost_group_by: list[str] | None = None,
+    cost_end_date: date | None = None,
 ) -> WorkspaceSnapshot:
     """Collect a deterministic snapshot of a workspace's inventory.
 
@@ -141,6 +156,12 @@ def collect_workspace(
     for the run. ``snapshot_id`` defaults to a fresh hex UUID when omitted.
     ``now`` must be timezone-aware when supplied; otherwise the current UTC
     time is used.
+
+    Cost collection (M2C-E): passing ``collect_cost=True`` requires
+    ``cost_end_date`` (a ``datetime.date``), otherwise ValueError. The
+    collector validates ``cost_window_days`` and ``cost_group_by`` and raises
+    ValueError for out-of-bounds or unknown values. The injected ``client``
+    must expose ``get_cost_and_usage`` when cost collection is requested.
     """
     if not regions:
         raise ValueError(
@@ -152,6 +173,11 @@ def collect_workspace(
 
     if now is not None and now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
+
+    if collect_cost and cost_end_date is None:
+        raise ValueError(
+            "cost_end_date is required when collect_cost is True"
+        )
 
     effective_limit = normalize_limit(limit)
     recorder = trace if trace is not None else TraceRecorder()
@@ -166,6 +192,14 @@ def collect_workspace(
         trace=recorder,
         regions=list(regions),
     )
+
+    cost_estimates: list[CostEstimate] = []
+    if collect_cost:
+        cost_estimates = CostExplorerCollector(client, trace=recorder).collect(
+            window_days=cost_window_days,
+            end_date=cost_end_date,
+            group_by=cost_group_by,
+        )
 
     run_events = list(recorder)[start_len:]
     inventory_events = [
@@ -232,4 +266,5 @@ def collect_workspace(
             event.status is TraceStatus.FAILED for event in inventory_events
         ),
         failures=failures,
+        cost=cost_estimates,
     )

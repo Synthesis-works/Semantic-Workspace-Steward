@@ -71,6 +71,25 @@ def _region_from_arn(function_arn: str) -> str | None:
     return None
 
 
+def _aws_error_code(exc: Exception) -> str | None:
+    """Best-effort AWS error code from an SDK-shaped exception.
+
+    botocore ``ClientError`` carries the code on ``exc.response["Error"]
+    ["Code"]``. Reading it by attribute keeps SWS decoupled from boto3: the
+    collector never imports an AWS SDK, and hermetic fakes reproducing the
+    same attribute shape behave identically. Returns None when the exception
+    carries no recognizable AWS error code.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        if isinstance(error, dict):
+            code = error.get("Code")
+            if isinstance(code, str) and code:
+                return code
+    return None
+
+
 class _InventoryCollectorBase:
     """Shared trace plumbing for inventory collectors."""
 
@@ -193,6 +212,14 @@ class S3BucketCollector(_InventoryCollectorBase):
         try:
             response = self._client.get_bucket_tagging(Bucket=name)
         except Exception as exc:
+            if _aws_error_code(exc) == "NoSuchTagSet":
+                # Real S3 raises NoSuchTagSet when a bucket simply has no
+                # tags. That absence is a fact, not a collection failure: the
+                # record is preserved with owner_tag=None and no ENRICHMENT
+                # failure is traced, so a normal untagged bucket never makes
+                # the workspace snapshot partial or downgrades policy
+                # confidence.
+                return None
             self._trace_fail(
                 f"failed to read tags for bucket '{name}': {exc}",
                 resource_id=name,

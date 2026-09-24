@@ -28,6 +28,11 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+# Optional AWS SDK for real-client validation only. boto3 is NOT a runtime
+# dependency of the collector core: the hermetic unit suite never imports it.
+aws = [
+    "boto3>=1.34",
+]
 
 [project.urls]
 Repository = "https://github.com/Synthesis-works/Semantic-Workspace-Steward"

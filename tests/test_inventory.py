@@ -32,6 +32,27 @@ BUCKET_CREATED = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
 PARTITION_OWNER = {"ID": "123456789012", "DisplayName": "OwnerDisplay"}
 
 
+class NoSuchTagSetError(Exception):
+    """Hermetic stand-in for botocore ClientError with code NoSuchTagSet.
+
+    Mimics the ``.response["Error"]["Code"]`` attribute shape that real
+    botocore exceptions carry, without importing boto3 in the test suite.
+    """
+
+    def __init__(self, bucket: str):
+        super().__init__(
+            f"An error occurred (NoSuchTagSet) when calling the "
+            f"GetBucketTagging operation: bucket '{bucket}' has no tags"
+        )
+        self.response = {
+            "Error": {
+                "Code": "NoSuchTagSet",
+                "Message": "The TagSet does not exist",
+                "BucketName": bucket,
+            }
+        }
+
+
 def _bucket(name: str, **overrides) -> dict:
     bucket = {"Name": name, "CreationDate": BUCKET_CREATED}
     bucket.update(overrides)
@@ -68,6 +89,7 @@ class FakeS3Client:
         location_errors=None,
         tag_sets=None,
         tag_errors=None,
+        no_tag_sets=None,
         list_error=None,
     ):
         self._buckets = list(buckets or [])
@@ -76,6 +98,7 @@ class FakeS3Client:
         self._location_errors = set(location_errors or ())
         self._tag_sets = dict(tag_sets or {})
         self._tag_errors = set(tag_errors or ())
+        self._no_tag_sets = set(no_tag_sets or ())
         self._list_error = list_error
         self.list_calls = 0
         self.location_calls: dict[str, int] = {}
@@ -95,6 +118,8 @@ class FakeS3Client:
 
     def get_bucket_tagging(self, Bucket):
         self.tag_calls[Bucket] = self.tag_calls.get(Bucket, 0) + 1
+        if Bucket in self._no_tag_sets:
+            raise NoSuchTagSetError(Bucket)
         if Bucket in self._tag_errors:
             raise ValueError(f"tag access denied for {Bucket}")
         return {"TagSet": list(self._tag_sets.get(Bucket) or [])}
@@ -219,6 +244,56 @@ def test_s3_tag_failure_keeps_record_and_traces_failure():
     ]
     assert len(failures) == 1
     assert failures[0].metadata["resource_id"] == "denied"
+
+
+def test_s3_no_tag_set_is_empty_tags_and_not_a_failure():
+    """Real S3 raises NoSuchTagSet for untagged buckets (NOT an empty TagSet).
+
+    The bucket must be collected with owner_tag=None and NO ENRICHMENT
+    failure, so the workspace snapshot is not made partial solely because a
+    bucket has no tags.
+    """
+    client = FakeS3Client(
+        buckets=[_bucket("untagged"), _bucket("owned")],
+        locations={},
+        tag_sets={"owned": [{"Key": "Owner", "Value": "alice"}]},
+        no_tag_sets={"untagged"},
+    )
+    trace = TraceRecorder()
+    records = {r.resource_id: r for r in S3BucketCollector(client, trace=trace).collect()}
+    assert records["untagged"].owner_tag is None
+    assert records["owned"].owner_tag == "alice"
+    assert {r.resource_id for r in records.values()} == {"untagged", "owned"}
+    assert not [
+        e for e in trace
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.FAILED
+    ]
+
+
+def test_s3_no_tag_set_distinguished_from_other_tag_failures():
+    """NoSuchTagSet is treated as absence; AccessDenied stays an ENRICHMENT failure."""
+    client = FakeS3Client(
+        buckets=[_bucket("untagged"), _bucket("denied")],
+        locations={},
+        no_tag_sets={"untagged"},
+        tag_errors={"denied"},
+    )
+    trace = TraceRecorder()
+    records = {r.resource_id: r for r in S3BucketCollector(client, trace=trace).collect()}
+    assert {r.resource_id for r in records.values()} == {"untagged", "denied"}
+    assert all(r.owner_tag is None for r in records.values())
+    failures = [
+        e for e in trace
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.FAILED
+    ]
+    assert len(failures) == 1  # only the access-denied bucket failed
+    assert failures[0].metadata["resource_id"] == "denied"
+    assert (
+        failures[0].metadata["category"]
+        == CollectionFailureCategory.ENRICHMENT.value
+    )
 
 
 def test_s3_location_failure_keeps_record_with_none_region():

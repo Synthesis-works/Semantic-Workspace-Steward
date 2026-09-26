@@ -37,7 +37,7 @@ import json
 from typing import Any, Callable
 
 from .constants import ClaimKind, TraceEventType
-from .interfaces import ExplanationProvider, TraceSink
+from .interfaces import TraceSink
 from .models import ExplanationResult, PolicyDecision, ResourceRecord
 
 STRANDS_EXPLANATION_PROVIDER: str = "strands"
@@ -119,43 +119,6 @@ def _project_explanation_input(
 
 class StrandsUnavailableError(RuntimeError):
     """Raised when Strands is required but ``strands-agents`` is not installed."""
-
-
-def _project_explanation_input(
-    resource: ResourceRecord, decision: PolicyDecision
-) -> dict[str, Any]:
-    """Deterministic projection of a resource and decision into explainable facts.
-
-    Deliberately omits ``raw``, ``arn``, and ``account_id`` so the prompt never
-    carries raw API payloads or canonical identities beyond what the decision
-    exposes. The projection shape is stable and is what the deterministic
-    ``build_prompt`` serializes.
-    """
-    return {
-        "resource": {
-            "resource_id": resource.resource_id,
-            "resource_type": resource.resource_type.value,
-            "name": resource.name,
-            "region": resource.region,
-            "owner_tag": resource.owner_tag,
-            "created_at": (
-                resource.created_at.isoformat()
-                if resource.created_at is not None
-                else None
-            ),
-            "metrics": dict(resource.metrics),
-        },
-        "decision": {
-            "resource_id": decision.resource_id,
-            "recommended_action": decision.recommended_action.value,
-            "risk_level": decision.risk_level.value,
-            "rationale": decision.rationale,
-            "confidence": decision.confidence,
-            "needs_approval": decision.needs_approval,
-            "rule": decision.rule,
-            "evidence": decision.evidence,
-        },
-    }
 
 
 def build_prompt(resource: ResourceRecord, decision: PolicyDecision) -> str:

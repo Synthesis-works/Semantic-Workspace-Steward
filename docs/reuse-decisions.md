@@ -41,7 +41,25 @@ For every component reused from SMS, this document records:
 - Document-content ingestion and Comprehend processing
 - S3 Vectors / embedding architecture and provider fallbacks
 - Legacy CLI entry points and root-level debug scripts
-- SMS dependencies not needed now (pypdf, openpyxl, strands-agents, streamlit, pandas, altair)
+- SMS dependencies not needed now (pypdf, openpyxl, streamlit, pandas, altair)
+
+> Note: `strands-agents` is no longer on this exclusion list. It is an
+> **optional** dependency of the M3-A explanation layer (see "Optional layers"
+> below), not a runtime requirement of SWS.
+
+## Optional layers
+
+- **Explanation (M3-A)** — Strands (`strands-agents`) backs the optional
+  natural-language explanation layer behind the `ExplanationProvider`
+  protocol. It is an **optional** dependency installed via the `explanation`
+  extra; `NullExplanationProvider` remains the default, so SWS functions
+  fully with no LLM. `bedrock_explanation.py` never imports `strands` at
+  module import time (`build_strands_agent` imports it lazily), and the
+  injected-agent boundary keeps the hermetic suite free of AWS/Bedrock calls.
+  Explanations are `ClaimKind.INTERPRETED` only and never influence policy,
+  authorization, or risk decisions. Strands is the agent layer by design;
+  later agent capabilities (MCP/AgentCore) build on it rather than replacing
+  it with a direct boto3 caller.
 
 ## SMS-specific functionality NOT copied
 

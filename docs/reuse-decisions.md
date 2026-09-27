@@ -31,7 +31,9 @@ For every component reused from SMS, this document records:
 - **Domain models** — all `models.py` records (ResourceRecord, PolicyDecision, AuthorizationRequest, CostEstimate, ...) are new.
 - **Policy engine** — SMS's retention heuristics are not portable. Only the `PolicyEngine` protocol (interface) exists so far; the deterministic implementation is future work.
 - **Semantic layer, embeddings, provider adapters** — SMS-specific and excluded.
-- **Web simulator / dashboard** — SWS does not adopt the Streamlit dashboard; the eventual interactive layer will talk to the real MCP server.
+- **Web simulator / dashboard** — SWS does not adopt SMS's Streamlit
+  dashboard. Its M5 layer is a minimal vanilla HTML/JS page that talks to the
+  real MCP server (see "MCP server (M4)" and "Web simulator (M5)" above).
 
 ## Intentionally excluded from SWS
 
@@ -70,10 +72,25 @@ For every component reused from SMS, this document records:
   structured snapshot data with the client; distrusted input fails
   deterministically via `ToolError`. Explanations keep flowing only from
   `ExplanationProvider` (see above) and can never re-derive a decision.
-  No action-execution tool is exposed; the approval ticket lifecycle is the
-  extent of state mutation and never touches AWS. There is no authentication
-  yet — that boundary is documented for the AgentCore Harness (which consumes
-  this server via its remote MCP integration) to solve at deployment.
+No action-execution tool is exposed; the approval ticket lifecycle is the
+   extent of state mutation and never touches AWS. There is no authentication
+   yet — that boundary is documented for the AgentCore Harness (which consumes
+   this server via its remote MCP integration) to solve at deployment.
+
+- **Web simulator (M5)** — `sws_agent.simulator` is a local, browser-based
+  demo **over the real M4 MCP server**: the starlette web app drives the
+  actual Streamable HTTP endpoint via the official MCP SDK client, and the
+  server's `SwsBackend` is the deterministic `DemoBackend` (synthetic
+  inventory feeding the real policy/relationships/approval core). The demo
+  deliberately does NOT reuse SMS's Streamlit dashboard. It is a minimal
+  vanilla HTML/JS single page with a deterministic rule-based router and a
+  real per-session tool trace. All replies are derived from real MCP results
+  (failures surface as explicit errors, never fabricated success); the
+  dataset, cost figures, and explanations are clearly labeled synthetic; no
+  AWS access or action execution is possible; `decide_ticket` only updates an
+  in-memory store. Optional `simulator` extra (`starlette`, `mcp`, `uvicorn`);
+  no listeners on import (startup via `python -m sws_agent.simulator`); the
+  MCP-bound validation lives in `tests/test_simulator_mcp.py`.
 
 ## SMS-specific functionality NOT copied
 

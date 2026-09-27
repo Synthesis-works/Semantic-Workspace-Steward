@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SWS interactive demo (M5)</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">SWS</span>
+      <span class="brand-sub">interactive demo over the real M4 MCP server</span>
+    </div>
+    <div class="meta">
+      <span id="demo-badge" class="badge">demo</span>
+      <span id="mcp-endpoint" class="muted"></span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel chat-panel">
+      <div id="chat-log" class="chat-log" aria-live="polite"></div>
+      <div id="commands" class="commands"></div>
+      <form id="chat-form" class="composer" autocomplete="off">
+        <input
+          id="message-input"
+          type="text"
+          placeholder="Try: Audit my AWS workspace"
+          aria-label="Message"
+        />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+    <aside class="panel trace-panel">
+      <h2>MCP activity trace</h2>
+      <p class="hint">Every entry is a real tool call on the Streamable HTTP MCP server.</p>
+      <ul id="trace" class="trace-list"></ul>
+      <h2>Tools exposed</h2>
+      <ul id="tools" class="tools-list"></ul>
+    </aside>
+  </main>
+
+  <footer class="footer">
+    Synthetic demo environment: no AWS access, no real cost figures, no actions executed.
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

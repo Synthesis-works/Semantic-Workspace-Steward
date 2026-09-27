@@ -47,6 +47,14 @@ mcp = [
     "mcp>=2.1",
     "uvicorn",
 ]
+# Optional web simulator extras (M5): a local-only interactive demo UI over
+# the real M4 Streamable HTTP MCP server. starlette only serves the demo web
+# app; uvicorn and the official MCP client ride the mcp extra transitively.
+simulator = [
+    "starlette",
+    "mcp>=2.1",
+    "uvicorn",
+]
 
 [project.urls]
 Repository = "https://github.com/Synthesis-works/Semantic-Workspace-Steward"

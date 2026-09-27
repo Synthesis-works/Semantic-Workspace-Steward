@@ -199,6 +199,22 @@ class CostEstimate(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
 
 
+class CostCollectionReport(BaseModel):
+    """Honest summary of a standalone cost-collection run (M7).
+
+    Produced by the MCP backend for the ``get_cost_estimates`` path: it
+    carries the estimate rows plus the same completeness contract the
+    workspace snapshot applies to cost. ``truncated`` is True only when the
+    collector observed genuinely more Cost Explorer pages than it returned,
+    and ``failures`` maps the run's FAILED INVENTORY_QUERY trace events 1:1.
+    The standalone tool never hides a truncation or a failure.
+    """
+
+    estimates: list[CostEstimate] = Field(default_factory=list)
+    truncated: bool = False
+    failures: list[CollectionFailure] = Field(default_factory=list)
+
+
 class PolicyDecision(BaseModel):
     """Output of deterministic policy evaluation.
 
@@ -288,6 +304,31 @@ class ApprovalTicket(BaseModel):
     decision_reason: str = ""
 
     @field_validator("action", "status", mode="before")
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class ActionPlan(BaseModel):
+    """Output of the pre-execution action-planning workflow (M7).
+
+    A deterministic plan for one candidate action: the authorization
+    decision rendered from the configured execution mode and, whenever the
+    gate requires human approval, the created PENDING approval ticket.
+    ``executed`` is always False: SWS plans and authorizes but never
+    executes an AWS action (no executor exists yet).
+    """
+
+    resource_id: str = Field(min_length=1)
+    action: PotentialAction
+    execution_mode: ExecutionMode
+    authorization: AuthorizationResult
+    ticket: ApprovalTicket | None = None
+    executed: bool = False
+
+    @field_validator("action", "execution_mode", mode="before")
     @classmethod
     def _normalize(cls, value: Any) -> Any:
         if isinstance(value, str):

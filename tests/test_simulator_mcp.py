@@ -112,8 +112,9 @@ def test_tool_discovery_matches_the_real_m4_toolset(
         "get_cost_estimates",
         "get_relationships",
         "list_approvals",
+        "request_approval",
     }
-    assert len(names) == 8
+    assert len(names) == 9
     assert not any("execute" in name or "apply" in name for name in names)
 
 

@@ -1,13 +1,11 @@
 """MCP boundary for SWS.
 
 SWS exposes its orchestration through a real MCP server using the
-Streamable HTTP transport. The MCP layer is a thin adapter over SWS
-business logic: policy, authorization, and action logic never live here.
-
-Nothing in this module claims MCP compliance. The dependency-free
-``ToolRegistry`` prepares the integration and is genuinely tested;
-wiring an actual MCP SDK server on top of it is a future task that must
-be implemented and tested before any compliance is claimed.
+Streamable HTTP transport (``mcp/server.py``). The MCP layer is a thin
+adapter over SWS business logic: policy, authorization, and action logic
+never live here. ``SwsMcpServer`` consumes the dependency-free
+``ToolRegistry`` defined in this module and wires each registered tool
+into the Streamable HTTP server; the simulator runs the same server.
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 class MCPServer(Protocol):
-    """Boundary for the eventual real MCP server.
+    """Boundary implemented by the real MCP server in ``mcp/server.py``.
 
     ``transport`` selects the MCP transport; SWS targets Streamable HTTP.
     """
@@ -32,8 +30,9 @@ class MCPServer(Protocol):
 class ToolRegistry:
     """Dependency-free registry mapping tool names to handler functions.
 
-    Testable without the MCP SDK. A future real MCP server consumes this
-    registry and wires each handler into the Streamable HTTP server.
+    Consumed by ``SwsMcpServer`` (``mcp/server.py``), which wires each
+    registered handler into the Streamable HTTP server. Kept SDK-free so
+    the dispatch logic stays testable without the MCP SDK.
     """
 
     _handlers: dict[str, ToolHandler] = field(default_factory=dict)

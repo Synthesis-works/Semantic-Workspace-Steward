@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from sws_agent.config import AWSConnectionConfig, SWSRuntimeConfig
+from sws_agent.config import (
+    SWS_EXECUTION_MODE_ENV,
+    AWSConnectionConfig,
+    SWSRuntimeConfig,
+    execution_mode_from_env,
+)
 from sws_agent.constants import ExecutionMode, MAX_COST_WINDOW_DAYS
 
 
@@ -52,3 +57,36 @@ def test_aws_config_accepts_region_only():
 def test_aws_config_accepts_profile_only():
     config = AWSConnectionConfig(profile="dev")
     assert config.profile == "dev"
+
+
+def test_execution_mode_defaults_to_safe_when_env_absent(monkeypatch):
+    monkeypatch.delenv(SWS_EXECUTION_MODE_ENV, raising=False)
+    assert execution_mode_from_env() is ExecutionMode.SAFE
+
+
+def test_execution_mode_blank_env_resolves_to_safe(monkeypatch):
+    monkeypatch.setenv(SWS_EXECUTION_MODE_ENV, "   ")
+    assert execution_mode_from_env() is ExecutionMode.SAFE
+
+
+def test_execution_mode_parses_valid_env(monkeypatch):
+    monkeypatch.setenv(SWS_EXECUTION_MODE_ENV, "autonomous")
+    assert execution_mode_from_env() is ExecutionMode.AUTONOMOUS
+
+
+def test_execution_mode_env_value_is_exact_lowercase(monkeypatch):
+    for raw in ("safe", "review", "autonomous"):
+        monkeypatch.setenv(SWS_EXECUTION_MODE_ENV, raw)
+        assert execution_mode_from_env() is ExecutionMode(raw)
+
+
+def test_execution_mode_env_mixed_case_fails_fast(monkeypatch):
+    monkeypatch.setenv(SWS_EXECUTION_MODE_ENV, "Safe")
+    with pytest.raises(ValidationError):
+        execution_mode_from_env()
+
+
+def test_execution_mode_unknown_env_fails_fast(monkeypatch):
+    monkeypatch.setenv(SWS_EXECUTION_MODE_ENV, "run_amok")
+    with pytest.raises(ValidationError):
+        execution_mode_from_env()

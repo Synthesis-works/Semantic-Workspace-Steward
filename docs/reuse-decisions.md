@@ -107,6 +107,20 @@ No action-execution tool is exposed; the approval ticket lifecycle is the
   `SWS_AWS_REGION` / `SWS_AWS_PROFILE` when launching the M4 server
   (`python -m sws_agent.mcp.server`).
 
+- **Action planning workflow (M7)** — `sws_agent.workflow.ActionPlanner`
+  makes the pre-existing deterministic authorization gate reachable end to
+  end: it maps a candidate `(resource, action)` through `ActionAuthorizer`
+  and, whenever the gate requires human approval, creates a PENDING ticket
+  in the approval store. It is bounded strictly pre-execution — it plans,
+  it never executes (no `ActionExecutor` exists; `ActionPlan.executed` is
+  always `False`) and makes no AWS calls. The execution mode is an operator
+  setting (`SWS_EXECUTION_MODE`, validated through `SWSRuntimeConfig`)
+  fixed at backend construction — never a per-request client input — so
+  callers cannot widen autonomy. The MCP surface gains one additive tool
+  (`request_approval`) and `get_cost_estimates` now honestly reports
+  `truncated`/`failures` from the same trace semantics as workspace audit.
+  Existing tool contracts are unchanged except additive keys.
+
 ## SMS-specific functionality NOT copied
 
 SMS itself (its governance product, pipeline, agent, evaluation harness, demo

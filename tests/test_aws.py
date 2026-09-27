@@ -391,13 +391,15 @@ def test_backend_get_cost_estimates_through_factory() -> None:
             )
         )
     )
-    estimates = backend.get_cost_estimates(
+    report = backend.get_cost_estimates(
         end_date=date(2026, 2, 1), window_days=7
     )
-    assert len(estimates) == 1
-    assert estimates[0].line_item == "total"
-    assert estimates[0].amount_usd == 12.34
-    assert estimates[0].projected is True
+    assert len(report.estimates) == 1
+    assert report.estimates[0].line_item == "total"
+    assert report.estimates[0].amount_usd == 12.34
+    assert report.estimates[0].projected is True
+    assert report.truncated is False
+    assert report.failures == []
 
 
 # 8. MCP tools flow through the injected factory end-to-end.

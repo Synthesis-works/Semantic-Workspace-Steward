@@ -33,12 +33,13 @@ SWS is built up in feature milestones. What is implemented so far:
   recording, protocol interfaces, deterministic authorization, relationship
   derivation, workspace collection, and the deterministic policy engine.
 - **M2C/M3/M4** — a real MCP server over Streamable HTTP
-  (`src/sws_agent/mcp/server.py`) exposing **eight tools**
+  (`src/sws_agent/mcp/server.py`) exposing **nine tools**
   (`audit_workspace`, `collect_workspace`, `get_relationships`,
   `evaluate_workspace`, `get_cost_estimates`, `explain_resource`,
-  `list_approvals`, `decide_ticket`) over a thin `SwsBackend` seam. It is
-  wired, invoked, and tested against the official MCP SDK v2 client. AWS
-  collectors are still injected via a backend, never hard-wired.
+  `list_approvals`, `decide_ticket`, `request_approval`) over a thin
+  `SwsBackend` seam. It is wired, invoked, and tested against the official
+  MCP SDK v2 client. AWS collectors are still injected via a backend, never
+  hard-wired.
 - **M5** — a local, demo-only **web simulator** (below) that talks to the
   real M4 MCP server through the official MCP client.
 - **M6** — a **real AWS client factory** (`src/sws_agent/aws.py`) that adapts
@@ -47,6 +48,16 @@ SWS is built up in feature milestones. What is implemented so far:
   injection seam. No collector, policy, or MCP contract changed. Real-AWS mode
   is opt-in via `SWS_AWS_REGION` / `SWS_AWS_PROFILE` (see below); the hermetic
   default and the deterministic no-factory `ToolError` are preserved.
+- **M7** — a **safe action-planning & authorization workflow (pre-execution)**:
+  the new `request_approval` tool plans one candidate action through the
+  deterministic `ActionAuthorizer` gate, returns the decision, and opens a
+  `PENDING` approval ticket whenever the gate requires human approval. The
+  operator-level `SWS_EXECUTION_MODE` env var (safe/review/autonomous) fixes
+  autonomy at server construction — never per request — so a caller can't
+  widen it. Nothing executes: `ActionPlan.executed` is always `False`, no
+  `ActionExecutor` exists, and `get_cost_estimates` now honestly surfaces
+  truncation and per-collector failures (matching the workspace audit
+  contract) instead of silently dropping them.
 
 It does **not** yet:
 
@@ -218,6 +229,32 @@ Lambda client for the configured region. Region lists passed to the workspace
 collectors are preserved as snapshot metadata, but Lambda inventory is scanned
 from the configured region only. Multi-region Lambda scanning requires
 per-region client injection and is deliberately outside M6.
+
+## M7: safe action-planning & authorization workflow
+
+M7 makes the pre-execution authorization boundary reachable end-to-end:
+`request_approval` maps a candidate (resource, action) through the existing
+deterministic `ActionAuthorizer` and, whenever the gate requires human
+approval, opens a `PENDING` ticket in the approval store. The simulator
+`DemoBackend` exercises the same real planner, so the demo behaves exactly
+as production does.
+
+- The **execution mode** is an operator setting (`SWS_EXECUTION_MODE`,
+  values `safe`/`review`/`autonomous`, validated through `SWSRuntimeConfig`
+  — absent/blank means `safe`). It is fixed at backend construction; it is
+  never a per-request client input, so callers cannot widen autonomy.
+- `request_approval(resource_id, resource_type, action, rationale="")`
+  returns `{"plan": {...}}` with the authorization decision and, when
+  required, the PENDING ticket. Zero-side-effect actions (`leave`,
+  `flag_for_review`) authorize without a ticket; `stop_resource` requires
+  human approval in `safe`/`review` and authorizes in `autonomous`.
+- M7 is strictly pre-execution: `ActionPlan.executed` is always `False`,
+  there is no action executor, and no AWS call is ever made by the planner.
+- Cost honesty add-on: the standalone `get_cost_estimates` tool now reports
+  `truncated` and `failures` alongside `cost_estimates`, derived from the
+  same trace semantics as workspace audit — a paged Cost Explorer response
+  that hits the 20-page cap is marked truncated instead of silently sold as
+  complete.
 
 ## Layout
 

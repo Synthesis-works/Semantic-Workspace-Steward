@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +26,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from sws_agent.approval import InMemoryApprovalStore
 from sws_agent.constants import (
+    ExecutionMode,
     PotentialAction,
     RiskLevel,
     SWSResourceType,
@@ -44,11 +45,13 @@ from sws_agent.mcp.server import (
 )
 from sws_agent.models import (
     ClaimKind,
+    CostCollectionReport,
     ExplanationResult,
     PolicyDecision,
     ResourceRecord,
     WorkspaceSnapshot,
 )
+from sws_agent.workflow import ActionPlanner
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -198,8 +201,8 @@ class SeededBackend:
         end_date: object,
         window_days: int | None = None,
         group_by: list[str] | None = None,
-    ) -> list:
-        return self.cost_estimates
+    ) -> CostCollectionReport:
+        return CostCollectionReport(estimates=self.cost_estimates)
 
     def explain(
         self, resource: ResourceRecord, decision: PolicyDecision
@@ -223,6 +226,25 @@ class SeededBackend:
             )
         return self.approval_store.deny(
             ticket_id, decided_by=decided_by, reason=reason
+        )
+
+    def request_approval(
+        self,
+        *,
+        resource_id: str,
+        resource_type: object,
+        action: object,
+        rationale: str = "",
+    ) -> object:
+        # Exercises the REAL M7 workflow through the fake backend seam.
+        return ActionPlanner(
+            approval_store=self.approval_store,
+            execution_mode=ExecutionMode.SAFE,
+        ).plan(
+            resource_id=resource_id,
+            resource_type=resource_type,
+            action=action,
+            rationale=rationale,
         )
 
 
@@ -276,18 +298,19 @@ def test_backend_conforms_to_sws_backend_protocol(seeded: SeededBackend):
         "explain",
         "list_approvals",
         "decide_ticket",
+        "request_approval",
     ):
         assert callable(getattr(seeded, name, None)), name
     # The protocol is importable and accepts the fake structurally.
     assert isinstance(seeded, SwsBackend)
 
 
-# 2. All eight built-in tools registered
-def test_all_eight_builtin_tools_registered(server: SwsMcpServer):
-    assert len(server.registry.names()) == len(BUILTIN_TOOL_NAMES) == 8
+# 2. All nine built-in tools registered
+def test_all_nine_builtin_tools_registered(server: SwsMcpServer):
+    assert len(server.registry.names()) == len(BUILTIN_TOOL_NAMES) == 9
     assert set(server.registry.names()) == set(BUILTIN_TOOL_NAMES)
     tools = _run(server.list_tools())
-    assert len(tools) == 8
+    assert len(tools) == 9
     assert {tool["name"] for tool in tools} == set(BUILTIN_TOOL_NAMES)
 
 
@@ -328,6 +351,7 @@ def test_deterministic_metadata_and_schemas(seeded: SeededBackend):
         ("evaluate_workspace", {}),
         ("get_relationships", {}),
         ("explain_resource", {}),
+        ("request_approval", {}),
     ],
 )
 def test_missing_or_unknown_arguments_fail_deterministically(
@@ -393,7 +417,10 @@ def test_get_cost_estimates_happy_path_with_seeded_backend(
         "get_cost_estimates", {"end_date": "2026-01-02", "window_days": 30}
     ))
     assert result.is_error is False
-    assert _payload(result)["cost_estimates"] == []
+    payload = _payload(result)
+    assert payload["cost_estimates"] == []
+    assert payload["truncated"] is False
+    assert payload["failures"] == []
 
 
 def test_decide_ticket_happy_path(server: SwsMcpServer):
@@ -590,3 +617,96 @@ def test_registry_seam_dispatches_builtin_tools(
 def test_unknown_tool_raises_tool_error(server: SwsMcpServer):
     with pytest.raises(ToolError):
         _run(server.call_tool("not_a_real_tool", {}))
+
+
+# 17. M7 request_approval: the pre-execution authorization workflow tool.
+def test_request_approval_pending_action_creates_ticket(
+    server: SwsMcpServer, seeded: SeededBackend
+):
+    result = _run(server.call_tool(
+        "request_approval",
+        {
+            "resource_id": "fn-1",
+            "resource_type": "lambda_function",
+            "action": "stop_resource",
+            "rationale": "candidate for review",
+        },
+    ))
+    assert result.is_error is False
+    plan = _payload(result)["plan"]
+    assert plan["resource_id"] == "fn-1"
+    assert plan["action"] == "stop_resource"
+    assert plan["execution_mode"] == "safe"
+    assert plan["authorization"]["decision"] == "pending_approval"
+    assert plan["authorization"]["requires_human_approval"] is True
+    assert plan["executed"] is False
+    assert plan["ticket"]["status"] == "pending"
+    assert plan["ticket"]["rationale"] == "candidate for review"
+    tickets = seeded.approval_store.pending()
+    assert [t.ticket_id for t in tickets] == [plan["ticket"]["ticket_id"]]
+
+
+def test_request_approval_zero_side_effect_action_no_ticket(
+    server: SwsMcpServer, seeded: SeededBackend
+):
+    result = _run(server.call_tool(
+        "request_approval",
+        {"resource_id": "b-1", "resource_type": "s3_bucket", "action": "leave"},
+    ))
+    assert result.is_error is False
+    plan = _payload(result)["plan"]
+    assert plan["authorization"]["decision"] == "authorized"
+    assert plan["ticket"] is None
+    assert plan["executed"] is False
+    assert seeded.approval_store.pending() == []
+
+
+def test_request_approval_invalid_action_is_error(server: SwsMcpServer):
+    with pytest.raises(ToolError) as exc:
+        _run(server.call_tool(
+            "request_approval",
+            {"resource_id": "b-1", "resource_type": "s3_bucket", "action": "run_amok"},
+        ))
+    assert "validation" in str(exc.value).lower()
+
+
+def test_request_approval_invalid_resource_type_is_error(server: SwsMcpServer):
+    with pytest.raises(ToolError) as exc:
+        _run(server.call_tool(
+            "request_approval",
+            {"resource_id": "b-1", "resource_type": "not_a_type", "action": "leave"},
+        ))
+    assert "validation" in str(exc.value).lower()
+
+
+# 18. M7 honesty add-on: the standalone cost tool surfaces truncation.
+def test_get_cost_estimates_surfaces_truncation_via_trace():
+    class TruncatingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_cost_and_usage(self, **kwargs):
+            self.calls += 1
+            return {
+                "ResultsByTime": [{"Total": {"UnblendedCost": {"Amount": "1.00"}}}],
+                "NextPageToken": "more",
+            }
+
+    backend = DefaultSwsBackend(client_factory=lambda: TruncatingClient())
+    report = backend.get_cost_estimates(end_date=date(2026, 2, 1), window_days=7)
+    assert report.truncated is True
+    assert report.estimates
+    assert report.failures == []
+
+
+def test_get_cost_estimates_surfaces_primary_failure():
+    class FailingClient:
+        def get_cost_and_usage(self, **kwargs):
+            raise RuntimeError("cost service unavailable")
+
+    backend = DefaultSwsBackend(client_factory=lambda: FailingClient())
+    report = backend.get_cost_estimates(end_date=date(2026, 2, 1), window_days=7)
+    assert report.estimates == []
+    assert len(report.failures) == 1
+    assert report.failures[0].category == "primary"
+    assert report.failures[0].fatal is True

@@ -5,7 +5,7 @@ interfaces.py; every interface in this module is written fresh for SWS's
 AWS workspace domain.
 
 These boundaries keep the MCP layer thin: business logic implements these
-Protocols, and the MCP adapter (future) only adapts them to MCP tools and
+Protocols, and the MCP adapter only adapts them to MCP tools and
 resources. Policy, authorization, and action logic never live in the MCP
 layer.
 """

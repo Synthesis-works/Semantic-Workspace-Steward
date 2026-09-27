@@ -23,10 +23,12 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from ..approval import InMemoryApprovalStore
-from ..constants import PotentialAction, SWSResourceType
+from ..constants import ExecutionMode, PotentialAction, SWSResourceType
 from ..models import (
+    ActionPlan,
     ApprovalTicket,
     ClaimKind,
+    CostCollectionReport,
     CostEstimate,
     ExplanationResult,
     PolicyDecision,
@@ -36,6 +38,7 @@ from ..models import (
 )
 from ..policy import evaluate_workspace as _evaluate_workspace
 from ..relationships import derive_relationships as _derive_relationships
+from ..workflow import ActionPlanner
 
 # Sentinel distinguishing this workspace from any live-AWS snapshot.
 DEMO_PROVIDER = "demo"
@@ -204,6 +207,10 @@ class DemoBackend:
     def __init__(self) -> None:
         self.snapshot = build_demo_snapshot()
         self._approvals = InMemoryApprovalStore()
+        self._planner = ActionPlanner(
+            approval_store=self._approvals,
+            execution_mode=ExecutionMode.SAFE,
+        )
         self._seed_tickets()
 
     def _seed_tickets(self) -> None:
@@ -259,8 +266,12 @@ class DemoBackend:
         end_date: date,
         window_days: int | None = None,
         group_by: list[str] | None = None,
-    ) -> list[CostEstimate]:
-        return demo_cost_estimates()
+    ) -> CostCollectionReport:
+        return CostCollectionReport(
+            estimates=demo_cost_estimates(),
+            truncated=False,
+            failures=[],
+        )
 
     def explain(
         self, resource: ResourceRecord, decision: PolicyDecision
@@ -284,4 +295,21 @@ class DemoBackend:
             )
         return self._approvals.deny(
             ticket_id, decided_by=decided_by, reason=reason
+        )
+
+    def request_approval(
+        self,
+        *,
+        resource_id: str,
+        resource_type: SWSResourceType,
+        action: PotentialAction,
+        rationale: str = "",
+    ) -> ActionPlan:
+        # Delegates to the REAL ActionPlanner, so the demo exercises the
+        # actual deterministic authorization gate over synthetic resources.
+        return self._planner.plan(
+            resource_id=resource_id,
+            resource_type=resource_type,
+            action=action,
+            rationale=rationale,
         )

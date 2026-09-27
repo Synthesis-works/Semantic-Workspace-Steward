@@ -48,10 +48,20 @@ from pydantic import BaseModel, ValidationError
 
 from ..approval import ApprovalError, InMemoryApprovalStore, UnknownTicketError
 from ..aws import AwsClientFactory, aws_config_from_env
+from ..config import execution_mode_from_env
+from ..constants import (
+    ExecutionMode,
+    PotentialAction,
+    SWSResourceType,
+    TraceEventType,
+    TraceStatus,
+)
 from ..cost_explorer import CostExplorerCollector
 from ..explanation import NullExplanationProvider
 from ..models import (
+    ActionPlan,
     ApprovalTicket,
+    CostCollectionReport,
     CostEstimate,
     ExplanationResult,
     PolicyDecision,
@@ -60,7 +70,12 @@ from ..models import (
 )
 from ..policy import evaluate_workspace
 from ..relationships import WorkspaceSnapshotTooLargeError, derive_relationships
-from ..workspace import collect_workspace as _collect_workspace
+from ..trace import TraceRecorder
+from ..workflow import ActionPlanner
+from ..workspace import (
+    _failure_from_event,
+    collect_workspace as _collect_workspace,
+)
 from . import ToolHandler, ToolRegistry
 
 SERVER_NAME: str = "sws"
@@ -70,8 +85,9 @@ SERVER_DESCRIPTION: str = (
     "relationships, policy, cost, and explanation over MCP."
 )
 
-# Tools are intentionally limited to read-only analysis and the approval
-# ticket lifecycle. No action-execution (e.g. STOP_RESOURCE) tool is exposed.
+# Tools are intentionally limited to read-only analysis, the approval
+# ticket lifecycle, and the pre-execution authorization workflow. No
+# action-execution (e.g. STOP_RESOURCE) tool is exposed.
 BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "audit_workspace",
     "collect_workspace",
@@ -81,6 +97,7 @@ BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "explain_resource",
     "list_approvals",
     "decide_ticket",
+    "request_approval",
 )
 
 
@@ -120,7 +137,7 @@ class SwsBackend(Protocol):
         end_date: date,
         window_days: int | None = None,
         group_by: list[str] | None = None,
-    ) -> list[CostEstimate]: ...
+    ) -> CostCollectionReport: ...
 
     def explain(
         self, resource: ResourceRecord, decision: PolicyDecision
@@ -137,6 +154,15 @@ class SwsBackend(Protocol):
         reason: str = "",
     ) -> ApprovalTicket: ...
 
+    def request_approval(
+        self,
+        *,
+        resource_id: str,
+        resource_type: SWSResourceType,
+        action: PotentialAction,
+        rationale: str = "",
+    ) -> ActionPlan: ...
+
 
 class DefaultSwsBackend:
     """Production backend: real SWS modules, injected AWS client factory.
@@ -152,11 +178,19 @@ class DefaultSwsBackend:
         *,
         explainer: Any | None = None,
         approval_store: Any | None = None,
+        execution_mode: ExecutionMode = ExecutionMode.SAFE,
     ) -> None:
         self._client_factory = client_factory
         self._explainer = explainer if explainer is not None else NullExplanationProvider()
         self._approval_store = (
             approval_store if approval_store is not None else InMemoryApprovalStore()
+        )
+        # M7: the authorization gate is now reachable through the backend.
+        # The execution mode is fixed at construction (an operator setting);
+        # it is never a per-request client input.
+        self._planner = ActionPlanner(
+            approval_store=self._approval_store,
+            execution_mode=execution_mode,
         )
 
     def _client(self) -> Any:
@@ -204,12 +238,17 @@ class DefaultSwsBackend:
         end_date: date,
         window_days: int | None = None,
         group_by: list[str] | None = None,
-    ) -> list[CostEstimate]:
-        return CostExplorerCollector(self._client()).collect(
+    ) -> CostCollectionReport:
+        # M7 honesty add-on: the standalone cost tool now runs behind a
+        # fresh trace so truncation and failures are surfaced instead of
+        # silently dropped (matching the audit_workspace cost contract).
+        recorder = TraceRecorder()
+        estimates = CostExplorerCollector(self._client(), trace=recorder).collect(
             window_days=window_days,
             end_date=end_date,
             group_by=group_by,
         )
+        return _cost_report_from_trace(estimates, list(recorder))
 
     def explain(
         self, resource: ResourceRecord, decision: PolicyDecision
@@ -236,6 +275,21 @@ class DefaultSwsBackend:
                 ticket_id, decided_by=decided_by, reason=reason
             )
         raise ToolError("decision must be 'grant' or 'deny'")
+
+    def request_approval(
+        self,
+        *,
+        resource_id: str,
+        resource_type: SWSResourceType,
+        action: PotentialAction,
+        rationale: str = "",
+    ) -> ActionPlan:
+        return self._planner.plan(
+            resource_id=resource_id,
+            resource_type=resource_type,
+            action=action,
+            rationale=rationale,
+        )
 
 
 def _jsonable(value: Any) -> Any:
@@ -296,10 +350,52 @@ def _snapshot_from(value: Any) -> WorkspaceSnapshot:
         ) from None
 
 
+def _cost_report_from_trace(
+    estimates: list[CostEstimate], events: list[Any]
+) -> CostCollectionReport:
+    """Derive the honest completeness summary from a cost run's trace.
+
+    Mirrors the workspace snapshot contract for cost data (M2C-B/M2C-E):
+    ``truncated`` is True only when a SUCCEEDED INVENTORY_QUERY event carries
+    genuine "more data existed" metadata, and ``failures`` maps every FAILED
+    INVENTORY_QUERY event 1:1 via the same workspace failure builder.
+    """
+    inventory_events = [
+        event
+        for event in events
+        if event.event_type is TraceEventType.INVENTORY_QUERY
+    ]
+    succeeded_types: set[SWSResourceType] = set()
+    for event in inventory_events:
+        if event.status is not TraceStatus.SUCCEEDED:
+            continue
+        try:
+            succeeded_types.add(
+                SWSResourceType((event.metadata or {}).get("resource_type"))
+            )
+        except (TypeError, ValueError):
+            continue
+    truncated = any(
+        event.status is TraceStatus.SUCCEEDED
+        and (event.metadata or {}).get("truncated") is True
+        for event in inventory_events
+    )
+    failures = [
+        failure
+        for event in inventory_events
+        if event.status is TraceStatus.FAILED
+        for failure in [_failure_from_event(event, succeeded_types=succeeded_types)]
+        if failure is not None
+    ]
+    return CostCollectionReport(
+        estimates=estimates, truncated=truncated, failures=failures
+    )
+
+
 def _adapter_functions(
     backend: SwsBackend,
 ) -> list[tuple[str, str, Callable[..., dict[str, Any]]]]:
-    """The eight built-in tools: (name, description, typed handler)."""
+    """The nine built-in tools: (name, description, typed handler)."""
 
     def collect_workspace(
         *,
@@ -381,15 +477,19 @@ def _adapter_functions(
         parsed_end_date = _date_optional(end_date)
         if parsed_end_date is None:
             raise ToolError("end_date is required and must be an ISO date (YYYY-MM-DD)")
-        estimates = backend.get_cost_estimates(
+        report = backend.get_cost_estimates(
             end_date=parsed_end_date,
             window_days=window_days,
             group_by=group_by,
         )
         return {
             "cost_estimates": [
-                _jsonable(e.model_dump()) for e in estimates
-            ]
+                _jsonable(e.model_dump()) for e in report.estimates
+            ],
+            "truncated": report.truncated,
+            "failures": [
+                _jsonable(f.model_dump()) for f in report.failures
+            ],
         }
 
     def explain_resource(
@@ -443,6 +543,21 @@ def _adapter_functions(
             reason=reason,
         )
         return {"ticket": _jsonable(ticket.model_dump())}
+
+    def request_approval(
+        *,
+        resource_id: str,
+        resource_type: str,
+        action: str,
+        rationale: str = "",
+    ) -> dict[str, Any]:
+        plan = backend.request_approval(
+            resource_id=resource_id,
+            resource_type=resource_type,
+            action=action,
+            rationale=rationale,
+        )
+        return {"plan": _jsonable(plan.model_dump())}
 
     tools: list[tuple[str, str, Callable[..., dict[str, Any]]]] = [
         (
@@ -517,6 +632,17 @@ def _adapter_functions(
                 "the approval store; never executes an AWS action."
             ),
             _guarded(decide_ticket),
+        ),
+        (
+            "request_approval",
+            (
+                "Plan one candidate action against the deterministic "
+                "authorization gate for the server's configured execution "
+                "mode. Returns the authorization decision and, when human "
+                "approval is required, creates a PENDING approval ticket. "
+                "Nothing is executed."
+            ),
+            _guarded(request_approval),
         ),
     ]
     return tools
@@ -635,16 +761,26 @@ def main(argv: list[str] | None = None) -> int:
     lazily, at tool execution time. Without them the server stays fully
     hermetic (the existing no-factory deterministic ``ToolError``). No AWS
     calls and no boto3 import happen at startup or on import either way.
+
+    ``SWS_EXECUTION_MODE`` (safe/review/autonomous) sets the operator-level
+    execution mode consumed by the ``request_approval`` authorization gate
+    (M7); absent or invalid-free, it validates via ``SWSRuntimeConfig`` and
+    fails fast on unknown values, defaulting to ``safe``.
     """
     parser = argparse.ArgumentParser(prog="sws-mcp-server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--path", default="/mcp")
     args = parser.parse_args(argv)
-    backend = None
     config = aws_config_from_env()
+    execution_mode = execution_mode_from_env()
     if config is not None:
-        backend = DefaultSwsBackend(client_factory=AwsClientFactory(config=config))
+        backend = DefaultSwsBackend(
+            client_factory=AwsClientFactory(config=config),
+            execution_mode=execution_mode,
+        )
+    else:
+        backend = DefaultSwsBackend(execution_mode=execution_mode)
     SwsMcpServer(backend=backend).run(host=args.host, port=args.port, path=args.path)
     return 0
 

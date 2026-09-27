@@ -13,6 +13,9 @@ there is a single source of truth.
 
 from __future__ import annotations
 
+import os
+from typing import Final
+
 from pydantic import BaseModel, Field, model_validator
 
 from .constants import (
@@ -20,6 +23,9 @@ from .constants import (
     MAX_COST_WINDOW_DAYS,
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
 )
+
+SWS_EXECUTION_MODE_ENV: Final[str] = "SWS_EXECUTION_MODE"
+"""Environment variable naming the runtime execution mode (safe/review/autonomous)."""
 
 
 class SWSRuntimeConfig(BaseModel):
@@ -57,3 +63,17 @@ class AWSConnectionConfig(BaseModel):
                 "no AWS region or profile configured; provide at least one"
             )
         return self
+
+
+def execution_mode_from_env() -> ExecutionMode:
+    """Resolve the runtime execution mode from ``SWS_EXECUTION_MODE``.
+
+    Absent or blank values resolve to the canonical ``SAFE`` default.
+    Anything else is validated through ``SWSRuntimeConfig`` (M7 consumes its
+    ``execution_mode`` field for the first time), so out-of-vocabulary modes
+    fail fast instead of being silently accepted.
+    """
+    raw = os.environ.get(SWS_EXECUTION_MODE_ENV)
+    if raw is None or not raw.strip():
+        return ExecutionMode.SAFE
+    return SWSRuntimeConfig(execution_mode=raw).execution_mode

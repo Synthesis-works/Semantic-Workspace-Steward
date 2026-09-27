@@ -21,6 +21,7 @@ creating a PENDING ticket when the gate requires human approval).
 
 from __future__ import annotations
 
+from ._identity import new_id, utc_now
 from .approval import InMemoryApprovalStore
 from .authorization import ActionAuthorizer
 from .constants import ExecutionMode, PotentialAction, SWSResourceType
@@ -35,6 +36,14 @@ class ActionPlanner:
     caller of the authorization gate. The execution mode is an operator
     setting fixed at construction; it is never a per-request client input,
     so a caller cannot widen autonomy.
+
+    Derivation is deterministic: identical inputs always render identical
+    authorization decisions. Each returned plan additionally carries a
+    stable ``action_plan_id`` and an aware ``created_at`` so the plan is
+    uniquely referenceable in the durable audit ledger (M8); both come from
+    injectable sources (``now`` / ``plan_id_source``) so tests are
+    deterministic. The approval store is the only mutated state, and only
+    by creating a PENDING ticket when the gate requires human approval.
     """
 
     def __init__(
@@ -43,12 +52,16 @@ class ActionPlanner:
         approval_store: InMemoryApprovalStore,
         authorizer: ActionAuthorizer | None = None,
         execution_mode: ExecutionMode = ExecutionMode.SAFE,
+        now=None,
+        plan_id_source=None,
     ) -> None:
         self._store = approval_store
         self._authorizer = (
             authorizer if authorizer is not None else ActionAuthorizer()
         )
         self._execution_mode = execution_mode
+        self._now = now or utc_now
+        self._plan_id_source = plan_id_source or new_id
 
     @property
     def execution_mode(self) -> ExecutionMode:
@@ -77,14 +90,19 @@ class ActionPlanner:
             execution_mode=self._execution_mode,
         )
         result = self._authorizer.authorize(request)
+        action_plan_id = self._plan_id_source()
+        created_at = self._now()
         ticket = None
         if result.requires_human_approval:
             ticket = self._store.create_ticket(
                 resource_id=resource_id,
                 action=action,
                 rationale=rationale,
+                plan_id=action_plan_id,
             )
         return ActionPlan(
+            action_plan_id=action_plan_id,
+            created_at=created_at,
             resource_id=resource_id,
             action=action,
             execution_mode=self._execution_mode,

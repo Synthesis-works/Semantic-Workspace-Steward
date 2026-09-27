@@ -58,6 +58,16 @@ SWS is built up in feature milestones. What is implemented so far:
   `ActionExecutor` exists, and `get_cost_estimates` now honestly surfaces
   truncation and per-collector failures (matching the workspace audit
   contract) instead of silently dropping them.
+- **M8** — a **durable audit ledger + lineage**: every tool now carries
+  stable identifiers (`run_id`, `snapshot_id`, deterministic `decision_id`,
+  `action_plan_id`, ticket `plan_id`) and, when an audit store is configured
+  (backend injection or `SWS_AUDIT_DIR`), write-through persists each
+  successful result to an append-only UTF-8 JSONL ledger
+  (`src/sws_agent/audit.py`): runs, snapshots, decisions, plans, tickets,
+  explanations, and cost collection. Persistence is a side effect —
+  tool request/response shapes are unchanged — and a persistence failure
+  surfaces as a `ToolError` (never a silent drop). No ledger rotation or
+  deletion exists in M8: audit history never silently disappears.
 
 It does **not** yet:
 
@@ -256,6 +266,37 @@ as production does.
   that hits the 20-page cap is marked truncated instead of silently sold as
   complete.
 
+## M8: durable audit ledger + lineage
+
+M8 adds persistence behind the existing read-only tools without changing any
+tool request/response shape. Every domain fact gets a stable id, and —
+when an audit store is configured — every successful tool result is appended
+to a durable ledger.
+
+- **Lineage ids**: `PolicyDecision` carries a deterministic `decision_id`
+  (SHA-256 over snapshot id + resource id + rule, so re-evaluating a snapshot
+  is a repeatable fact) plus `snapshot_id`/`run_id`; `ActionPlan` carries
+  `action_plan_id` + `created_at`; `ApprovalTicket` carries an optional
+  `plan_id`; every collection run owns a `run_id`. Existing constructions
+  remain valid (all additive, with defaults).
+- **Ledger** (`src/sws_agent/audit.py`): append-only UTF-8 JSONL, one
+  `AuditEnvelope` per line (`schema_version`, stamped `record_id` +
+  `created_at`, kind, correlation ids, reserved `execution`, payload). No
+  SQLite, no rotation, no deletion. A duplicate `record_id` or a corrupt
+  existing line fails fast; a `close()`d store refuses further writes.
+  Sanitization: never `ResourceRecord.raw`, explanation prose, credentials,
+  wire payloads, or raw Cost Explorer pages.
+- **Write-through**: when an `audit_store` is injected (or `SWS_AUDIT_DIR`
+  is set for `python -m sws_agent.mcp.server`), the backend records `RUN` +
+  `SNAPSHOT` per collection, one `DECISION` per policy decision, `PLAN` +
+  `TICKET` on `request_approval`, a `TICKET` on `decide_ticket`, `EXPLANATION`
+  per explanation, and `RUN` + `COST` for standalone cost collection.
+- **Fail-loud**: a persistence failure propagates as `ToolError` (via the
+  `_guarded` seam). If a tool call itself fails, no durable record is written
+  — SWS never claims durable facts it did not persist.
+- **M8 is read-only persistence**: no `get_history` tool, no executor, no
+  `execution` records (the envelope stanza is reserved for M9).
+
 ## Layout
 
 ```
@@ -268,6 +309,8 @@ src/sws_agent/
     relationships.py deterministic-evidence-over-inference merging
     config.py        fail-fast configuration validation
     aws.py           real AWS client factory (M6, lazy optional boto3)
+    audit.py         durable append-only JSONL audit ledger (M8)
+    _identity.py     UTC-aware clock + id sources (stdlib-only, hermetic)
     mcp/             MCP boundary (real Streamable HTTP server, M4)
     simulator/       M5 web demo: demo backend, router, client, service, app
 tests/               hermetic unit tests (no AWS credentials)

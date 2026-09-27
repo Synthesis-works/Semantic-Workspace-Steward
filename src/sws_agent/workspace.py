@@ -154,8 +154,10 @@ def collect_workspace(
 
     ``trace`` is reused when provided; otherwise a fresh recorder is created
     for the run. ``snapshot_id`` defaults to a fresh hex UUID when omitted.
-    ``now`` must be timezone-aware when supplied; otherwise the current UTC
-    time is used.
+    ``run_id`` defaults to a fresh hex UUID when omitted: every collection
+    run owns a run id so decisions and audit trace can be correlated back to
+    the exact run that produced them (M8). ``now`` must be timezone-aware
+    when supplied; otherwise the current UTC time is used.
 
     Cost collection (M2C-E): passing ``collect_cost=True`` requires
     ``cost_end_date`` (a ``datetime.date``), otherwise ValueError. The
@@ -255,7 +257,7 @@ def collect_workspace(
         snapshot_id=snapshot_id if snapshot_id else uuid4().hex,
         created_at=created_at,
         collected_at=collected_at,
-        run_id=run_id,
+        run_id=run_id if run_id else uuid4().hex,
         requested_limit=effective_limit,
         regions=list(regions),
         resource_types=resource_types,

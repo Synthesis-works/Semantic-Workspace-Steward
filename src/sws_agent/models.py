@@ -13,8 +13,9 @@ Structural ideas retained from SMS (documented in docs/reuse-decisions.md):
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -226,6 +227,14 @@ class PolicyDecision(BaseModel):
     machine-readable attribute/value facts that the rule's predicate
     depended on. Both fields are additive (M2C-D): existing constructions
     that omit them remain valid, and the engine never executes an action.
+
+    M8 lineage (additive): ``snapshot_id`` / ``run_id`` name the collection
+    run whose snapshot this decision was derived from, and ``decision_id``
+    is the stable identifier of the decision. The deterministic policy
+    engine (policy.py) sets ``decision_id`` deterministically from the
+    decision's identity inputs (snapshot id, resource id, rule), so
+    re-evaluating the same snapshot is a repeatable fact; a default value
+    keeps direct model constructions valid.
     """
 
     resource_id: str = Field(min_length=1)
@@ -236,6 +245,9 @@ class PolicyDecision(BaseModel):
     needs_approval: bool = False
     rule: str | None = Field(default=None, min_length=1)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
+    decision_id: str = Field(default_factory=lambda: uuid4().hex, min_length=1)
+    snapshot_id: str | None = Field(default=None, min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
 
     @field_validator("recommended_action", "risk_level", mode="before")
     @classmethod
@@ -291,6 +303,9 @@ class ApprovalTicket(BaseModel):
     transition are managed by the approval store (approval.py); this model
     only validates the ticket's shape and enforces case-insensitive
     normalization at the construction boundary.
+
+    ``plan_id`` (M8, optional) links the ticket to the ``ActionPlan`` that
+    created it; a ticket created outside the planner has no plan.
     """
 
     ticket_id: str = Field(min_length=1)
@@ -302,6 +317,7 @@ class ApprovalTicket(BaseModel):
     decided_at: datetime | None = None
     decided_by: str = ""
     decision_reason: str = ""
+    plan_id: str | None = Field(default=None, min_length=1)
 
     @field_validator("action", "status", mode="before")
     @classmethod
@@ -319,6 +335,11 @@ class ActionPlan(BaseModel):
     gate requires human approval, the created PENDING approval ticket.
     ``executed`` is always False: SWS plans and authorizes but never
     executes an AWS action (no executor exists yet).
+
+    M8 lineage (additive): every plan carries a stable ``action_plan_id``
+    and an aware ``created_at``; the planner stamps both from injectable
+    identity/clock sources so each plan record is uniquely referenceable in
+    the durable audit ledger.
     """
 
     resource_id: str = Field(min_length=1)
@@ -327,6 +348,10 @@ class ActionPlan(BaseModel):
     authorization: AuthorizationResult
     ticket: ApprovalTicket | None = None
     executed: bool = False
+    action_plan_id: str = Field(default_factory=lambda: uuid4().hex, min_length=1)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
     @field_validator("action", "execution_mode", mode="before")
     @classmethod

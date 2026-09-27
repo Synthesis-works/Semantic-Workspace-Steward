@@ -145,7 +145,12 @@ def test_planner_is_deterministic_without_tickets(store: InMemoryApprovalStore):
         resource_type=SWSResourceType.S3_BUCKET,
         action=PotentialAction.LEAVE,
     )
-    assert first.model_dump() == second.model_dump()
+    # M8: plans carry a unique identity + timestamp, so the determinism
+    # contract covers everything except those two per-plan fields.
+    assert first.model_dump(exclude={"action_plan_id", "created_at"}) == (
+        second.model_dump(exclude={"action_plan_id", "created_at"})
+    )
+    assert first.action_plan_id != second.action_plan_id
 
 
 # 8. ActionPlan round-trips through its JSON schema.

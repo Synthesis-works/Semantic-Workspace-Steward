@@ -63,6 +63,7 @@ class InMemoryApprovalStore:
         action: PotentialAction,
         rationale: str = "",
         ticket_id: str | None = None,
+        plan_id: str | None = None,
     ) -> ApprovalTicket:
         ticket = ApprovalTicket(
             ticket_id=ticket_id or uuid.uuid4().hex,
@@ -70,6 +71,7 @@ class InMemoryApprovalStore:
             action=action,
             rationale=rationale,
             created_at=self._now(),
+            plan_id=plan_id,
         )
         self._tickets[ticket.ticket_id] = ticket
         return ticket

@@ -17,6 +17,7 @@ import os
 from typing import Final
 
 from pydantic import BaseModel, Field, model_validator
+from pathlib import Path
 
 from .constants import (
     ExecutionMode,
@@ -26,6 +27,22 @@ from .constants import (
 
 SWS_EXECUTION_MODE_ENV: Final[str] = "SWS_EXECUTION_MODE"
 """Environment variable naming the runtime execution mode (safe/review/autonomous)."""
+
+SWS_AUDIT_DIR_ENV: Final[str] = "SWS_AUDIT_DIR"
+"""Environment variable naming the audit ledger directory (M8 write-through)."""
+
+
+def audit_dir_from_env() -> Path | None:
+    """Resolve the audit ledger directory from ``SWS_AUDIT_DIR``.
+
+    Absent or blank values opt out of durable audit persistence (the backend
+    writes nothing). A non-blank value is used as-is; the store itself
+    validates the path (creating parents and failing fast when unusable).
+    """
+    raw = os.environ.get(SWS_AUDIT_DIR_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return Path(raw.strip())
 
 
 class SWSRuntimeConfig(BaseModel):

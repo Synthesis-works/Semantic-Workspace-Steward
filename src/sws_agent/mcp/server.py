@@ -18,10 +18,16 @@ Design contract:
   - ``ToolRegistry`` (``sws_agent.mcp``) remains the logical registry
     boundary: every tool is registered there with a deterministic name and
     surfaced through the SDK server.
-  - Handlers are stateless. No persistent sessions, no database, no external
-    state. Stateful workspace data travels with the client: tools that need a
-    snapshot accept the structured snapshot returned by ``collect_workspace``
-    or ``audit_workspace``.
+  - Handlers are stateless. The domain is deterministic and replayable; no
+    persistent sessions and no database. Stateful workspace data travels
+    with the client: tools that need a snapshot accept the structured
+    snapshot returned by ``collect_workspace`` or ``audit_workspace``.
+  - Optional durable audit ledger (M8): when an ``audit_store`` is injected
+    (or ``SWS_AUDIT_DIR`` is set for ``main()``), the backend writes an
+    append-only JSONL ledger covering runs, snapshots, decisions, plans,
+    tickets, explanations, and cost collection. Persistence is a side
+    effect: tool request/response shapes are unchanged, and a persistence
+    failure surfaces as a ``ToolError`` (never a silent drop).
   - Distrusted input fails deterministically: schema validation is delegated
     to the SDK, and adapter-level domain errors (unknown resource, invalid
     decision, malformed snapshot/date) are raised as ``ToolError`` so they
@@ -41,14 +47,28 @@ from datetime import date, datetime
 import enum
 from functools import wraps
 from typing import Any, Callable, Protocol, runtime_checkable
+from uuid import uuid4
 
 from mcp.server.mcpserver import MCPServer as SdkMCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ValidationError
 
 from ..approval import ApprovalError, InMemoryApprovalStore, UnknownTicketError
+from ..audit import (
+    AuditRecordKind,
+    AuditStoreError,
+    JsonlAuditStore,
+    LEDGER_FILENAME,
+    cost_payload,
+    decision_payload,
+    explanation_payload,
+    plan_payload,
+    run_payload,
+    snapshot_payload,
+    ticket_payload,
+)
 from ..aws import AwsClientFactory, aws_config_from_env
-from ..config import execution_mode_from_env
+from ..config import audit_dir_from_env, execution_mode_from_env
 from ..constants import (
     ExecutionMode,
     PotentialAction,
@@ -179,12 +199,17 @@ class DefaultSwsBackend:
         explainer: Any | None = None,
         approval_store: Any | None = None,
         execution_mode: ExecutionMode = ExecutionMode.SAFE,
+        audit_store: Any | None = None,
     ) -> None:
         self._client_factory = client_factory
         self._explainer = explainer if explainer is not None else NullExplanationProvider()
         self._approval_store = (
             approval_store if approval_store is not None else InMemoryApprovalStore()
         )
+        # M8: the optional durable audit store. ``None`` (the default) keeps
+        # the backend fully hermetic; when set, every tool writes its
+        # append-only ledger records after a successful, deterministic result.
+        self._audit_store = audit_store
         # M7: the authorization gate is now reachable through the backend.
         # The execution mode is fixed at construction (an operator setting);
         # it is never a per-request client input.
@@ -200,6 +225,33 @@ class DefaultSwsBackend:
             )
         return self._client_factory()
 
+    def _audit(
+        self,
+        kind: AuditRecordKind,
+        *,
+        run_id: str | None = None,
+        snapshot_id: str | None = None,
+        decision_id: str | None = None,
+        action_plan_id: str | None = None,
+        ticket_id: str | None = None,
+        resource_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Write one ledger record when an audit store is configured."""
+        audit = self._audit_store
+        if audit is None:
+            return
+        audit.write(
+            kind,
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            decision_id=decision_id,
+            action_plan_id=action_plan_id,
+            ticket_id=ticket_id,
+            resource_id=resource_id,
+            payload=payload,
+        )
+
     def collect_workspace(
         self,
         *,
@@ -210,15 +262,32 @@ class DefaultSwsBackend:
         cost_group_by: list[str] | None = None,
         cost_end_date: date | None = None,
     ) -> WorkspaceSnapshot:
-        return _collect_workspace(
+        run_id = uuid4().hex
+        recorder = TraceRecorder()
+        snapshot = _collect_workspace(
             client=self._client(),
             regions=regions,
             limit=limit,
+            run_id=run_id,
+            trace=recorder,
             collect_cost=collect_cost,
             cost_window_days=cost_window_days,
             cost_group_by=cost_group_by,
             cost_end_date=cost_end_date,
         )
+        self._audit(
+            AuditRecordKind.RUN,
+            run_id=run_id,
+            snapshot_id=snapshot.snapshot_id,
+            payload=run_payload("workspace", recorder.to_dicts()),
+        )
+        self._audit(
+            AuditRecordKind.SNAPSHOT,
+            run_id=run_id,
+            snapshot_id=snapshot.snapshot_id,
+            payload=snapshot_payload(snapshot),
+        )
+        return snapshot
 
     def derive_relationships(
         self, snapshot: WorkspaceSnapshot
@@ -230,7 +299,17 @@ class DefaultSwsBackend:
         snapshot: WorkspaceSnapshot,
         relationships: list[Any] | None = None,
     ) -> list[PolicyDecision]:
-        return evaluate_workspace(snapshot, relationships=relationships)
+        decisions = evaluate_workspace(snapshot, relationships=relationships)
+        for decision in decisions:
+            self._audit(
+                AuditRecordKind.DECISION,
+                run_id=decision.run_id or snapshot.run_id,
+                snapshot_id=decision.snapshot_id or snapshot.snapshot_id,
+                decision_id=decision.decision_id,
+                resource_id=decision.resource_id,
+                payload=decision_payload(decision),
+            )
+        return decisions
 
     def get_cost_estimates(
         self,
@@ -242,18 +321,52 @@ class DefaultSwsBackend:
         # M7 honesty add-on: the standalone cost tool now runs behind a
         # fresh trace so truncation and failures are surfaced instead of
         # silently dropped (matching the audit_workspace cost contract).
+        run_id = uuid4().hex
         recorder = TraceRecorder()
         estimates = CostExplorerCollector(self._client(), trace=recorder).collect(
             window_days=window_days,
             end_date=end_date,
             group_by=group_by,
         )
-        return _cost_report_from_trace(estimates, list(recorder))
+        report = _cost_report_from_trace(estimates, list(recorder))
+        self._audit(
+            AuditRecordKind.RUN,
+            run_id=run_id,
+            payload=run_payload("cost", recorder.to_dicts()),
+        )
+        self._audit(
+            AuditRecordKind.COST,
+            run_id=run_id,
+            payload=cost_payload(
+                end_date=end_date.isoformat(),
+                window_days=window_days,
+                group_by=group_by,
+                report=report,
+            ),
+        )
+        return report
 
     def explain(
         self, resource: ResourceRecord, decision: PolicyDecision
     ) -> ExplanationResult:
-        return self._explainer.explain(resource, decision)
+        result = self._explainer.explain(resource, decision)
+        self._audit(
+            AuditRecordKind.EXPLANATION,
+            run_id=decision.run_id,
+            snapshot_id=decision.snapshot_id,
+            decision_id=decision.decision_id,
+            resource_id=resource.resource_id,
+            payload=explanation_payload(
+                resource_id=resource.resource_id,
+                decision_id=decision.decision_id,
+                snapshot_id=decision.snapshot_id,
+                run_id=decision.run_id,
+                provider=result.provider,
+                claim_kind=result.claim_kind.value,
+                reason=result.reason,
+            ),
+        )
+        return result
 
     def list_approvals(self) -> list[ApprovalTicket]:
         return list(self._approval_store.pending())
@@ -267,14 +380,24 @@ class DefaultSwsBackend:
         reason: str = "",
     ) -> ApprovalTicket:
         if decision == "grant":
-            return self._approval_store.grant(
+            ticket = self._approval_store.grant(
                 ticket_id, decided_by=decided_by, reason=reason
             )
-        if decision == "deny":
-            return self._approval_store.deny(
+        elif decision == "deny":
+            ticket = self._approval_store.deny(
                 ticket_id, decided_by=decided_by, reason=reason
             )
-        raise ToolError("decision must be 'grant' or 'deny'")
+        else:
+            raise ToolError("decision must be 'grant' or 'deny'")
+        self._audit(
+            AuditRecordKind.TICKET,
+            run_id=None,
+            action_plan_id=ticket.plan_id,
+            ticket_id=ticket.ticket_id,
+            resource_id=ticket.resource_id,
+            payload=ticket_payload(ticket),
+        )
+        return ticket
 
     def request_approval(
         self,
@@ -284,12 +407,29 @@ class DefaultSwsBackend:
         action: PotentialAction,
         rationale: str = "",
     ) -> ActionPlan:
-        return self._planner.plan(
+        plan = self._planner.plan(
             resource_id=resource_id,
             resource_type=resource_type,
             action=action,
             rationale=rationale,
         )
+        self._audit(
+            AuditRecordKind.PLAN,
+            run_id=None,
+            action_plan_id=plan.action_plan_id,
+            resource_id=plan.resource_id,
+            payload=plan_payload(plan),
+        )
+        if plan.ticket is not None:
+            self._audit(
+                AuditRecordKind.TICKET,
+                run_id=None,
+                action_plan_id=plan.action_plan_id,
+                ticket_id=plan.ticket.ticket_id,
+                resource_id=plan.ticket.resource_id,
+                payload=ticket_payload(plan.ticket),
+            )
+        return plan
 
 
 def _jsonable(value: Any) -> Any:
@@ -324,6 +464,7 @@ def _guarded(fn: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]
             WorkspaceSnapshotTooLargeError,
             ApprovalError,
             UnknownTicketError,
+            AuditStoreError,
         ) as exc:
             raise ToolError(str(exc)) from exc
 
@@ -766,6 +907,11 @@ def main(argv: list[str] | None = None) -> int:
     execution mode consumed by the ``request_approval`` authorization gate
     (M7); absent or invalid-free, it validates via ``SWSRuntimeConfig`` and
     fails fast on unknown values, defaulting to ``safe``.
+
+    ``SWS_AUDIT_DIR`` (M8) names a directory for the append-only JSONL audit
+    ledger. When set, the server persists every tool's ledger records there
+    and fails fast at startup on an unreadable/corrupt ledger; when absent,
+    the server runs fully hermetic with no ledger writes.
     """
     parser = argparse.ArgumentParser(prog="sws-mcp-server")
     parser.add_argument("--host", default="127.0.0.1")
@@ -774,13 +920,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = aws_config_from_env()
     execution_mode = execution_mode_from_env()
+    audit_dir = audit_dir_from_env()
+    audit_store = (
+        JsonlAuditStore(audit_dir / LEDGER_FILENAME)
+        if audit_dir is not None
+        else None
+    )
     if config is not None:
         backend = DefaultSwsBackend(
             client_factory=AwsClientFactory(config=config),
             execution_mode=execution_mode,
+            audit_store=audit_store,
         )
     else:
-        backend = DefaultSwsBackend(execution_mode=execution_mode)
+        backend = DefaultSwsBackend(
+            execution_mode=execution_mode, audit_store=audit_store
+        )
     SwsMcpServer(backend=backend).run(host=args.host, port=args.port, path=args.path)
     return 0
 

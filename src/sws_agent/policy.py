@@ -32,6 +32,7 @@ compatibility without letting them change outcomes.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Iterable
 
 from .constants import (
@@ -46,6 +47,24 @@ from .models import (
     ResourceRelationship,
     WorkspaceSnapshot,
 )
+
+
+def _decision_id(
+    resource_id: str, *, snapshot_id: str | None, rule: str | None
+) -> str:
+    """Deterministic decision identity over the decision's derivation inputs.
+
+    The id is a stable hex digest of ``(snapshot_id, resource_id, rule)``:
+    re-evaluating the same resource from the same snapshot produces the
+    same decision id (so audit replay is repeatable), while the same
+    resource evaluated under a different snapshot or rule produces a
+    different id (so lineage is distinguishable). Engine-level single
+    resource evaluations (no snapshot context) pass ``snapshot_id=None``.
+    """
+    material = "\x1f".join(
+        [snapshot_id or "", resource_id, rule or ""]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 class WorkspacePolicyEngine:
@@ -87,6 +106,9 @@ class WorkspacePolicyEngine:
                 f"no deterministic policy rule triggered for "
                 f"'{resource.resource_id}'"
             ),
+            decision_id=_decision_id(
+                resource.resource_id, snapshot_id=None, rule=None
+            ),
         )
 
     @staticmethod
@@ -102,6 +124,11 @@ class WorkspacePolicyEngine:
             ),
             confidence=1.0,
             rule=POLICY_RULE_MISSING_OWNER_TAG,
+            decision_id=_decision_id(
+                resource.resource_id,
+                snapshot_id=None,
+                rule=POLICY_RULE_MISSING_OWNER_TAG,
+            ),
             evidence=[
                 {
                     "rule": POLICY_RULE_MISSING_OWNER_TAG,
@@ -134,6 +161,11 @@ class WorkspacePolicyEngine:
             ),
             confidence=0.5,
             rule=POLICY_RULE_OWNER_UNVERIFIABLE,
+            decision_id=_decision_id(
+                resource.resource_id,
+                snapshot_id=None,
+                rule=POLICY_RULE_OWNER_UNVERIFIABLE,
+            ),
             evidence=[
                 {
                     "rule": POLICY_RULE_OWNER_UNVERIFIABLE,
@@ -164,12 +196,29 @@ def evaluate_workspace(
     Output is deterministic and sorted by ``resource_id``.
     """
     engine = WorkspacePolicyEngine()
-    decisions = [
-        engine.evaluate(
-            resource,
-            partial=snapshot.partial,
-            truncated=snapshot.truncated,
+    stamped = [
+        (
+            decision.model_copy(
+                update={
+                    "decision_id": _decision_id(
+                        decision.resource_id,
+                        snapshot_id=snapshot.snapshot_id,
+                        rule=decision.rule,
+                    ),
+                    "snapshot_id": snapshot.snapshot_id,
+                    "run_id": snapshot.run_id,
+                }
+            )
+            if decision.snapshot_id is None
+            else decision
         )
-        for resource in snapshot.resources
+        for decision in (
+            engine.evaluate(
+                resource,
+                partial=snapshot.partial,
+                truncated=snapshot.truncated,
+            )
+            for resource in snapshot.resources
+        )
     ]
-    return sorted(decisions, key=lambda decision: decision.resource_id)
+    return sorted(stamped, key=lambda decision: decision.resource_id)

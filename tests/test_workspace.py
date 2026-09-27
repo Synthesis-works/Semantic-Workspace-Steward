@@ -324,7 +324,7 @@ def test_collect_workspace_empty_healthy_snapshot():
     assert snapshot.snapshot_id
     assert snapshot.created_at == NOW
     assert snapshot.collected_at is not None
-    assert snapshot.run_id is None
+    assert snapshot.run_id
     assert snapshot.requested_limit == MAX_RESOURCES_PER_INVENTORY_REQUEST
     assert snapshot.regions == ["us-east-1"]
     assert snapshot.resource_types == ALL_TYPES

@@ -121,6 +121,22 @@ No action-execution tool is exposed; the approval ticket lifecycle is the
   `truncated`/`failures` from the same trace semantics as workspace audit.
   Existing tool contracts are unchanged except additive keys.
 
+- **Durable audit ledger (M8)** — `sws_agent.audit` is a fresh, stdlib-only
+  append-only JSONL ledger (no SQLite, no rotation, no deletion) stamped at
+  write time with `record_id`/`created_at` and sanitized payloads (no
+  `ResourceRecord.raw`, explanation prose, credentials, wire payloads, or raw
+  Cost Explorer pages). Lineage ids (`run_id`, `snapshot_id`, deterministic
+  `decision_id`, `action_plan_id`, ticket `plan_id`) are additive to the
+  existing domain models, so every existing construction remains valid. The
+  MCP backend writes through to the ledger as a side effect after each
+  successful deterministic result — request/response shapes are unchanged —
+  and persistence failures surface as `ToolError` (fail-loud, never a silent
+  drop; a failed tool call itself writes nothing). Persistence is opt-in
+  (`audit_store` injection or `SWS_AUDIT_DIR`); the hermetic no-store default
+  is preserved. M8 is read-only persistence: no `get_history`, no execution
+  records (the envelope's `execution` stanza is reserved for M9), no new
+  runtime dependency.
+
 ## SMS-specific functionality NOT copied
 
 SMS itself (its governance product, pipeline, agent, evaluation harness, demo

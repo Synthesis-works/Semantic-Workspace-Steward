@@ -23,13 +23,16 @@ For every component reused from SMS, this document records:
 | `relationships.py` | Deterministic evidence takes precedence over semantic inference | The precedence rule is generic | Fresh implementation for AWS `ResourceRecord` relationships |
 | test conventions | Hermetic tests; autouse environment guard; injected fakes; invariant-pinning tests | Credential-free, deterministic testing is generic | SWS-specific tests and fixtures written fresh |
 | `.github/workflows/ci.yml` | Hermetic pytest on `main` + PRs, Python 3.12, editable `.[dev]` install | Standard packaging/CI practice | Fresh workflow for this repository |
-| `pyproject.toml` | src-layout packaging, dev extra, editing-based tooling | Standard practice | Minimal dependency set (only `pydantic` runtime + `pytest` dev); `boto3` and the MCP SDK stay optional extras until their features are genuinely implemented |
+| `pyproject.toml` | src-layout packaging, dev extra, editing-based tooling | Standard practice | Minimal dependency set (only `pydantic` runtime + `pytest` dev); `boto3` stays an optional extra (`aws`) used only by the real client factory (`aws.py`), and the MCP SDK extra is implemented and used by the M4 server (`mcp` extra) |
 
 ## Intentionally rewritten (not copied)
 
 - **Action vocabulary** — SWS uses `LEAVE / FLAG_FOR_REVIEW / REQUEST_APPROVAL / STOP_RESOURCE` for AWS resources. SMS's file-lifecycle states (KEEP / ARCHIVE / TRASH / QUARANTINE) are deliberately banned; `constants.SMS_DEPRECATED_ACTIONS` guards this in tests.
 - **Domain models** — all `models.py` records (ResourceRecord, PolicyDecision, AuthorizationRequest, CostEstimate, ...) are new.
-- **Policy engine** — SMS's retention heuristics are not portable. Only the `PolicyEngine` protocol (interface) exists so far; the deterministic implementation is future work.
+- **Policy engine** — SMS's retention heuristics are not portable. SWS
+  implements the `PolicyEngine` protocol fresh in `policy.py` as the
+  deterministic `WorkspacePolicyEngine` (rules `missing_owner_tag` /
+  `owner_unverifiable`, M2C-D); no LLM ever decides.
 - **Semantic layer, embeddings, provider adapters** — SMS-specific and excluded.
 - **Web simulator / dashboard** — SWS does not adopt SMS's Streamlit
   dashboard. Its M5 layer is a minimal vanilla HTML/JS page that talks to the
@@ -91,6 +94,18 @@ No action-execution tool is exposed; the approval ticket lifecycle is the
   in-memory store. Optional `simulator` extra (`starlette`, `mcp`, `uvicorn`);
   no listeners on import (startup via `python -m sws_agent.simulator`); the
   MCP-bound validation lives in `tests/test_simulator_mcp.py`.
+
+- **Real AWS client factory (M6)** — `sws_agent.aws` is the adapter between
+  boto3 and the already-existing collector client protocols, closing the only
+  production gap reported by the M6 investigation. It exposes exactly the six
+  collector methods (`AwsMultiClient`) behind a lazy `AwsClientFactory` that
+  consumes `AWSConnectionConfig` and the `AWS_API_RETRY_ATTEMPTS` /
+  `AWS_API_TIMEOUT_SECONDS` limits. boto3/botocore are imported lazily only at
+  tool execution time (optional `aws` extra); import and default startup stay
+  credential-free, clients are injected through the existing `SwsBackend`
+  seam, and no MCP/policy/collector behavior changed. Real mode is opt-in via
+  `SWS_AWS_REGION` / `SWS_AWS_PROFILE` when launching the M4 server
+  (`python -m sws_agent.mcp.server`).
 
 ## SMS-specific functionality NOT copied
 

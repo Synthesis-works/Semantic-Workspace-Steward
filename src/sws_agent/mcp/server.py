@@ -47,6 +47,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ValidationError
 
 from ..approval import ApprovalError, InMemoryApprovalStore, UnknownTicketError
+from ..aws import AwsClientFactory, aws_config_from_env
 from ..cost_explorer import CostExplorerCollector
 from ..explanation import NullExplanationProvider
 from ..models import (
@@ -626,13 +627,25 @@ class SwsMcpServer:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Explicit CLI entry point; binds loopback by default."""
+    """Explicit CLI entry point; binds loopback by default.
+
+    Real-AWS mode is opt-in: when ``SWS_AWS_REGION`` and/or
+    ``SWS_AWS_PROFILE`` are set, the server is constructed with a
+    ``DefaultSwsBackend`` whose client factory builds real boto3 clients
+    lazily, at tool execution time. Without them the server stays fully
+    hermetic (the existing no-factory deterministic ``ToolError``). No AWS
+    calls and no boto3 import happen at startup or on import either way.
+    """
     parser = argparse.ArgumentParser(prog="sws-mcp-server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--path", default="/mcp")
     args = parser.parse_args(argv)
-    SwsMcpServer().run(host=args.host, port=args.port, path=args.path)
+    backend = None
+    config = aws_config_from_env()
+    if config is not None:
+        backend = DefaultSwsBackend(client_factory=AwsClientFactory(config=config))
+    SwsMcpServer(backend=backend).run(host=args.host, port=args.port, path=args.path)
     return 0
 
 

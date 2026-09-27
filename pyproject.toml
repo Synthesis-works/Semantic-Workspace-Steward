@@ -18,8 +18,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
-# Minimal foundation runtime. boto3 and the MCP SDK are deferred until the
-# corresponding AWS collectors and MCP wiring are genuinely implemented.
+# Minimal foundation runtime. The core never imports boto3: the M6 real
+# client factory (sws_agent.aws) imports it lazily behind the optional 'aws'
+# extra. MCP wiring is implemented (M4) via the optional 'mcp' extra.
 dependencies = [
     "pydantic>=2.7",
 ]
@@ -28,8 +29,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
-# Optional AWS SDK for real-client validation only. boto3 is NOT a runtime
-# dependency of the collector core: the hermetic unit suite never imports it.
+# Optional AWS SDK for the real client factory only. boto3 is NOT a runtime
+# dependency of the collector core: the hermetic unit suite never imports it,
+# and sws_agent.aws imports it lazily when a collector tool actually runs.
 aws = [
     "boto3>=1.34",
 ]

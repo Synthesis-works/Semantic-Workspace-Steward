@@ -41,18 +41,28 @@ SWS is built up in feature milestones. What is implemented so far:
   collectors are still injected via a backend, never hard-wired.
 - **M5** — a local, demo-only **web simulator** (below) that talks to the
   real M4 MCP server through the official MCP client.
+- **M6** — a **real AWS client factory** (`src/sws_agent/aws.py`) that adapts
+  boto3 clients (lazily imported, optional `aws` extra) to the existing S3 +
+  Lambda + Cost Explorer collectors through the existing `SwsBackend`/MCP
+  injection seam. No collector, policy, or MCP contract changed. Real-AWS mode
+  is opt-in via `SWS_AWS_REGION` / `SWS_AWS_PROFILE` (see below); the hermetic
+  default and the deterministic no-factory `ToolError` are preserved.
 
 It does **not** yet:
 
 - deploy or create AWS infrastructure
-- run AWS API calls or collectors against a live account
+- run AWS collectors against a live account by default: real mode is opt-in
+  (`SWS_AWS_REGION` / `SWS_AWS_PROFILE`) and has only ever been verified
+  through guarded, read-only gitignored probes in `scripts/experiments/`
 - implement destructive actions or the full action engine
 - expose the simulator or MCP server on anything but local loopback
 
-Deliberately deferred (documented in `docs/reuse-decisions.md`): S3/EC2/EBS
-inventory collectors, Cost Explorer analysis, AWS auth, and non-loopback
-deployment. Nothing in this repository ever fabricates AWS usage, savings,
-or history.
+Deliberately deferred (documented in `docs/reuse-decisions.md`): EC2/EBS
+inventory collectors, AWS authentication/deployment, per-resource cost
+attribution, and non-loopback deployment. S3 and Lambda inventory and
+account-level Cost Explorer collection are implemented (M2C); the M6 real AWS
+client factory is the production link that runs them against a live account.
+Nothing in this repository ever fabricates AWS usage, savings, or history.
 
 ## Planned MVP AWS scope
 
@@ -169,6 +179,46 @@ python -m pytest tests/test_simulator_router.py tests/test_simulator_demo.py \
 ephemeral loopback port and drives it with the official MCP client; the
 remaining simulator suites are hermetic.
 
+## M6: real AWS client factory
+
+M6 is the smallest production integration that makes the existing S3, Lambda,
+and Cost Explorer collectors usable through the M4 MCP backend against a real
+AWS account. It is infrastructure plumbing only — no collector, policy, MCP,
+or simulator behavior changed.
+
+- `src/sws_agent/aws.py` adapts boto3 clients to the already-existing
+  collector client protocols via a thin `AwsMultiClient` (exactly the six
+  collector methods) and a lazy `AwsClientFactory`. boto3/botocore are
+  imported only when a collector tool actually runs; importing `sws_agent`
+  never does.
+- The factory consumes the existing `AWSConnectionConfig` (region/profile)
+  and applies the canonical `AWS_API_RETRY_ATTEMPTS` / `AWS_API_TIMEOUT_SECONDS`
+  limits through `botocore.config.Config`.
+- Hermetic behavior is unchanged: the default `SwsMcpServer` still carries no
+  client factory, so inventory/cost tools fail with the same deterministic
+  `ToolError("no AWS client factory configured for this server")`, and the
+  whole test suite stays credential-free and never imports boto3.
+
+### Running against a live account (opt-in, read-only)
+
+```bash
+pip install -e ".[dev,mcp,aws]"
+$env:SWS_AWS_REGION="us-east-1"   # optional: target region
+$env:SWS_AWS_PROFILE="default"    # optional: boto3 profile
+python -m sws_agent.mcp.server
+```
+
+Only read-only permissions are exercised: `ListBuckets`, `GetBucketLocation`,
+`GetBucketTagging`, `ListFunctions`, `ListTags`, `GetCostAndUsage`, and
+optionally `sts:GetCallerIdentity`. Credentials always resolve through boto3's
+standard chain; nothing is stored, logged, traced, or printed.
+
+Known limitation: Lambda is a regional service, and the factory creates one
+Lambda client for the configured region. Region lists passed to the workspace
+collectors are preserved as snapshot metadata, but Lambda inventory is scanned
+from the configured region only. Multi-region Lambda scanning requires
+per-region client injection and is deliberately outside M6.
+
 ## Layout
 
 ```
@@ -180,6 +230,7 @@ src/sws_agent/
     authorization.py deterministic authorization gate
     relationships.py deterministic-evidence-over-inference merging
     config.py        fail-fast configuration validation
+    aws.py           real AWS client factory (M6, lazy optional boto3)
     mcp/             MCP boundary (real Streamable HTTP server, M4)
     simulator/       M5 web demo: demo backend, router, client, service, app
 tests/               hermetic unit tests (no AWS credentials)

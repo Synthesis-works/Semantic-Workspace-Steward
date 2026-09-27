@@ -23,7 +23,7 @@ For every component reused from SMS, this document records:
 | `relationships.py` | Deterministic evidence takes precedence over semantic inference | The precedence rule is generic | Fresh implementation for AWS `ResourceRecord` relationships |
 | test conventions | Hermetic tests; autouse environment guard; injected fakes; invariant-pinning tests | Credential-free, deterministic testing is generic | SWS-specific tests and fixtures written fresh |
 | `.github/workflows/ci.yml` | Hermetic pytest on `main` + PRs, Python 3.12, editable `.[dev]` install | Standard packaging/CI practice | Fresh workflow for this repository |
-| `pyproject.toml` | src-layout packaging, dev extra, editing-based tooling | Standard practice | Minimal dependency set (only `pydantic` runtime + `pytest` dev); `boto3` and MCP SDK deferred until genuinely implemented |
+| `pyproject.toml` | src-layout packaging, dev extra, editing-based tooling | Standard practice | Minimal dependency set (only `pydantic` runtime + `pytest` dev); `boto3` and the MCP SDK stay optional extras until their features are genuinely implemented |
 
 ## Intentionally rewritten (not copied)
 
@@ -60,6 +60,20 @@ For every component reused from SMS, this document records:
   authorization, or risk decisions. Strands is the agent layer by design;
   later agent capabilities (MCP/AgentCore) build on it rather than replacing
   it with a direct boto3 caller.
+
+- **MCP server (M4)** — `sws_agent.mcp.server` exposes SWS through a real MCP
+  server on the **Streamable HTTP** transport (MCP SDK v2, optional `mcp`
+  extra + `uvicorn`; FastMCP and MCP v1 are deliberately not used). The MCP
+  layer is **transport/exposure only**: every tool is a thin adapter over the
+  deterministic SWS core (inventory, relationships, policy, cost, approval),
+  and the core is the sole source of truth. Tools are stateless and carry
+  structured snapshot data with the client; distrusted input fails
+  deterministically via `ToolError`. Explanations keep flowing only from
+  `ExplanationProvider` (see above) and can never re-derive a decision.
+  No action-execution tool is exposed; the approval ticket lifecycle is the
+  extent of state mutation and never touches AWS. There is no authentication
+  yet — that boundary is documented for the AgentCore Harness (which consumes
+  this server via its remote MCP integration) to solve at deployment.
 
 ## SMS-specific functionality NOT copied
 

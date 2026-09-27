@@ -39,6 +39,14 @@ aws = [
 explanation = [
     "strands-agents>=1.0",
 ]
+# Optional MCP server extras (M4): the Streamable HTTP transport server is
+# built on the official MCP SDK v2 (do NOT rely on a transitively installed
+# copy) plus uvicorn for explicit loopback/local serving. The hermetic test
+# suite and the core never require mcp; only sws_agent.mcp.server does.
+mcp = [
+    "mcp>=2.1",
+    "uvicorn",
+]
 
 [project.urls]
 Repository = "https://github.com/Synthesis-works/Semantic-Workspace-Steward"

@@ -28,6 +28,7 @@ from .constants import (
     EvidenceBasis,
     ExecutionMode,
     ExecutionOutcome,
+    ObservationProvenance,
     PotentialAction,
     RefusalReason,
     RelationshipType,
@@ -404,18 +405,26 @@ class ExplanationResult(BaseModel):
 
 
 class ResourceObservation(BaseModel):
-    """A fresh, independent observation of a resource's post-state (M9).
+    """An independent observation of a resource's state (M9, hardened in M10).
 
-    Produced by an observation provider after an attempt. ``facts`` carries
-    sanitized, machine-readable attribute/value facts (for example
+    Produced by an observation provider. ``facts`` carries sanitized,
+    machine-readable attribute/value facts (for example
     ``{"state": "stopped"}``); it never carries credentials or secrets.
     ``ambiguous`` is set by the observer when the authoritative state could
     not be firmly established (for example the observation timed out); an
     ambiguous observation can never support a SUCCESS claim.
 
-    ``arn`` / ``account_id`` are optional canonical identity facts used by
-    the gate to confirm the observed resource is the same resource the plan
-    targeted (A1 identity). ``observed_at`` must be timezone-aware.
+    ``arn`` / ``account_id`` / ``region`` are canonical identity facts. M10
+    makes them **mandatory for the execution gate**: a refusal is issued when
+    either the snapshot record or the observation lacks one, instead of
+    silently skipping the comparison.
+
+    ``provenance`` (M10) records who minted the observation. It defaults to
+    ``UNVERIFIED``, and the coordinator only accepts a ``PROVIDER_ISSUED``
+    observation that it obtained itself from the injected
+    ``ObservationProvider``. Observation providers should build instances
+    through :meth:`issued` so the provenance cannot be forgotten; a
+    hand-built observation can never satisfy the A5 gate.
     """
 
     resource_id: str = Field(min_length=1)
@@ -426,6 +435,20 @@ class ResourceObservation(BaseModel):
     arn: str | None = Field(default=None, min_length=1)
     account_id: str | None = Field(default=None, pattern=r"^[0-9]{12}$")
     region: str | None = None
+    provenance: ObservationProvenance = ObservationProvenance.UNVERIFIED
+
+    @classmethod
+    def issued(cls, **kwargs: Any) -> ResourceObservation:
+        """Build a provider-issued observation (M10).
+
+        This is the only supported way for an ``ObservationProvider`` to
+        produce evidence the execution gate will accept. It stamps
+        ``provenance=PROVIDER_ISSUED``; the coordinator still cross-checks
+        the identity and freshness of whatever it receives, so provenance is
+        necessary but never sufficient.
+        """
+        kwargs["provenance"] = ObservationProvenance.PROVIDER_ISSUED
+        return cls(**kwargs)
 
     @field_validator("resource_type", mode="before")
     @classmethod
@@ -443,15 +466,22 @@ class ResourceObservation(BaseModel):
 
 
 class ExecutionRequest(BaseModel):
-    """Everything the execution gate needs to evaluate one attempt (M9).
+    """Everything the execution gate needs to evaluate one attempt (M9/M10).
 
     ``action_plan_id`` + ``resource_id`` + ``action`` name the attempt. The
     gate cross-checks the ``plan``, the ``decision`` that motivated it, the
     ``snapshot`` the decision was derived from, the GRANTED ``ticket`` when
-    human approval is required, and a ``fresh_observation`` of the resource
-    taken no earlier than the snapshot's creation (A5 freshness). Every
-    context field is optional at the boundary so each refusal case can be
-    exercised; the gate is what requires them.
+    human approval is required, and an observation the coordinator obtains
+    itself from the injected provider. Every context field is optional at the
+    boundary so each refusal case can be exercised; the gate is what requires
+    them.
+
+    M10 boundary: ``fresh_observation`` is **not** an input the gate will
+    accept. The field is retained only so a caller that supplies one is
+    refused explicitly (``CALLER_SUPPLIED_OBSERVATION_REJECTED``) instead of
+    having its evidence silently dropped. ``expected_poststate`` is likewise
+    not a source of truth: the gate verifies the canonical, action-derived
+    postcondition and only requires a supplied value to agree with it.
     """
 
     action_plan_id: str = Field(min_length=1)

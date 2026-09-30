@@ -64,6 +64,56 @@ def test_partially_verified_when_expected_fact_unobserved():
     assert result.status is VerificationStatus.PARTIALLY_VERIFIED
 
 
+# ---------------------------------------------------------------------------
+# M10: fact values are compared by type, not by Python equality.
+# ---------------------------------------------------------------------------
+
+
+def test_boolean_observed_value_does_not_satisfy_numeric_expectation():
+    """``True == 1`` in Python, so equality alone would claim success.
+
+    A provider reporting a boolean flag must not satisfy an expected
+    numeric fact of the same value.
+    """
+    result = DefaultOutcomeVerifier().verify(
+        observation=_observation({"attached_volume_count": True}),
+        expected_facts={"attached_volume_count": 1},
+    )
+    assert result.status is VerificationStatus.FAILED
+
+
+def test_numeric_observed_value_does_not_satisfy_boolean_expectation():
+    result = DefaultOutcomeVerifier().verify(
+        observation=_observation({"encrypted": 1}),
+        expected_facts={"encrypted": True},
+    )
+    assert result.status is VerificationStatus.FAILED
+
+
+def test_false_does_not_satisfy_zero():
+    result = DefaultOutcomeVerifier().verify(
+        observation=_observation({"count": False}),
+        expected_facts={"count": 0},
+    )
+    assert result.status is VerificationStatus.FAILED
+
+
+def test_matching_booleans_still_succeed():
+    result = DefaultOutcomeVerifier().verify(
+        observation=_observation({"encrypted": True, "egress": False}),
+        expected_facts={"encrypted": True, "egress": False},
+    )
+    assert result.status is VerificationStatus.SUCCESS
+
+
+def test_matching_numbers_still_succeed():
+    result = DefaultOutcomeVerifier().verify(
+        observation=_observation({"count": 1}),
+        expected_facts={"count": 1},
+    )
+    assert result.status is VerificationStatus.SUCCESS
+
+
 def test_unknown_when_observation_is_ambiguous():
     result = DefaultOutcomeVerifier().verify(
         observation=_observation({"state": "stopped"}, ambiguous=True),

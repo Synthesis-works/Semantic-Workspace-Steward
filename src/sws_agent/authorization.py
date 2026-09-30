@@ -73,21 +73,31 @@ class ActionAuthorizer:
             )
 
         # STOP_RESOURCE is the only side-effecting action currently defined.
-        if request.execution_mode is ExecutionMode.AUTONOMOUS:
+        #
+        # M10: this used to return AUTHORIZED in AUTONOMOUS mode, which
+        # contradicted the execution gate (which refuses autonomous execution
+        # of approval-required actions) and left two sources of truth for
+        # "may this destructive action proceed". A plan stamped AUTHORIZED
+        # could be produced with no ticket at all, so any weaker code path
+        # than the coordinator would have been able to act on it. The
+        # authorizer now refuses the combination outright; the coordinator
+        # keeps its own refusal as defense in depth.
+        if request.action is PotentialAction.STOP_RESOURCE:
+            if request.execution_mode is ExecutionMode.AUTONOMOUS:
+                return AuthorizationResult(
+                    decision=AuthorizationDecision.BLOCKED,
+                    reason=(
+                        "autonomous execution of an approval-required "
+                        "destructive action is not supported; STOP_RESOURCE "
+                        "requires an explicit human approval in safe or "
+                        "review mode"
+                    ),
+                )
             return AuthorizationResult(
-                decision=AuthorizationDecision.AUTHORIZED,
+                decision=AuthorizationDecision.PENDING_APPROVAL,
                 reason=(
-                    "STOP_RESOURCE in AUTONOMOUS mode is reversible and "
-                    "approved; verification of the resulting AWS state is "
-                    "still mandatory after execution"
+                    f"STOP_RESOURCE requires human approval in "
+                    f"{request.execution_mode.value} mode"
                 ),
+                requires_human_approval=True,
             )
-
-        return AuthorizationResult(
-            decision=AuthorizationDecision.PENDING_APPROVAL,
-            reason=(
-                f"STOP_RESOURCE requires human approval in "
-                f"{request.execution_mode.value} mode"
-            ),
-            requires_human_approval=True,
-        )

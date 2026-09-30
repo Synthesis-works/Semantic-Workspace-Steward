@@ -318,7 +318,8 @@ execute anything.
   `snapshot` that decision was derived from, a GRANTED and unconsumed
   `ApprovalTicket` bound to that plan (approval-required actions), and a fresh
   post-snapshot observation whose identity (resource/type/ARN/account) matches
-  the snapshot record. Refusals use the closed `RefusalReason` vocabulary
+  the snapshot record (M10 replaced the caller-supplied half of this with
+  coordinator-obtained, provider-issued evidence — see below). Refusals use the closed `RefusalReason` vocabulary
   (missing/pending/denied/expired/mismatched/consumed ticket, decision or
   snapshot mismatch, partial/truncated snapshot, stale/missing observation,
   identity mismatch, already-executed plan, duplicate attempt, autonomous
@@ -351,6 +352,49 @@ execute anything.
   must come from an external provider; adding an EC2 verification primitive is
   a deferred, separately-reviewed change.
 
+## M10: preflight hardening (still nothing executes)
+
+M10 keeps M9's honesty boundary intact — **no mutation handler is registered and
+no AWS call is made** — while fixing the places where the M9 gate could be fed
+evidence it should not have trusted. The gate is only as safe as its inputs, and
+M9's inputs were caller-shaped. The full rationale and the M9→M13 sequence are in
+[`docs/adr/0001-execution-milestone-sequence.md`](docs/adr/0001-execution-milestone-sequence.md).
+
+- **Provider-issued A5 evidence**: the coordinator obtains its own observation
+  during the gate instead of trusting `ExecutionRequest.fresh_observation`.
+  Observations carry `ObservationProvenance`; only `PROVIDER_ISSUED` evidence
+  satisfies A5, and a hand-built or caller-supplied observation is an explicit
+  refusal (`CALLER_SUPPLIED_OBSERVATION_REJECTED`).
+- **Bounded freshness**: observations must not predate
+  `WorkspaceSnapshot.collected_at` (M9 compared against `created_at`, the run
+  *start*), must not exceed `SWS_MAX_OBSERVATION_AGE_SECONDS`, and must not be
+  future-dated. A snapshot with no `collected_at` cannot establish freshness.
+- **Mandatory identity**: ARN, account, and region must be present on both the
+  snapshot record and the observation. M9 skipped a comparison whenever a field
+  was `None`; a missing fact is now `IDENTITY_EVIDENCE_MISSING`, not a pass.
+- **Action-derived postconditions**: `ActionSpec.postconditions` declares what
+  "success" means per action (`STOP_RESOURCE` → `{"state": "stopped"}`). The
+  verifier is never handed a caller-chosen expectation, so a caller cannot pick
+  a trivially satisfiable one. A supplied `expected_poststate` must be empty or
+  exactly canonical; extras are refused rather than silently dropped.
+- **Durable deterministic intent key**: `execution_intent_key()` is a SHA-256
+  digest over `(snapshot_id, resource_id, action)`. Duplicate detection is
+  re-derived from the ledger on every attempt, so it survives a process restart
+  and cannot be reset by re-planning under a new `action_plan_id` (the M9 hole).
+  It is recomputed from stored records, so there is still **no audit schema
+  change** and `AuditEnvelope.execution` stays `None`.
+- **Observer symmetry**: a provider failure before the mutation refuses the
+  attempt; a failure after it is contained and yields UNKNOWN. Non-`ObservationError`
+  exceptions no longer escape with the transaction left open.
+- **Read-only reconciliation**: `reconcile_open_transactions()` deterministically
+  reports execution transactions that reached ATTEMPT/RESULT but never POST. It
+  writes nothing, repairs nothing, and never retries.
+- **Autonomous execution** of `STOP_RESOURCE` is `BLOCKED` in the authorizer,
+  matching the coordinator's refusal (M9 marked it `AUTHORIZED`).
+- Handler registration additionally requires a durable audit store
+  (`DURABLE_LEDGER_REQUIRED`), because without a ledger the intent key could not
+  be enforced across restarts.
+
 ## Layout
 
 ```
@@ -369,6 +413,7 @@ src/sws_agent/
     simulator/       M5 web demo: demo backend, router, client, service, app
 tests/               hermetic unit tests (no AWS credentials)
 docs/                reuse decisions and current scope
+docs/adr/            architecture decision records
 scripts/experiments/ throwaway experiments (not committed)
 ```
 

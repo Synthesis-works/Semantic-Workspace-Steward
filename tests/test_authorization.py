@@ -2,8 +2,9 @@
 
 Tests pin the decision matrix: zero-side-effect actions are authorized in
 all modes, REQUEST_APPROVAL always implies pending approval, STOP_RESOURCE
-requires approval outside AUTONOMOUS mode, and unknown actions are blocked.
-All decisions are rule-based (never LLM) and deterministic.
+requires approval in safe/review mode and is BLOCKED in autonomous mode, and
+unknown actions are blocked. All decisions are rule-based (never LLM) and
+deterministic.
 """
 
 from __future__ import annotations
@@ -54,12 +55,31 @@ def test_stop_requires_approval_in_safe_and_review_modes():
         assert result.requires_human_approval is True
 
 
-def test_stop_authorized_in_autonomous_mode():
+def test_stop_blocked_in_autonomous_mode():
+    """M10: the authorizer refuses autonomous destructive actions.
+
+    It used to return AUTHORIZED here, contradicting the execution gate and
+    allowing a plan to be stamped AUTHORIZED with no ticket at all.
+    """
     result = AUTHORIZER.authorize(
         _request(PotentialAction.STOP_RESOURCE, ExecutionMode.AUTONOMOUS)
     )
-    assert result.decision is AuthorizationDecision.AUTHORIZED
+    assert result.decision is AuthorizationDecision.BLOCKED
     assert result.requires_human_approval is False
+
+
+def test_stop_is_never_authorized_in_any_mode():
+    """M10: no execution mode yields AUTHORIZED for a destructive action."""
+    for mode in ExecutionMode:
+        result = AUTHORIZER.authorize(
+            _request(PotentialAction.STOP_RESOURCE, mode)
+        )
+        assert result.decision is not AuthorizationDecision.AUTHORIZED
+
+
+def test_autonomous_refusal_is_deterministic():
+    request = _request(PotentialAction.STOP_RESOURCE, ExecutionMode.AUTONOMOUS)
+    assert AUTHORIZER.authorize(request) == AUTHORIZER.authorize(request)
 
 
 def test_nonexistent_action_blocked():

@@ -364,6 +364,32 @@ class ExecutionOutcome(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
+class ObservationProvenance(str, enum.Enum):
+    """Where a ``ResourceObservation`` came from (M10).
+
+    M9 accepted any ``ResourceObservation`` a caller attached to the request,
+    which meant a caller could assert arbitrary post-state facts and satisfy
+    the A5 freshness gate without any independent read. M10 makes the
+    coordinator obtain the observation itself from the injected
+    ``ObservationProvider`` and requires the returned observation to be
+    provider-issued. ``UNVERIFIED`` is the default so a hand-built
+    observation can never satisfy a gate by accident.
+    """
+
+    PROVIDER_ISSUED = "provider_issued"
+    UNVERIFIED = "unverified"
+
+
+SWS_MAX_OBSERVATION_AGE_SECONDS: Final[int] = 300
+"""Maximum age of an A5 preflight observation, in seconds.
+
+An observation older than this cannot describe the current state of the
+resource, even if it is newer than the snapshot it is checked against. The
+coordinator accepts an override for tests and operators; the default is the
+canonical value.
+"""
+
+
 class VerificationStatus(str, enum.Enum):
     """How well the post-attempt state matched the expected post-state.
 
@@ -413,6 +439,19 @@ class RefusalReason(str, enum.Enum):
     ALREADY_EXECUTED = "already_executed"
     DUPLICATE_ATTEMPT = "duplicate_attempt"
     EXECUTION_NOT_IMPLEMENTED = "execution_not_implemented"
+    # M10: preflight-evidence hardening. A5 evidence must be issued by the
+    # injected observation provider, must be temporally bounded, must carry
+    # complete identity, and must verify an action-derived postcondition.
+    OBSERVATION_PROVIDER_UNAVAILABLE = "observation_provider_unavailable"
+    OBSERVATION_NOT_PROVIDER_ISSUED = "observation_not_provider_issued"
+    CALLER_SUPPLIED_OBSERVATION_REJECTED = "caller_supplied_observation_rejected"
+    SNAPSHOT_FRESHNESS_UNESTABLISHED = "snapshot_freshness_unestablished"
+    OBSERVATION_FROM_FUTURE = "observation_from_future"
+    OBSERVATION_TOO_OLD = "observation_too_old"
+    IDENTITY_EVIDENCE_MISSING = "identity_evidence_missing"
+    POSTCONDITION_UNDEFINED = "postcondition_undefined"
+    POSTCONDITION_MISMATCH = "postcondition_mismatch"
+    DURABLE_LEDGER_REQUIRED = "durable_ledger_required"
 
 
 SWS_SUPPORTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
@@ -434,3 +473,8 @@ SWS_SUPPORTED_VERIFICATION_STATUSES: Final[frozenset[str]] = frozenset(
     status.value for status in VerificationStatus
 )
 """The complete set of canonical verification statuses."""
+
+SWS_SUPPORTED_OBSERVATION_PROVENANCES: Final[frozenset[str]] = frozenset(
+    provenance.value for provenance in ObservationProvenance
+)
+"""The complete set of canonical observation-provenance values."""

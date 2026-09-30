@@ -79,7 +79,7 @@ def test_request_approval_action_opens_pending_ticket(
 
 # 3. STOP_RESOURCE requires human approval in safe and review modes...
 @pytest.mark.parametrize("mode", [ExecutionMode.SAFE, ExecutionMode.REVIEW])
-def test_stop_resource_requires_human_approval_unless_autonomous(
+def test_stop_resource_requires_human_approval_in_safe_and_review(
     store: InMemoryApprovalStore, mode: ExecutionMode
 ):
     plan = _planner(store, mode).plan(
@@ -93,8 +93,8 @@ def test_stop_resource_requires_human_approval_unless_autonomous(
     assert plan.ticket.status == "pending"
 
 
-# 4. ...but is authorized in AUTONOMOUS mode, still without any ticket or execution.
-def test_stop_resource_authorized_in_autonomous_mode(
+# 4. M10: ...but is BLOCKED in AUTONOMOUS mode -- no ticket, no authorization.
+def test_stop_resource_blocked_in_autonomous_mode(
     store: InMemoryApprovalStore,
 ):
     plan = _planner(store, ExecutionMode.AUTONOMOUS).plan(
@@ -102,10 +102,24 @@ def test_stop_resource_authorized_in_autonomous_mode(
         resource_type=SWSResourceType.LAMBDA_FUNCTION,
         action=PotentialAction.STOP_RESOURCE,
     )
-    assert plan.authorization.decision is AuthorizationDecision.AUTHORIZED
+    assert plan.authorization.decision is AuthorizationDecision.BLOCKED
     assert plan.authorization.requires_human_approval is False
     assert plan.ticket is None
     assert list(store.pending()) == []
+
+
+def test_planner_never_produces_an_authorized_destructive_plan(
+    store: InMemoryApprovalStore,
+):
+    """M10: the plan can no longer self-assert authorization to mutate."""
+    for mode in ExecutionMode:
+        plan = _planner(store, mode).plan(
+            resource_id="fn-1",
+            resource_type=SWSResourceType.LAMBDA_FUNCTION,
+            action=PotentialAction.STOP_RESOURCE,
+        )
+        assert plan.authorization.decision is not AuthorizationDecision.AUTHORIZED
+        assert plan.executed is False
 
 
 # 5. Nothing is ever executed: `executed` is always False across the matrix.

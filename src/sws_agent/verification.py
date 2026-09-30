@@ -30,6 +30,19 @@ from .constants import VerificationStatus
 from .models import ResourceObservation, VerificationResult
 
 
+def _fact_confirms(observed: Any, expected: Any) -> bool:
+    """Return True only when ``observed`` confirms ``expected`` exactly.
+
+    Equality alone is not enough: in Python ``True == 1`` and ``False == 0``,
+    so a boolean fact would silently satisfy a numeric postcondition (and the
+    reverse). A verification claim must not rest on that, so booleans only
+    ever confirm booleans.
+    """
+    if isinstance(observed, bool) or isinstance(expected, bool):
+        return isinstance(observed, bool) and isinstance(expected, bool) and observed == expected
+    return bool(observed == expected)
+
+
 class ObservationError(RuntimeError):
     """An observation provider could not establish an authoritative state.
 
@@ -76,6 +89,12 @@ class DefaultOutcomeVerifier:
       - confirmed facts but some expected facts unobserved ->
         PARTIALLY_VERIFIED;
       - every expected fact confirmed, none contradicted -> SUCCESS.
+
+    M10: the expected facts are supplied by the coordinator from the
+    action's canonical postcondition, never from the caller, and a fact only
+    counts as confirmed when its value *and* its boolean-ness agree. Plain
+    Python equality would let ``True`` satisfy an expected ``1`` (and ``False``
+    an expected ``0``), which would let a type-confused fact claim success.
     """
 
     def verify(
@@ -109,7 +128,7 @@ class DefaultOutcomeVerifier:
             if key not in observed_facts:
                 missing.append(key)
                 continue
-            if observed_facts[key] == expected_value:
+            if _fact_confirms(observed_facts[key], expected_value):
                 matched.append(key)
             else:
                 contradicted.append(key)

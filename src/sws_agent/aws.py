@@ -14,11 +14,22 @@ Scope and honesty (M6):
 - The factory consumes the existing ``AWSConnectionConfig`` (configured
   region/profile) and applies the canonical ``AWS_API_RETRY_ATTEMPTS`` and
   ``AWS_API_TIMEOUT_SECONDS`` limits through ``botocore.config.Config``.
-- ``AwsMultiClient`` exposes exactly the six client methods the collectors
-  call (``list_buckets``, ``get_bucket_location``, ``get_bucket_tagging``,
-  ``list_functions``, ``list_tags``, ``get_cost_and_usage``), delegating to
-  the matching boto3 client. No collector logic is duplicated here and no
-  second abstraction layer exists beyond this thin adapter.
+- ``AwsMultiClient`` exposes exactly the seven client methods SWS calls: the
+  six collector methods (``list_buckets``, ``get_bucket_location``,
+  ``get_bucket_tagging``, ``list_functions``, ``list_tags``,
+  ``get_cost_and_usage``) plus the single M11 read seam
+  ``describe_instances``. No collector logic is duplicated here and no second
+  abstraction layer exists beyond this thin adapter. There is deliberately no
+  generic EC2 escape hatch (no ``**kwargs`` dispatch to arbitrary methods, no
+  ``getattr``-style passthrough, no client handle exposure).
+- The EC2 client (M11) is built lazily on first use, exactly like the boto3
+  import: a workspace that never observes an instance never constructs an
+  ``ec2`` client. This keeps ``describe_instances`` the only reason an EC2
+  client can exist, and keeps read-only observation from adding a client to
+  every inventory run.
+- ``describe_instances`` returns the *paginator* for ``ec2:DescribeInstances``
+  (AWS strongly recommends paginated requests). It is a read: SWS has no EC2
+  write method here, so no mutation can be reached through this adapter.
 - Lambda is a regional service: a single Lambda client targets one region.
   The factory creates the Lambda client for the configured region; region
   lists passed to ``collect_workspace`` are preserved as snapshot metadata,
@@ -70,6 +81,10 @@ class AwsMultiClient:
     object that the existing collectors and ``DefaultSwsBackend`` consume.
     Each method forwards exactly as the collector calls it; kwargs pass
     through untouched so pagination and per-call parameters are preserved.
+
+    M11 adds exactly one read-only EC2 method, ``describe_instances``. The
+    ``ec2`` client is created on first use by ``ec2_client_factory`` so a
+    caller that never observes an instance never builds one.
     """
 
     def __init__(
@@ -78,10 +93,13 @@ class AwsMultiClient:
         s3: Any,
         lambda_client: Any,
         cost_explorer: Any,
+        ec2_client_factory: Callable[[], Any] | None = None,
     ) -> None:
         self._s3 = s3
         self._lambda_client = lambda_client
         self._cost_explorer = cost_explorer
+        self._ec2_client_factory = ec2_client_factory
+        self._ec2: Any = None
 
     def list_buckets(self, **kwargs: Any) -> Any:
         return self._s3.list_buckets(**kwargs)
@@ -101,13 +119,37 @@ class AwsMultiClient:
     def get_cost_and_usage(self, **kwargs: Any) -> Any:
         return self._cost_explorer.get_cost_and_usage(**kwargs)
 
+    def describe_instances(self) -> Any:
+        """Return the paginator for the read-only ``ec2:DescribeInstances``.
+
+        This is the whole M11 AWS surface: one named read operation, exposed
+        as a paginator because AWS strongly recommends paginated requests.
+        The provider drains the pages itself.
+
+        There is intentionally no ``ec2_method(name, **kwargs)`` counterpart,
+        so no caller can name an arbitrary EC2 operation -- and in particular
+        no mutation (``ec2:StopInstances``) is reachable through SWS.
+        """
+        client = self._ec2
+        if client is None:
+            if self._ec2_client_factory is None:
+                raise RuntimeError(
+                    "no EC2 client factory is configured for this client"
+                )
+            client = self._ec2_client_factory()
+            self._ec2 = client
+        return client.get_paginator("describe_instances")
+
 
 class AwsClientFactory:
     """Callable client factory that builds an ``AwsMultiClient`` per call.
 
     Construction never imports boto3 and never performs an AWS call; boto3,
-    botocore, and the clients are created inside ``__call__``, so real AWS
-    plumbing happens only when a collector tool actually runs. Caller-supplied
+    botocore, and the s3/lambda/ce clients are created inside ``__call__``, so
+    real AWS plumbing happens only when a collector tool actually runs. The
+    ``ec2`` client is created even later -- on the first ``describe_instances``
+    call -- so no EC2 client exists unless an instance is observed.
+    Caller-supplied
     ``session_factory`` (receiving the profile name) and
     ``client_config_factory`` (receiving the retry/timeout limits) keep the
     factory fully deterministic and credential-free for hermetic tests.
@@ -152,6 +194,12 @@ class AwsClientFactory:
         )
         client_config = config_factory(self._retry_attempts, self._timeout_seconds)
         region = self._config.region
+
+        def ec2_client_factory() -> Any:
+            # Lazy (M11): only an EC2 observation builds an ``ec2`` client, and
+            # it inherits the same profile/region/retry/timeout plumbing.
+            return session.client("ec2", region_name=region, config=client_config)
+
         return AwsMultiClient(
             s3=session.client("s3", region_name=region, config=client_config),
             lambda_client=session.client(
@@ -160,4 +208,5 @@ class AwsClientFactory:
             cost_explorer=session.client(
                 "ce", region_name=COST_EXPLORER_REGION, config=client_config
             ),
+            ec2_client_factory=ec2_client_factory,
         )

@@ -395,6 +395,47 @@ M9's inputs were caller-shaped. The full rationale and the M9→M13 sequence are
   (`DURABLE_LEDGER_REQUIRED`), because without a ledger the intent key could not
   be enforced across restarts.
 
+## M11: read-only EC2 observation (still nothing executes)
+
+M11 adds the **read** half of the boundary M10 defined, and nothing else. It
+introduces `Ec2InstanceObservationProvider`
+([`src/sws_agent/ec2_observation.py`](src/sws_agent/ec2_observation.py)), the
+first implementation of the M9/M10 `ObservationProvider` protocol, plus a single
+read seam on the AWS client factory. The full identity rationale is in
+[`docs/adr/0002-ec2-observation-identity.md`](docs/adr/0002-ec2-observation-identity.md).
+
+- **One read, one operation.** `DescribeInstances` is the only AWS API SWS
+  calls, requested as `InstanceIds=[<id>]` through the paginator, with every
+  page drained. There is no second call, no discovery pass, and no provider-side
+  retry loop — retry and timeout behavior stay with the SDK configuration.
+- **Account identity comes from the read.** `account_id` is the enclosing
+  reservation's `OwnerId`: the instance owner's account, observed in the same
+  response. It is never read from configuration, never taken from a caller, and
+  **no STS call is made** (`GetCallerIdentity` answers a different question, and
+  would add a call and an IAM permission for information EC2 already returned).
+- **The ARN is constructed, and says so.** `DescribeInstances` returns no ARN,
+  so `arn:{partition}:ec2:{region}:{account_id}:instance/{instance_id}` is built
+  from an explicitly bound region and partition plus the observed owner. The
+  gate's ARN check is therefore a consistency check over identity components, not
+  independent ARN evidence. The independently observed fact is `State.Name`,
+  passed through byte-for-byte.
+- **Fail-closed everywhere.** Zero results, more than one result, a missing or
+  blank `InstanceId`/`State.Name`/`OwnerId`, a denied or throttled or timed-out
+  call, and any malformed response all raise `ObservationError`, which M10
+  already handles as a refusal or UNKNOWN. No AWS outcome is ever readable as
+  "absent, therefore safe to stop" — an invalid id, a recently terminated
+  instance, and an instance owned by another account are indistinguishable.
+- **The reported id is AWS's, not the caller's.** That is what lets M10's
+  identity gate detect a wrong-target read instead of accepting it.
+
+M11 boundaries, all still true: **no mutation, no `StopInstances`, no mutation
+handler, no execute/apply MCP tool, no `ExecutionCoordinator` production wiring,
+no autonomous execution, no audit schema change, and no M10 semantic change.**
+`PotentialAction.STOP_RESOURCE` remains `implemented=False`; M11 makes its
+read-side evidence available and its write side remains unreachable. The EC2
+client is built lazily, so inventory runs that never observe an instance never
+construct one. **M12 is next and is not implemented.**
+
 ## Layout
 
 ```
@@ -407,6 +448,7 @@ src/sws_agent/
     relationships.py deterministic-evidence-over-inference merging
     config.py        fail-fast configuration validation
     aws.py           real AWS client factory (M6, lazy optional boto3)
+    ec2_observation.py  read-only EC2 instance observation provider (M11)
     audit.py         durable append-only JSONL audit ledger (M8)
     _identity.py     UTC-aware clock + id sources (stdlib-only, hermetic)
     mcp/             MCP boundary (real Streamable HTTP server, M4)

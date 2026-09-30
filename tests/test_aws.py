@@ -541,3 +541,186 @@ def test_no_factory_toolerror_remains_deterministic() -> None:
     with pytest.raises(ToolError) as exc:
         _run(server.call_tool("collect_workspace", {"regions": ["us-east-1"]}))
     assert "no AWS client factory" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 11. M11: the single read-only EC2 seam. Additive only -- no existing test
+#     above is modified, and the ``ec2`` client stays lazy so the inventory
+#     tests that assert exactly {s3, lambda, ce} keep holding.
+# ---------------------------------------------------------------------------
+
+
+class FakeEc2Paginator:
+    """Fake ``ec2:DescribeInstances`` paginator."""
+
+    def __init__(self, pages: list[dict] | None = None) -> None:
+        self._pages = pages or [{"Reservations": []}]
+        self.paginate_calls: list[dict] = []
+
+    def paginate(self, **kwargs: object) -> object:
+        self.paginate_calls.append(kwargs)
+        return iter(self._pages)
+
+
+class FakeEc2Client:
+    """Fake boto3 ``ec2`` client exposing only the paginated read."""
+
+    def __init__(self, region_name: str | None, config) -> None:
+        self.service_name = "ec2"
+        self.region_name = region_name
+        self.config = config
+        self.paginator_requests: list[str] = []
+
+    def get_paginator(self, operation_name: str) -> FakeEc2Paginator:
+        self.paginator_requests.append(operation_name)
+        return FakeEc2Paginator()
+
+    def __getattr__(self, name: str):
+        raise AssertionError(f"unexpected EC2 client attribute access: {name}")
+
+
+def _ec2_session(profile_name: str | None = None) -> FakeSession:
+    """A FakeSession that serves a FakeEc2Client for the ``ec2`` service."""
+    session = FakeSession(profile_name=profile_name)
+
+    def client(
+        service_name: str, region_name: str | None = None, config=None
+    ) -> FakeClient:
+        if service_name == "ec2":
+            existing = session.clients.get("ec2")
+            if existing is not None:
+                return existing
+            built = FakeEc2Client(region_name, config)
+            session.clients["ec2"] = built  # type: ignore[assignment]
+            return built  # type: ignore[return-value]
+        return FakeSession.client(session, service_name, region_name, config)
+
+    session.client = client  # type: ignore[method-assign]
+    return session
+
+
+def test_ec2_client_uses_the_configured_region_and_profile() -> None:
+    session = _ec2_session()
+    profiles: list[str | None] = []
+    factory = AwsClientFactory(
+        AWSConnectionConfig(region="us-west-2", profile="dev"),
+        session_factory=lambda profile: (profiles.append(profile), session)[1],
+        client_config_factory=RecordingConfig,
+    )
+    multi = factory()
+    multi.describe_instances()
+    assert profiles == ["dev"]
+    assert session.clients["ec2"].region_name == "us-west-2"
+    assert session.clients["s3"].region_name == "us-west-2"
+
+
+def test_ec2_client_inherits_retry_and_timeout_configuration() -> None:
+    session = _ec2_session()
+    _factory(session_factory=lambda profile: session)().describe_instances()
+    config = session.clients["ec2"].config
+    assert config.retries["max_attempts"] == AWS_API_RETRY_ATTEMPTS
+    assert config.retries["mode"] == "standard"
+    assert config.connect_timeout == AWS_API_TIMEOUT_SECONDS
+    assert config.read_timeout == AWS_API_TIMEOUT_SECONDS
+
+
+def test_describe_instances_returns_the_describe_instances_paginator() -> None:
+    session = _ec2_session()
+    paginator = _factory(session_factory=lambda profile: session)().describe_instances()
+    assert isinstance(paginator, FakeEc2Paginator)
+    assert session.clients["ec2"].paginator_requests == ["describe_instances"]
+
+
+def test_multi_client_exposes_exactly_seven_operations() -> None:
+    expected = {
+        "list_buckets",
+        "get_bucket_location",
+        "get_bucket_tagging",
+        "list_functions",
+        "list_tags",
+        "get_cost_and_usage",
+        "describe_instances",
+    }
+    public = {
+        name
+        for name in dir(AwsMultiClient)
+        if not name.startswith("_") and callable(getattr(AwsMultiClient, name, None))
+    }
+    assert public == expected
+
+
+def test_multi_client_has_no_generic_ec2_passthrough() -> None:
+    for name in ("call", "invoke", "request", "ec2_method", "client", "get_client"):
+        assert not hasattr(AwsMultiClient, name), name
+    signature = inspect.signature(AwsMultiClient.describe_instances)
+    assert list(signature.parameters) == ["self"]
+    source = inspect.getsource(AwsMultiClient)
+    assert "stop_instances" not in source
+    assert "getattr(" not in source
+
+
+def test_existing_six_methods_are_unchanged() -> None:
+    s3 = FakeClient("s3", "us-east-1", None)
+    s3.set_response("list_buckets", {"Buckets": []})
+    s3.set_response("get_bucket_location", {"LocationConstraint": None})
+    s3.set_response("get_bucket_tagging", {"TagSet": []})
+    lambda_client = FakeClient("lambda", "us-east-1", None)
+    lambda_client.set_response("list_functions", {"Functions": []})
+    lambda_client.set_response("list_tags", {"Tags": {}})
+    ce = FakeClient("ce", COST_EXPLORER_REGION, None)
+    ce.set_response("get_cost_and_usage", {"ResultsByTime": []})
+
+    multi = AwsMultiClient(s3=s3, lambda_client=lambda_client, cost_explorer=ce)
+    multi.list_buckets()
+    multi.get_bucket_location(Bucket="b")
+    multi.get_bucket_tagging(Bucket="b")
+    multi.list_functions()
+    multi.list_tags(Resource="fn")
+    multi.get_cost_and_usage(TimePeriod={"Type": "MONTH"})
+
+    assert [method for method, _ in s3.calls] == [
+        "list_buckets",
+        "get_bucket_location",
+        "get_bucket_tagging",
+    ]
+    assert s3.calls[1][1] == {"Bucket": "b"}
+    assert [method for method, _ in lambda_client.calls] == ["list_functions", "list_tags"]
+    assert [method for method, _ in ce.calls] == ["get_cost_and_usage"]
+
+
+def test_describe_instances_without_an_ec2_factory_fails_loudly() -> None:
+    multi = AwsMultiClient(
+        s3=FakeClient("s3", None, None),
+        lambda_client=FakeClient("lambda", None, None),
+        cost_explorer=FakeClient("ce", None, None),
+    )
+    with pytest.raises(RuntimeError, match="no EC2 client factory"):
+        multi.describe_instances()
+
+
+def test_no_ec2_client_is_constructed_until_an_instance_is_observed() -> None:
+    session = _ec2_session()
+    builds: list[FakeEc2Client] = []
+    original_client = session.client
+
+    def counting_client(
+        service_name: str, region_name: str | None = None, config=None
+    ) -> FakeClient:
+        built = original_client(service_name, region_name, config)
+        if service_name == "ec2" and session.clients.get("ec2") is built:
+            builds.append(built)
+        return built
+
+    session.client = counting_client  # type: ignore[method-assign]
+    multi = _factory(session_factory=lambda profile: session)()
+    # Inventory-only usage never builds an EC2 client.
+    assert set(session.clients) == {"s3", "lambda", "ce"}
+    assert builds == []
+
+    multi.describe_instances()
+    assert set(session.clients) == {"s3", "lambda", "ce", "ec2"}
+    assert len(builds) == 1
+
+    multi.describe_instances()
+    assert len(builds) == 1  # reused, not rebuilt
+    assert session.clients["ec2"].paginator_requests == ["describe_instances"] * 2

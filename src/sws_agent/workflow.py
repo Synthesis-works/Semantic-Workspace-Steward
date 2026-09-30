@@ -25,7 +25,7 @@ from ._identity import new_id, utc_now
 from .approval import InMemoryApprovalStore
 from .authorization import ActionAuthorizer
 from .constants import ExecutionMode, PotentialAction, SWSResourceType
-from .models import ActionPlan, AuthorizationRequest
+from .models import ActionPlan, AuthorizationRequest, PolicyDecision
 
 
 class ActionPlanner:
@@ -75,6 +75,7 @@ class ActionPlanner:
         resource_type: SWSResourceType,
         action: PotentialAction,
         rationale: str = "",
+        decision: PolicyDecision | None = None,
     ) -> ActionPlan:
         """Authorize one candidate action and open a ticket when required.
 
@@ -82,7 +83,16 @@ class ActionPlanner:
         construction (fail-fast); actions the gate requires human approval
         for produce a new PENDING ticket in the injected approval store.
         Nothing is executed.
+
+        M9 lineage: when the ``PolicyDecision`` that motivated the request is
+        supplied, it must belong to the same resource, and its ``decision_id``
+        / ``snapshot_id`` / ``run_id`` are stamped onto the plan so the plan
+        can be correlated back to the exact policy evaluation and collection
+        run in the durable audit ledger. Omitting the decision remains valid
+        and leaves those fields unset.
         """
+        if decision is not None and decision.resource_id != resource_id:
+            raise ValueError("decision.resource_id does not match resource_id")
         request = AuthorizationRequest(
             resource_id=resource_id,
             resource_type=resource_type,
@@ -108,4 +118,7 @@ class ActionPlanner:
             execution_mode=self._execution_mode,
             authorization=result,
             ticket=ticket,
+            decision_id=decision.decision_id if decision is not None else None,
+            snapshot_id=decision.snapshot_id if decision is not None else None,
+            run_id=decision.run_id if decision is not None else None,
         )

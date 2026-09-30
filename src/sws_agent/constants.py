@@ -326,3 +326,111 @@ SWS_SUPPORTED_EXECUTION_MODES: Final[frozenset[str]] = frozenset(
     mode.value for mode in ExecutionMode
 )
 """The complete set of canonical execution modes."""
+
+
+class ExecutionStage(str, enum.Enum):
+    """Phases of a gated execution attempt for the audit ledger.
+
+    PRE marks the moment the gate finished evaluating and recorded intent;
+    ATTEMPT marks the single moment a mutation boundary would be crossed;
+    RESULT captures post-attempt verification; POST closes the record with
+    the final outcome. A request that stops at PRE without an ATTEMPT is an
+    honest statement that no mutation occurred.
+    """
+
+    PRE = "pre"
+    ATTEMPT = "attempt"
+    RESULT = "result"
+    POST = "post"
+
+
+class ExecutionOutcome(str, enum.Enum):
+    """Final outcome of an execution request after full verification.
+
+    VERIFIED_SUCCESS is only ever reported when an independent observation
+    confirmed the expected post-state. FAILED means a confirmed deviation or
+    a known call error. UNKNOWN means the attempt or its outcome could not be
+    firmly established (for example a timeout). PARTIALLY_VERIFIED means some
+    expected facts were confirmed but others could not be observed. REFUSED
+    and NOT_EXECUTED are the honest outcomes for requests that never crossed
+    the mutation boundary.
+    """
+
+    REFUSED = "refused"
+    NOT_EXECUTED = "not_executed"
+    VERIFIED_SUCCESS = "verified_success"
+    PARTIALLY_VERIFIED = "partially_verified"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class VerificationStatus(str, enum.Enum):
+    """How well the post-attempt state matched the expected post-state.
+
+    SUCCESS requires the observed facts to match every expected fact.
+    FAILED requires a confirmed contradiction. UNKNOWN is used whenever an
+    observation is unavailable, ambiguous (for example a timeout), or the
+    verifier cannot establish the outcome; it is NEVER upgraded to a success
+    claim. PARTIALLY_VERIFIED reports partial evidence honestly.
+    """
+
+    SUCCESS = "success"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    PARTIALLY_VERIFIED = "partially_verified"
+
+
+class RefusalReason(str, enum.Enum):
+    """Controlled reason vocabulary for gate-level execution refusals.
+
+    Every refusal SWS emits maps to exactly one reason value so callers can
+    act on it deterministically. The list is closed: a new reason is only
+    added after its gate condition is documented.
+    """
+
+    MISSING_PLAN = "missing_plan"
+    MISSING_DECISION = "missing_decision"
+    MISSING_SNAPSHOT = "missing_snapshot"
+    MODE_MISMATCH = "mode_mismatch"
+    ACTION_NOT_EXECUTABLE = "action_not_executable"
+    RESOURCE_TYPE_MISMATCH = "resource_type_mismatch"
+    RESOURCE_NOT_IN_SNAPSHOT = "resource_not_in_snapshot"
+    PARTIAL_SNAPSHOT = "partial_snapshot"
+    TRUNCATED_SNAPSHOT = "truncated_snapshot"
+    AUTONOMOUS_EXECUTION_UNSUPPORTED = "autonomous_execution_unsupported"
+    MISSING_TICKET = "missing_ticket"
+    TICKET_PENDING = "ticket_pending"
+    TICKET_DENIED = "ticket_denied"
+    TICKET_EXPIRED = "ticket_expired"
+    TICKET_MISMATCH_ACTION = "ticket_mismatch_action"
+    TICKET_MISMATCH_RESOURCE = "ticket_mismatch_resource"
+    TICKET_MISMATCH_PLAN = "ticket_mismatch_plan"
+    TICKET_CONSUMED = "ticket_consumed"
+    DECISION_MISMATCH = "decision_mismatch"
+    SNAPSHOT_MISMATCH = "snapshot_mismatch"
+    RESOURCE_IDENTITY_MISMATCH = "resource_identity_mismatch"
+    STALE_OBSERVATION = "stale_observation"
+    ALREADY_EXECUTED = "already_executed"
+    DUPLICATE_ATTEMPT = "duplicate_attempt"
+    EXECUTION_NOT_IMPLEMENTED = "execution_not_implemented"
+
+
+SWS_SUPPORTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
+    reason.value for reason in RefusalReason
+)
+"""The complete set of canonical gate-refusal reasons."""
+
+SWS_SUPPORTED_EXECUTION_STAGES: Final[frozenset[str]] = frozenset(
+    stage.value for stage in ExecutionStage
+)
+"""The complete set of canonical execution stages."""
+
+SWS_SUPPORTED_EXECUTION_OUTCOMES: Final[frozenset[str]] = frozenset(
+    outcome.value for outcome in ExecutionOutcome
+)
+"""The complete set of canonical execution outcomes."""
+
+SWS_SUPPORTED_VERIFICATION_STATUSES: Final[frozenset[str]] = frozenset(
+    status.value for status in VerificationStatus
+)
+"""The complete set of canonical verification statuses."""

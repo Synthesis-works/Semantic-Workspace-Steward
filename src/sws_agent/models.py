@@ -27,10 +27,13 @@ from .constants import (
     CollectionFailureCategory,
     EvidenceBasis,
     ExecutionMode,
+    ExecutionOutcome,
     PotentialAction,
+    RefusalReason,
     RelationshipType,
     RiskLevel,
     SWSResourceType,
+    VerificationStatus,
 )
 
 
@@ -306,6 +309,12 @@ class ApprovalTicket(BaseModel):
 
     ``plan_id`` (M8, optional) links the ticket to the ``ActionPlan`` that
     created it; a ticket created outside the planner has no plan.
+
+    ``consumed`` (M9, additive, always ``False`` for freshly created
+    tickets) marks a GRANTED ticket that has already been redeemed by an
+    execution attempt. Consumption is a one-way transition enforced by the
+    approval store (approval.py); a consumed ticket can never authorize
+    another attempt.
     """
 
     ticket_id: str = Field(min_length=1)
@@ -318,6 +327,7 @@ class ApprovalTicket(BaseModel):
     decided_by: str = ""
     decision_reason: str = ""
     plan_id: str | None = Field(default=None, min_length=1)
+    consumed: bool = False
 
     @field_validator("action", "status", mode="before")
     @classmethod
@@ -340,6 +350,13 @@ class ActionPlan(BaseModel):
     and an aware ``created_at``; the planner stamps both from injectable
     identity/clock sources so each plan record is uniquely referenceable in
     the durable audit ledger.
+
+    M9 lineage (additive): when the planner is handed the ``PolicyDecision``
+    that motivated the plan, it stamps ``decision_id`` / ``snapshot_id`` /
+    ``run_id`` from that decision so the plan can be correlated back to the
+    exact policy evaluation and collection run it was derived from. All
+    three are optional: direct constructions and planner flows that do not
+    supply a decision remain valid.
     """
 
     resource_id: str = Field(min_length=1)
@@ -352,6 +369,9 @@ class ActionPlan(BaseModel):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    decision_id: str | None = Field(default=None, min_length=1)
+    snapshot_id: str | None = Field(default=None, min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
 
     @field_validator("action", "execution_mode", mode="before")
     @classmethod
@@ -378,6 +398,154 @@ class ExplanationResult(BaseModel):
     @field_validator("claim_kind", mode="before")
     @classmethod
     def _normalize_claim_kind(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class ResourceObservation(BaseModel):
+    """A fresh, independent observation of a resource's post-state (M9).
+
+    Produced by an observation provider after an attempt. ``facts`` carries
+    sanitized, machine-readable attribute/value facts (for example
+    ``{"state": "stopped"}``); it never carries credentials or secrets.
+    ``ambiguous`` is set by the observer when the authoritative state could
+    not be firmly established (for example the observation timed out); an
+    ambiguous observation can never support a SUCCESS claim.
+
+    ``arn`` / ``account_id`` are optional canonical identity facts used by
+    the gate to confirm the observed resource is the same resource the plan
+    targeted (A1 identity). ``observed_at`` must be timezone-aware.
+    """
+
+    resource_id: str = Field(min_length=1)
+    resource_type: SWSResourceType
+    facts: dict[str, Any] = Field(default_factory=dict)
+    observed_at: datetime
+    ambiguous: bool = False
+    arn: str | None = Field(default=None, min_length=1)
+    account_id: str | None = Field(default=None, pattern=r"^[0-9]{12}$")
+    region: str | None = None
+
+    @field_validator("resource_type", mode="before")
+    @classmethod
+    def _normalize_resource_type(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("observed_at", mode="before")
+    @classmethod
+    def _require_aware_datetime(cls, value: Any) -> Any:
+        if isinstance(value, datetime) and value.tzinfo is None:
+            raise ValueError("observation timestamps must be timezone-aware")
+        return value
+
+
+class ExecutionRequest(BaseModel):
+    """Everything the execution gate needs to evaluate one attempt (M9).
+
+    ``action_plan_id`` + ``resource_id`` + ``action`` name the attempt. The
+    gate cross-checks the ``plan``, the ``decision`` that motivated it, the
+    ``snapshot`` the decision was derived from, the GRANTED ``ticket`` when
+    human approval is required, and a ``fresh_observation`` of the resource
+    taken no earlier than the snapshot's creation (A5 freshness). Every
+    context field is optional at the boundary so each refusal case can be
+    exercised; the gate is what requires them.
+    """
+
+    action_plan_id: str = Field(min_length=1)
+    resource_id: str = Field(min_length=1)
+    action: PotentialAction
+    execution_mode: ExecutionMode
+    plan: ActionPlan | None = None
+    decision: PolicyDecision | None = None
+    snapshot: WorkspaceSnapshot | None = None
+    ticket: ApprovalTicket | None = None
+    fresh_observation: ResourceObservation | None = None
+    expected_poststate: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("action", "execution_mode", mode="before")
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class MutationAttempt(BaseModel):
+    """Single, opaque result from crossing the mutation boundary (M9).
+
+    Produced by an injected mutation handler. ``ambiguous`` means the
+    attempt's own outcome is unknown (for example the call timed out after
+    being dispatched); an ambiguous attempt is never reported as anything
+    other than UNKNOWN. ``call_error`` means the underlying call failed
+    deterministically. ``sanitized`` carries only safe, non-secret evidence. A
+    ``None`` resolution yields the attempt outcome whenever the boundary is a
+    dry-run or verification-only boundary.
+    """
+
+    ambiguous: bool = False
+    call_error: bool = False
+    sanitized: dict[str, Any] = Field(default_factory=dict)
+
+
+class VerificationResult(BaseModel):
+    """Comparison of expected post-state facts against observed facts (M9).
+
+    ``status`` follows the verification taxonomy from constants.py:
+
+    - SUCCESS: every expected fact is confirmed by the observation.
+    - FAILED: at least one observed fact directly contradicts an expected
+      fact.
+    - PARTIALLY_VERIFIED: some expected facts are confirmed but others could
+      not be observed (the verifier reports partial evidence honestly).
+    - UNKNOWN: the observation was unavailable or ambiguous (including a
+      timeout); an UNKNOWN is never upgraded to SUCCESS.
+
+    ``details`` is a human-readable, claim-kind-marked description used by
+    the audit POST record.
+    """
+
+    status: VerificationStatus
+    expected_facts: dict[str, Any] = Field(default_factory=dict)
+    observed_facts: dict[str, Any] = Field(default_factory=dict)
+    details: list[str] = Field(default_factory=list)
+    observed_at: datetime | None = None
+
+
+class ExecutionResult(BaseModel):
+    """Final outcome of an execution attempt after the full gate (M9).
+
+    ``outcome`` is the canonical ``ExecutionOutcome``. On refusal the outcome
+    is REFUSED, ``refusal`` names the deterministic reason, and no attempt was
+    recorded. ``NOT_EXECUTED`` is the honest M9 statement that the gate
+    passed but no mutation implementation exists, so nothing was crossed.
+    Otherwise the outcome reflects the post-attempt verification
+    (VERIFIED_SUCCESS / PARTIALLY_VERIFIED / FAILED / UNKNOWN).
+    """
+
+    execution_id: str = Field(min_length=1)
+    action_plan_id: str = Field(min_length=1)
+    resource_id: str = Field(min_length=1)
+    action: PotentialAction
+    execution_mode: ExecutionMode
+    outcome: ExecutionOutcome
+    refusal: RefusalReason | None = None
+    refusal_detail: str = ""
+    verification: VerificationStatus | None = None
+    attempt_id: str | None = Field(default=None, min_length=1)
+    started_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    completed_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    note: str = ""
+
+    @field_validator("action", "execution_mode", "outcome", "refusal", mode="before")
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.strip().lower()
         return value

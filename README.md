@@ -297,6 +297,60 @@ to a durable ledger.
 - **M8 is read-only persistence**: no `get_history` tool, no executor, no
   `execution` records (the envelope stanza is reserved for M9).
 
+## M9: execution-safety machinery (still nothing executes)
+
+M9 builds the machinery SWS would need before it could ever touch AWS, and at
+the same time proves that machinery cannot touch AWS: there is **no real AWS
+mutation in M9** (the investigation explicitly confirmed "none is safe" for a
+first action) and **no mutation handler is registered**, so production cannot
+execute anything.
+
+- **Registry** (`src/sws_agent/execution.py`): `ACTION_EXECUTION_REGISTRY` is
+  immutable, metadata-only, and holds no callables. `STOP_RESOURCE` is the
+  only action with an execution contract — eligible types `{EC2_INSTANCE}`,
+  `requires_human_approval=True`, `implemented=False`, and a documentation-only
+  `mutation` string (`"ec2:StopInstances"`). `LEAVE` / `FLAG_FOR_REVIEW` /
+  `REQUEST_APPROVAL` have no eligible types and are never executable. There is
+  no EC2 inventory, no new mutating AWS client method, and no `execute`/`apply`
+  MCP tool.
+- **Gate** (`ExecutionCoordinator`): a fully gated request needs a `plan`
+  carrying decision lineage, the exact `PolicyDecision` that motivated it, the
+  `snapshot` that decision was derived from, a GRANTED and unconsumed
+  `ApprovalTicket` bound to that plan (approval-required actions), and a fresh
+  post-snapshot observation whose identity (resource/type/ARN/account) matches
+  the snapshot record. Refusals use the closed `RefusalReason` vocabulary
+  (missing/pending/denied/expired/mismatched/consumed ticket, decision or
+  snapshot mismatch, partial/truncated snapshot, stale/missing observation,
+  identity mismatch, already-executed plan, duplicate attempt, autonomous
+  execution unsupported, not executable). Autonomous execution of
+  approval-required actions is refused. A refused request performs **no AWS
+  call and writes no audit claim**.
+- **Honesty boundary**: because no handler is registered, a gate-passing
+  request ends `NOT_EXECUTED` — the result states plainly that the gate
+  passed but nothing was executed, and the ticket is not consumed. Only an
+  injected (test) handler can cross the boundary.
+- **Verification** (`src/sws_agent/verification.py`): closed taxonomy in
+  `VerificationStatus` — SUCCESS requires every expected fact observed,
+  FAILED requires a confirmed contradiction or call error, PARTIALLY_VERIFIED
+  reports partial evidence, UNKNOWN is used whenever the outcome cannot be
+  established (timeout/ambiguous/missing observation) and is **never**
+  upgraded to SUCCESS; SWS never blindly retries an ambiguous attempt (the
+  same plan is refused as a duplicate). A call timeout → UNKNOWN, never FAILED.
+- **Ledger contract** (`AuditRecordKind.EXECUTION`): transactions are
+  correlated via the shared lineage ids (`run_id` / `snapshot_id` /
+  `decision_id` / `action_plan_id` / `ticket_id` / `resource_id`) with sanitized
+  `execution_payload` stage records `PRE → ATTEMPT → RESULT → POST`. There is
+  **no schema change**: the envelope `execution` stanza stays `None` and
+  `schema_version` is unchanged. A gate refusal never leaves a durable claim,
+  and a `NOT_EXECUTED` request leaves only the `PRE` record.
+- **M9.4 probe** (`scripts/experiments/m9_live_readonly_probe.py`,
+  gitignored): opt-in (`SWS_AWS_REGION` / `SWS_AWS_PROFILE`) read-only probe
+  with a hard allowlist and exact call-count assertions; it performs no
+  mutations and prints no secrets. Honest A5 limitation: the current read-only
+  surface has no EC2 read-back primitive, so a fresh observation for the gate
+  must come from an external provider; adding an EC2 verification primitive is
+  a deferred, separately-reviewed change.
+
 ## Layout
 
 ```

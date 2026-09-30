@@ -114,6 +114,32 @@ class InMemoryApprovalStore:
             ticket_id, ApprovalStatus.EXPIRED, decided_by, reason
         )
 
+    def consume(self, ticket_id: str) -> ApprovalTicket:
+        """Mark a GRANTED ticket as consumed by an execution attempt (M9).
+
+        Consumption is a one-way, exactly-once transition: only a GRANTED
+        ticket that is not yet consumed may be consumed. Anything else raises
+        ``InvalidTransitionError`` (a PENDING/DENIED/EXPIRED ticket or a
+        second consume of the same ticket). A consumed ticket can never
+        authorize another execution attempt.
+        """
+        self._require_known(ticket_id)
+        self._expire_if_stale(ticket_id)
+        ticket = self._tickets[ticket_id]
+        if ticket.status is not ApprovalStatus.GRANTED:
+            raise InvalidTransitionError(
+                f"ticket '{ticket_id}' must be GRANTED before consumption "
+                f"(current status is {ticket.status.value})"
+            )
+        if ticket.consumed:
+            raise InvalidTransitionError(
+                f"ticket '{ticket_id}' is already consumed"
+            )
+        self._tickets[ticket_id] = ticket.model_copy(
+            update={"consumed": True}
+        )
+        return self._tickets[ticket_id]
+
     def pending(self) -> list[ApprovalTicket]:
         """Return tickets still awaiting approval.
 

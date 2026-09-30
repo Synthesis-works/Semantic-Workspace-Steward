@@ -26,8 +26,11 @@ Guarantees and boundaries:
     ``_guarded`` seam) instead of a silently missed durable claim. ``close()``
     makes any later write fail fast. If a tool call itself fails, no audit
     write happens at all (no false durable claim is recorded).
-  - The ``execution`` stanza is reserved and always ``None`` in M8; M9 will
-    own it once an executor exists.
+  - The ``execution`` envelope stanza is reserved and always ``None``: M9
+    deliberately makes NO schema change (no ``schema_version`` bump) and
+    records execution transactions through the standard ``kind`` / ``payload``
+    structure using ``AuditRecordKind.EXECUTION`` with the sanitized stage
+    payload from ``execution_payload``.
 
 The ledger is pure-python (only the standard library) so it remains hermetic
 in the no-AWS, no-network unit-test suite.
@@ -45,14 +48,18 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
+from .constants import ExecutionOutcome, ExecutionStage, RefusalReason
 from .models import (
     ActionPlan,
     ApprovalTicket,
     CollectionFailure,
     CostCollectionReport,
     CostEstimate,
+    ExecutionRequest,
+    MutationAttempt,
     PolicyDecision,
     ResourceRecord,
+    VerificationResult,
     WorkspaceSnapshot,
 )
 
@@ -73,6 +80,7 @@ class AuditRecordKind(str, enum.Enum):
     TICKET = "ticket"
     EXPLANATION = "explanation"
     COST = "cost"
+    EXECUTION = "execution"
 
 
 class AuditStoreError(RuntimeError):
@@ -96,7 +104,8 @@ class AuditEnvelope(BaseModel):
 
     ``record_id`` and ``created_at`` are stamped by the store at write time
     (never trusted from callers), so the ledger owns identity and time.
-    ``execution`` is reserved for M9 and is always ``None`` here.
+    ``execution`` is reserved and always ``None`` (M9 records execution
+    transactions through ``kind`` + sanitized ``payload`` instead).
     """
 
     schema_version: int = Field(default=AUDIT_SCHEMA_VERSION, ge=1)
@@ -390,3 +399,61 @@ def cost_payload(
             _failure_payload(failure) for failure in report.failures
         ],
     }
+
+
+def execution_payload(
+    *,
+    stage: ExecutionStage,
+    execution_id: str | None = None,
+    request: ExecutionRequest | None = None,
+    outcome: ExecutionOutcome | None = None,
+    refusal: RefusalReason | None = None,
+    refusal_detail: str = "",
+    attempt: MutationAttempt | None = None,
+    verification: VerificationResult | None = None,
+    consumed: bool = False,
+    note: str = "",
+) -> dict[str, Any]:
+    """Sanitized execution-stage payload (M9).
+
+    Written through the standard EXECUTION kind + payload structure; the
+    reserved ``execution`` envelope stanza deliberately stays ``None`` (no
+    schema change in M9). The payload carries only identifiers, canonical
+    enum values, and plain verification facts (``expected``/``observed``
+    values are sanitized domain facts, never raw AWS wire payloads,
+    credentials, or secrets). A mutation-call error is recorded as
+    ``attempt.call_error`` / ``attempt.ambiguous`` flags plus a sanitized
+    note, never an exception traceback.
+    """
+    payload: dict[str, Any] = {
+        "stage": stage.value,
+        "consumed": consumed,
+        "note": note,
+    }
+    if execution_id is not None:
+        payload["execution_id"] = execution_id
+    if request is not None:
+        payload["resource_id"] = request.resource_id
+        payload["action"] = request.action.value
+        payload["execution_mode"] = request.execution_mode.value
+    if outcome is not None:
+        payload["outcome"] = outcome.value
+    if refusal is not None:
+        payload["refusal"] = refusal.value
+        if refusal_detail:
+            payload["refusal_detail"] = refusal_detail
+    if attempt is not None:
+        payload["attempt"] = attempt.model_dump(mode="json")
+    if verification is not None:
+        payload["verification"] = {
+            "status": verification.status.value,
+            "expected_facts": dict(verification.expected_facts),
+            "observed_facts": dict(verification.observed_facts),
+            "details": list(verification.details),
+            "observed_at": (
+                verification.observed_at.isoformat()
+                if verification.observed_at is not None
+                else None
+            ),
+        }
+    return payload

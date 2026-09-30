@@ -152,3 +152,32 @@ Throwaway experiments live in `scripts/experiments/` (gitignored, with a
 Every important state, label, action, and limit is defined once in
 `src/sws_agent/constants.py` and imported everywhere. Tests assert the action
 vocabulary never drifts into SMS's file-lifecycle states.
+
+## Execution boundary (M9)
+
+- **New vocabulary, new boundary.** `ExecutionStage`, `ExecutionOutcome`,
+  `VerificationStatus`, and `RefusalReason` are fresh SWS definitions (with
+  `SWS_SUPPORTED_*` frozensets guarded by tests, matching the canonical-label
+  rule). Nothing is inherited from a file-lifecycle stage model.
+- **The sketch `interfaces.ActionExecutor` was left untouched but is
+  superseded.** It is still the minimal M4-era sketch; the real boundary is
+  `sws_agent.execution.MutationHandler` plus `ExecutionCoordinator`. It is not
+  wired anywhere and carries no behavior, so changing it would only churn
+  unrelated history.
+- **Lineage was reconciled, not duplicated.** M9 reuses the M8 identifiers
+  (`decision_id`, `snapshot_id`, `run_id`, `action_plan_id`, `plan_id`,
+  `ticket_id`). The only genuinely missing linkages were added as optional
+  fields: `ActionPlan.decision_id/snapshot_id/run_id` (stamped by the planner
+  from the supplied `PolicyDecision`) and `ApprovalTicket.consumed` (one-way
+  exactly-once redemption). No parallel id scheme was introduced.
+- **No real AWS mutation in M9 (deliberate).** The read-only investigation
+  concluded no first action is safe to enable: `ec2:StopInstances` is the
+  natural future mapping but SWS has no EC2 surface, and adding one purely to
+  have something to verify would be unsafe. M9 therefore registers no
+  `MutationHandler`, every `ActionSpec.implemented` is `False`, and the
+  registry's `mutation` string is documentation only. The ledger contract
+  (PRE/ATTEMPT/RESULT/POST) is validated with injected fakes, and the A5
+  freshness claim is exercised per-test with a fake observation harness.
+- **No schema change.** `AuditEnvelope` and `AUDIT_SCHEMA_VERSION` are
+  untouched: the reserved `execution` stanza stays `None` and M9 uses the
+  existing kind/payload structure with a new `AuditRecordKind.EXECUTION`.

@@ -301,7 +301,9 @@ class InMemoryApprovalStore:
             ticket_id, ApprovalStatus.REVOKED, decided_by, reason
         )
 
-    def consume(self, ticket_id: str) -> ApprovalTicket:
+    def consume(
+        self, ticket_id: str, *, expected_revision: int | None = None
+    ) -> ApprovalTicket:
         """Redeem a GRANTED ticket exactly once (M9, restated in M12).
 
         Transitions GRANTED -> CONSUMED. A consumed ticket is terminal, so a
@@ -309,6 +311,15 @@ class InMemoryApprovalStore:
         mark a CONSUMED ticket as consumed again, because the status no longer
         admits an outgoing transition. Anything that is not currently
         GRANTED (PENDING, DENIED, EXPIRED, CONSUMED, REVOKED) is refused.
+
+        ``expected_revision`` is the exact-revision precondition M13 requires at
+        the redemption boundary, and its semantics match
+        ``DurableApprovalStore.consume`` exactly: when supplied, the transition
+        succeeds only if the ticket is currently at that revision, and
+        ``RevisionConflictError`` is raised otherwise. When omitted, behaviour is
+        unchanged. This closes a revision check that previously existed only in
+        the durable store, which meant an in-memory-backed caller had no way to
+        bind a redemption to the revision it had verified.
 
         The transition is deliberately not atomic with respect to the caller's
         mutation. ``ExecutionCoordinator`` still consumes *after* the handler
@@ -321,6 +332,7 @@ class InMemoryApprovalStore:
             ApprovalStatus.CONSUMED,
             decided_by="",
             reason="",
+            expected_revision=expected_revision,
         )
 
     def pending(self) -> list[ApprovalTicket]:
@@ -355,8 +367,19 @@ class InMemoryApprovalStore:
         new_status: ApprovalStatus,
         decided_by: str,
         reason: str,
+        *,
+        expected_revision: int | None = None,
     ) -> ApprovalTicket:
         """Validate a transition against the M12 table and commit it.
+
+        ``expected_revision`` is checked *after* the transition table and
+        before any write, matching ``DurableApprovalStore``'s gate order
+        (unknown -> expiry -> transition table -> revision -> CAS). The order is
+        part of the contract: a caller that gets ``InvalidTransitionError``
+        learns the transition itself is illegal, while a caller that gets
+        ``RevisionConflictError`` learns the transition is legal but its view of
+        the ticket is stale and must be re-read. Reporting the stale view first
+        would make an illegal transition look like a race worth retrying.
 
         The successor ticket is rebuilt through ``model_validate`` rather than
         ``model_copy`` so the model's status/consumed invariant is enforced on
@@ -383,6 +406,13 @@ class InMemoryApprovalStore:
                 f"ticket '{ticket_id}' cannot transition from "
                 f"{ticket.status.value} to {new_status.value} "
                 f"(legal targets from {ticket.status.value}: {allowed})"
+            )
+        expected = ticket.revision if expected_revision is None else expected_revision
+        if expected != ticket.revision:
+            raise RevisionConflictError(
+                f"ticket '{ticket_id}' is at revision {ticket.revision}, but "
+                f"revision {expected} was expected; refusing to overwrite "
+                "newer approval state"
             )
         moment = self._now()
         changes: dict[str, object] = {

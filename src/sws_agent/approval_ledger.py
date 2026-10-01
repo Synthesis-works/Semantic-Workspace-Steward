@@ -503,10 +503,20 @@ class DurableApprovalStore:
         """GRANTED -> CONSUMED, exactly once.
 
         The terminal status is what makes a second redemption impossible; the
-        transition table rejects it before any write is attempted. This store
-        deliberately does **not** make consumption atomic with respect to the
-        caller's mutation. ``ExecutionCoordinator`` still consumes after
-        ``handler.handle()`` and Phase 2 leaves that ordering untouched; it
+        transition table rejects it before any write is attempted.
+
+        ``expected_revision`` is the exact-revision precondition M13 requires at
+        the redemption boundary. Its semantics are identical to
+        ``InMemoryApprovalStore.consume``: when supplied, the transition
+        succeeds only if the ticket is currently at that revision, and
+        ``RevisionConflictError`` is raised otherwise; when omitted, behaviour is
+        unchanged. A caller that reserved an execution against a specific
+        approval revision can therefore redeem exactly that revision rather
+        than whatever it has since become.
+
+        This store deliberately does **not** make consumption atomic with
+        respect to the caller's mutation. ``ExecutionCoordinator`` still consumes
+        after ``handler.handle()`` and Phase 2 leaves that ordering untouched; it
         is M13's problem to close.
         """
         return self._transition(

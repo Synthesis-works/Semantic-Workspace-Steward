@@ -148,9 +148,118 @@ class ApprovalStore(Protocol):
         self, ticket_id: str, *, decided_by: str = "", reason: str = ""
     ) -> ApprovalTicket: ...
 
-    def consume(self, ticket_id: str) -> ApprovalTicket: ...
+    def consume(
+        self, ticket_id: str, *, expected_revision: int | None = None
+    ) -> ApprovalTicket:
+        """Redeem a GRANTED ticket exactly once, optionally pinning a revision.
+
+        ``expected_revision`` is the exact-revision precondition M13 needs. When
+        supplied, the transition succeeds only if the ticket is currently at
+        exactly that revision, and raises ``RevisionConflictError`` otherwise.
+        When omitted, behaviour is unchanged: consume whatever is currently
+        ``GRANTED``.
+
+        M13's execution ledger records the approval revision a reservation was
+        claimed against. Without this parameter a caller could reserve against
+        revision *R*, let the ticket advance, and then redeem the newer
+        revision while the execution ledger still asserts the older one -- the
+        two stores would disagree about which authorization was used. This
+        parameter is what lets a caller force them to agree at the redemption
+        boundary. It is deliberately keyword-only and optional so existing
+        callers keep working unchanged.
+        """
+        ...
 
     def pending(self) -> list[ApprovalTicket]: ...
+
+
+@runtime_checkable
+class ExecutionLedger(Protocol):
+    """Durable, exclusive claim on a single execution (M13 Phase 3).
+
+    The authoritative record of *which executions have been claimed* lives
+    here and nowhere else. This is deliberately a different authority from
+    :class:`ApprovalStore`: approval answers "is this action authorized?",
+    and this answers "has this execution already been claimed, was it
+    attempted, and what is known about what happened?".
+
+    The M13 Phase 2 investigation established why the two must stay
+    separate. The approval compare-and-swap protects the *approval record*
+    while leaving the *external side effect* unprotected -- measured against
+    the real durable approval store, four independent processes all crossed
+    the external-effect boundary and only one later won ``consume``. The
+    audit ledger cannot fill the gap either: its duplicate scans answer from
+    an in-memory dict populated once at open, so they are process-local by
+    construction, and concurrent appends lose records on this platform.
+
+    Contract every implementation must satisfy:
+
+    * **Exactly-once claim.** ``reserve`` may succeed at most once per
+      ``(intent_key, ticket_id)``. A second call raises rather than
+      re-claiming, and the caller must not proceed to any external effect.
+    * **Read current state.** Every operation reads durable state. An
+      implementation must not answer from a cache populated at open, because
+      that is precisely the failure this seam exists to close.
+    * **Monotonic revision.** Every committed transition advances
+      ``revision`` by exactly one, and a caller-supplied expected revision
+      is honoured as a precondition.
+    * **Transitions are bound to the claiming worker.** ``mark_attempted``
+      and ``record_outcome`` require the ``worker_id`` that made the
+      reservation. Otherwise any caller that learned a pair could stamp a
+      definite outcome onto another worker's execution, which would make the
+      exclusive claim meaningless.
+    * **No automatic release.** A reservation that may have crossed the
+      external boundary is never released for another worker, and an
+      unresolved outcome is never retried automatically. Neither is there
+      an automatic takeover of an abandoned claim: a worker that crashed
+      before its external call and one that crashed during it leave
+      identical durable state.
+    * **No approval authority.** This seam reads ``ticket_id`` and
+      ``ticket_revision`` only as opaque bindings. It never consumes an
+      approval and never decides whether an action is authorized.
+
+    Implementations raise ``execution_ledger.UnknownReservationError`` for an
+    unclaimed pair and a ``ReservationConflictError`` subclass when the pair
+    is already claimed. Persistence, clocking, and locking are implementation
+    details and are deliberately absent from this surface.
+    """
+
+    def reserve(
+        self,
+        *,
+        intent_key: str,
+        ticket_id: str,
+        ticket_revision: int,
+        worker_id: str,
+        action_plan_id: str | None = None,
+        resource_id: str | None = None,
+        action: PotentialAction | None = None,
+    ) -> Any: ...
+
+    def get(self, intent_key: str, ticket_id: str) -> Any: ...
+
+    def mark_attempted(
+        self,
+        intent_key: str,
+        ticket_id: str,
+        *,
+        worker_id: str,
+        expected_revision: int | None = None,
+    ) -> Any: ...
+
+    def record_outcome(
+        self,
+        intent_key: str,
+        ticket_id: str,
+        outcome: Any,
+        *,
+        worker_id: str,
+        expected_revision: int | None = None,
+    ) -> Any: ...
+
+    def open_executions(self) -> tuple[Any, ...]: ...
+
+    def unresolved_executions(self) -> tuple[Any, ...]: ...
 
 
 @runtime_checkable

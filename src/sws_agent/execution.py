@@ -857,7 +857,17 @@ class ExecutionCoordinator:
                 RefusalReason.TICKET_MISMATCH_ACTION,
                 "ticket approves a different action",
             )
-        if stored.plan_id is not request.action_plan_id:
+        # Compare plan ids by value, not identity. This used to be `is not`,
+        # which only ever passed when the caller handed back the very object
+        # the store had cached: ``InMemoryApprovalStore`` returns its own
+        # instance, but ``DurableApprovalStore`` rehydrates a fresh
+        # ``ApprovalTicket`` per read, so an equal plan id arrives as a
+        # distinct ``str`` and every durable approval was refused here as
+        # "not bound to this plan". Every sibling check in this gate compares
+        # values (``resource_id``, ``action_plan_id``), so this also restores
+        # consistency. An unbound ticket (``plan_id`` ``None``) still only
+        # matches an unbound request.
+        if stored.plan_id != request.action_plan_id:
             return (
                 RefusalReason.TICKET_MISMATCH_PLAN,
                 "ticket is not bound to this plan",

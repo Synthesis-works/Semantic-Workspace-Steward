@@ -31,6 +31,9 @@ SWS_EXECUTION_MODE_ENV: Final[str] = "SWS_EXECUTION_MODE"
 SWS_AUDIT_DIR_ENV: Final[str] = "SWS_AUDIT_DIR"
 """Environment variable naming the audit ledger directory (M8 write-through)."""
 
+SWS_APPROVAL_DB_ENV: Final[str] = "SWS_APPROVAL_DB"
+"""Environment variable naming the durable approval ledger file (M12 Phase 3B)."""
+
 
 def audit_dir_from_env() -> Path | None:
     """Resolve the audit ledger directory from ``SWS_AUDIT_DIR``.
@@ -94,3 +97,40 @@ def execution_mode_from_env() -> ExecutionMode:
     if raw is None or not raw.strip():
         return ExecutionMode.SAFE
     return SWSRuntimeConfig(execution_mode=raw).execution_mode
+
+
+def approval_db_from_env() -> Path | None:
+    """Resolve the durable approval ledger file from ``SWS_APPROVAL_DB``.
+
+    Absent or blank values opt out of durable approval persistence: the caller
+    keeps the in-memory store. This is deliberately opt-in for the same reason
+    ``SWS_AUDIT_DIR`` is -- a hermetic, no-filesystem deployment must keep
+    working, and there is no safe default location to guess at.
+
+    A non-blank value **must** be absolute. A relative path would be resolved
+    against each process's working directory, so two processes started from
+    different directories would silently open two different approval
+    authorities -- both would look correct and neither would see the other's
+    grants. That is a correctness hazard an approval store cannot have, so the
+    configuration is rejected here rather than normalized into an absolute
+    path the operator did not choose.
+
+    Fails fast with ``ValueError`` (the same style as
+    ``execution_mode_from_env``): a misconfigured approval authority is an
+    operator error, not something to repair silently at startup.
+
+    Resolves the path only. It opens no database, creates no directories, and
+    performs no I/O -- ``DurableApprovalStore`` owns all of that.
+    """
+    raw = os.environ.get(SWS_APPROVAL_DB_ENV)
+    if raw is None or not raw.strip():
+        return None
+    path = Path(raw.strip())
+    if not path.is_absolute():
+        raise ValueError(
+            f"{SWS_APPROVAL_DB_ENV} must be an absolute path, got "
+            f"{str(path)!r}: a relative path would resolve differently per "
+            "working directory and could open a second, competing approval "
+            "authority"
+        )
+    return path

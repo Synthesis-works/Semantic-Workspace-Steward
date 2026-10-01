@@ -53,7 +53,13 @@ from mcp.server.mcpserver import MCPServer as SdkMCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ValidationError
 
-from ..approval import ApprovalError, InMemoryApprovalStore, UnknownTicketError
+from ..approval import (
+    ApprovalError,
+    ApprovalStoreCorruptionError,
+    ApprovalStoreUnavailableError,
+    InMemoryApprovalStore,
+    UnknownTicketError,
+)
 from ..audit import (
     AuditRecordKind,
     AuditStoreError,
@@ -67,8 +73,13 @@ from ..audit import (
     snapshot_payload,
     ticket_payload,
 )
+from ..approval_ledger import DurableApprovalStore
 from ..aws import AwsClientFactory, aws_config_from_env
-from ..config import audit_dir_from_env, execution_mode_from_env
+from ..config import (
+    approval_db_from_env,
+    audit_dir_from_env,
+    execution_mode_from_env,
+)
 from ..constants import (
     ExecutionMode,
     PotentialAction,
@@ -464,6 +475,17 @@ def _guarded(fn: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]
             WorkspaceSnapshotTooLargeError,
             ApprovalError,
             UnknownTicketError,
+            # Durable approval-store failures (M12 Phase 3A). These already
+            # subclass ``ApprovalError``, so they were reaching here
+            # transitively; they are named explicitly because it is a
+            # fail-closed boundary that must not silently regress. A corrupt or
+            # unavailable ledger must surface as an error, never as a fall back
+            # to a second, in-memory approval authority -- a caller that got a
+            # ToolError can retry or fail; a caller that got a fresh empty
+            # in-memory store would be told the ticket it holds no longer
+            # exists, and the durable authority would be bypassed.
+            ApprovalStoreCorruptionError,
+            ApprovalStoreUnavailableError,
             AuditStoreError,
         ) as exc:
             raise ToolError(str(exc)) from exc
@@ -893,6 +915,38 @@ class SwsMcpServer:
         )
 
 
+def approval_store_from_env() -> Any | None:
+    """Resolve the single approval authority this process will use.
+
+    Returns ``None`` when ``SWS_APPROVAL_DB`` is absent or blank, which leaves
+    ``DefaultSwsBackend`` on its explicit in-memory default. Otherwise it
+    returns a ``DurableApprovalStore`` opened at exactly that absolute path.
+
+    This is the only place the runtime decides which store is authoritative,
+    and the decision is deliberately one-way:
+
+    * There is no default database path. An operator must name one, because
+      a guessed location would silently split the approval authority between
+      deployments that disagree about where it lives.
+    * There is **no fallback to memory**. If the path is a corrupt or
+      non-SQLite file, the parent cannot be created, or the ledger fails its
+      integrity check, the failure propagates and startup aborts. Silently
+      continuing with an in-memory store would be the worst possible outcome:
+      the caller asked for durable approvals and would receive approvals that
+      vanish on restart, with no indication that durability was never in
+      effect. Failing loudly is recoverable; quietly losing the authority is
+      not.
+    * The ledger is never repaired, replaced, or deleted on failure.
+
+    Exactly one store is constructed here and handed to the single backend
+    instance, so the backend and its ``ActionPlanner`` share one authority.
+    """
+    path = approval_db_from_env()
+    if path is None:
+        return None
+    return DurableApprovalStore(path)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Explicit CLI entry point; binds loopback by default.
 
@@ -912,6 +966,13 @@ def main(argv: list[str] | None = None) -> int:
     ledger. When set, the server persists every tool's ledger records there
     and fails fast at startup on an unreadable/corrupt ledger; when absent,
     the server runs fully hermetic with no ledger writes.
+
+    ``SWS_APPROVAL_DB`` (M12 Phase 3B) names the durable approval ledger file.
+    When set to an absolute path, approvals become restart-durable SQLite
+    state; when absent or blank, the backend keeps its in-memory store. There
+    is no default path and no fallback: an unusable ledger aborts startup
+    rather than silently downgrading to an authority that loses approvals on
+    exit.
     """
     parser = argparse.ArgumentParser(prog="sws-mcp-server")
     parser.add_argument("--host", default="127.0.0.1")
@@ -926,15 +987,21 @@ def main(argv: list[str] | None = None) -> int:
         if audit_dir is not None
         else None
     )
+    # Resolved before the backend and never defaulted: a durable-approval
+    # failure must abort startup, not degrade to in-memory.
+    approval_store = approval_store_from_env()
     if config is not None:
         backend = DefaultSwsBackend(
             client_factory=AwsClientFactory(config=config),
             execution_mode=execution_mode,
             audit_store=audit_store,
+            approval_store=approval_store,
         )
     else:
         backend = DefaultSwsBackend(
-            execution_mode=execution_mode, audit_store=audit_store
+            execution_mode=execution_mode,
+            audit_store=audit_store,
+            approval_store=approval_store,
         )
     SwsMcpServer(backend=backend).run(host=args.host, port=args.port, path=args.path)
     return 0

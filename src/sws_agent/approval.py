@@ -212,7 +212,20 @@ class InMemoryApprovalStore:
         as supplied. Phase 1 does not derive either value; stamping the
         intent key from the plan and defining the evidence digest are Phase 5
         concerns, so both stay ``None`` on every planner-created ticket.
+
+        A ``ticket_id`` already in use raises :class:`DuplicateTicketError`
+        and leaves the stored ticket untouched, matching
+        :class:`approval_ledger.DurableApprovalStore`. This used to be an
+        unconditional assignment, which silently reset an existing ticket to
+        PENDING at ``revision`` 0 -- so a duplicate create could un-approve a
+        GRANTED approval. Keeping the two implementations behaviorally
+        identical is what lets the durable store replace this one without any
+        caller observing a change in duplicate handling.
         """
+        if ticket_id is not None and ticket_id in self._tickets:
+            raise DuplicateTicketError(
+                f"approval ticket already exists: {ticket_id}"
+            )
         ticket = ApprovalTicket(
             ticket_id=ticket_id or uuid.uuid4().hex,
             resource_id=resource_id,

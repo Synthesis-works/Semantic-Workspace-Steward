@@ -15,6 +15,7 @@ from sws_agent.approval import (
     DEFAULT_APPROVAL_TICKET_TTL,
     LEGAL_APPROVAL_TRANSITIONS,
     TERMINAL_APPROVAL_STATUSES,
+    DuplicateTicketError,
     InMemoryApprovalStore,
     InvalidTransitionError,
     UnknownTicketError,
@@ -549,3 +550,93 @@ def test_consumed_flag_cannot_contradict_status():
     assert ApprovalTicket(
         **base, status=ApprovalStatus.CONSUMED, consumed=True
     ).status is ApprovalStatus.CONSUMED
+
+
+# --- M12 Phase 3A: duplicate-ticket parity with DurableApprovalStore ---
+
+
+def test_duplicate_ticket_id_is_refused_and_leaves_granted_ticket_intact():
+    """A duplicate create must not be able to un-approve a GRANTED ticket.
+
+    This store used to assign unconditionally, so re-creating a ticket_id
+    reset it to PENDING at revision 0 -- a live approval could be silently
+    revoked (or, in the other direction, a denial erased). It now raises
+    DuplicateTicketError and leaves the stored ticket exactly as it was.
+    """
+    clock, store = _store()
+    store.create_ticket("r1", PotentialAction.STOP_RESOURCE, "run A", ticket_id="dup")
+    granted = store.grant("dup", decided_by="alice")
+    assert granted.status is ApprovalStatus.GRANTED
+
+    with pytest.raises(DuplicateTicketError, match="dup"):
+        store.create_ticket(
+            "r2",
+            PotentialAction.STOP_RESOURCE,
+            "attacker run",
+            ticket_id="dup",
+        )
+
+    # The original ticket is untouched: still GRANTED, same revision, same
+    # decision fields, and no trace of the rejected create.
+    after = store.get("dup")
+    assert after == granted
+    assert after.status is ApprovalStatus.GRANTED
+    assert after.revision == granted.revision
+    assert after.decided_by == "alice"
+    assert after.decided_at == granted.decided_at
+    assert after.resource_id == "r1"
+    assert after.rationale == "run A"
+    # And the rejected ticket's distinct fields leaked nowhere.
+    assert "attacker run" not in {t.rationale for t in store.pending()}
+    assert store.pending() == []
+
+
+def test_duplicate_refusal_is_independent_of_stored_status():
+    """Duplicate detection keys on identity, not on the stored status."""
+    clock, store = _store()
+    store.create_ticket("r1", PotentialAction.STOP_RESOURCE, ticket_id="d1")
+    store.grant("d1", decided_by="alice")
+    store.create_ticket("r2", PotentialAction.STOP_RESOURCE, ticket_id="d2")
+    store.deny("d2", decided_by="bob")
+
+    for ticket_id in ("d1", "d2"):
+        with pytest.raises(DuplicateTicketError):
+            store.create_ticket(
+                "r3", PotentialAction.STOP_RESOURCE, ticket_id=ticket_id
+            )
+    assert store.get("d1").status is ApprovalStatus.GRANTED
+    assert store.get("d2").status is ApprovalStatus.DENIED
+
+
+def test_refused_duplicate_does_not_advance_revision_counter():
+    """A rejected create must not consume a revision number or an id slot."""
+    clock, store = _store()
+    store.create_ticket("r1", PotentialAction.STOP_RESOURCE, ticket_id="x")
+    granted = store.grant("x", decided_by="alice")
+
+    for _ in range(3):
+        with pytest.raises(DuplicateTicketError):
+            store.create_ticket(
+                "r1", PotentialAction.STOP_RESOURCE, ticket_id="x"
+            )
+
+    assert store.get("x") == granted
+    # A subsequent legitimate create still works and starts at revision 0.
+    fresh = store.create_ticket("r1", PotentialAction.STOP_RESOURCE, ticket_id="y")
+    assert fresh.revision == 0
+
+
+def test_distinct_ticket_ids_and_autogen_ids_still_create_normally():
+    """The guard rejects only true duplicates; normal creation is unchanged."""
+    clock, store = _store()
+    first = store.create_ticket("r1", PotentialAction.STOP_RESOURCE, ticket_id="t1")
+    second = store.create_ticket("r1", PotentialAction.STOP_RESOURCE, ticket_id="t2")
+    auto_a = store.create_ticket("r1", PotentialAction.STOP_RESOURCE)
+    auto_b = store.create_ticket("r1", PotentialAction.STOP_RESOURCE)
+
+    ids = {first.ticket_id, second.ticket_id, auto_a.ticket_id, auto_b.ticket_id}
+    assert len(ids) == 4  # uuid4 path still produces distinct ids
+    for ticket in (first, second, auto_a, auto_b):
+        assert ticket.status is ApprovalStatus.PENDING
+        assert ticket.revision == 0
+    assert len(store.pending()) == 4

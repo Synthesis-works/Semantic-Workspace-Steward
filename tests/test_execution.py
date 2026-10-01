@@ -30,6 +30,7 @@ from sws_agent.approval import (
     InvalidTransitionError,
     UnknownTicketError,
 )
+from sws_agent.approval_ledger import DurableApprovalStore
 from sws_agent.audit import AuditRecordKind, JsonlAuditStore
 from sws_agent.constants import (
     SWS_MAX_OBSERVATION_AGE_SECONDS,
@@ -2100,3 +2101,146 @@ def test_new_execution_vocabulary_is_canonical():
     assert SWS_SUPPORTED_VERIFICATION_STATUSES == {
         v.value for v in VerificationStatus
     }
+
+
+# ---------------------------------------------------------------------------
+# M13 precondition: plan binding must compare plan_id by value, not identity.
+#
+# The gate used `is not`, which only passed when the caller handed back the
+# exact object the store had cached. InMemoryApprovalStore returns its own
+# instance so the bug stayed hidden; DurableApprovalStore rehydrates a fresh
+# ApprovalTicket from SQLite, so an equal plan id arrives as a distinct str
+# and every durable approval was refused as "not bound to this plan".
+# ---------------------------------------------------------------------------
+
+
+def _durable_gate_ticket(tmp_path: Path, *, plan_id: str = "plan-1"):
+    """Issue and grant a ticket through the durable store, then re-read it.
+
+    The returned ticket is the rehydrated one, which is the whole point: it is
+    a different object from anything the request will carry.
+    """
+    store = DurableApprovalStore(tmp_path / "approvals.sqlite3", now=lambda: FIXED_NOW)
+    store.create_ticket(
+        "inst-1",
+        STOP,
+        plan_id=plan_id,
+        ticket_id="t1",
+    )
+    store.grant("t1", decided_by="human-1")
+    return store, store.get("t1")
+
+
+def test_durable_rehydrated_ticket_passes_plan_binding_by_value(tmp_path: Path):
+    """Case A: equal plan_id value, distinct object -> gate accepts."""
+    store, stored = _durable_gate_ticket(tmp_path)
+    snapshot = _make_snapshot()
+    decision = _make_decision(snapshot)
+    plan = _make_plan(InMemoryApprovalStore(now=_Clock()), snapshot=snapshot, decision=decision)
+
+    # Rebuild the plan id at runtime so interning cannot make this the same
+    # object: equal by value, guaranteed distinct by identity.
+    equal_value = "".join(list(stored.plan_id))
+    assert equal_value == stored.plan_id
+    assert equal_value is not stored.plan_id
+
+    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock())
+    request = ExecutionRequest(
+        action_plan_id=equal_value,
+        resource_id="inst-1",
+        action=STOP,
+        execution_mode=SAFE,
+        plan=plan,
+        decision=decision,
+        snapshot=snapshot,
+        ticket=stored,
+    )
+
+    assert coordinator._ticket_gate(request) is None
+    store.close()
+
+
+def test_durable_rehydration_does_not_reuse_ticket_objects(tmp_path: Path):
+    """Precondition of the test above: rehydration really is a new object.
+
+    Without this, a future change that caches tickets could make the equality
+    test pass for the wrong reason and hide the original defect again.
+    """
+    store, first = _durable_gate_ticket(tmp_path)
+    second = store.get("t1")
+    assert first is not second
+    assert first.plan_id == second.plan_id
+    assert first.plan_id is not second.plan_id
+    store.close()
+
+
+def test_durable_ticket_with_different_plan_id_still_refused(tmp_path: Path):
+    """Case B: a genuinely different plan id is still rejected."""
+    store, stored = _durable_gate_ticket(tmp_path, plan_id="plan-1")
+    snapshot = _make_snapshot()
+    decision = _make_decision(snapshot)
+    plan = _make_plan(InMemoryApprovalStore(now=_Clock()), snapshot=snapshot, decision=decision)
+
+    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock())
+    request = ExecutionRequest(
+        action_plan_id="a-different-plan",
+        resource_id="inst-1",
+        action=STOP,
+        execution_mode=SAFE,
+        plan=plan,
+        decision=decision,
+        snapshot=snapshot,
+        ticket=stored,
+    )
+
+    refusal = coordinator._ticket_gate(request)
+    assert refusal is not None
+    assert refusal[0] is RefusalReason.TICKET_MISMATCH_PLAN
+    store.close()
+
+
+def test_in_memory_plan_binding_behavior_is_unchanged(tmp_path: Path):
+    """Case C: the existing in-memory semantics still hold."""
+    store = InMemoryApprovalStore(now=_Clock())
+    snapshot = _make_snapshot()
+    decision = _make_decision(snapshot)
+    plan = _make_plan(store, snapshot=snapshot, decision=decision)
+    granted = _grant(store, plan)
+
+    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock())
+
+    matching = _request(
+        plan=plan, snapshot=snapshot, decision=decision, ticket=granted
+    )
+    assert coordinator._ticket_gate(matching) is None
+
+    mismatched = _request(
+        plan=plan,
+        snapshot=snapshot,
+        decision=decision,
+        ticket=granted,
+        action_plan_id="plan-2",
+    )
+    refusal = coordinator._ticket_gate(mismatched)
+    assert refusal is not None
+    assert refusal[0] is RefusalReason.TICKET_MISMATCH_PLAN
+
+
+def test_plan_binding_still_refuses_when_ticket_has_no_plan():
+    """An unbound ticket (plan_id None) must not match any named plan."""
+    store = InMemoryApprovalStore(now=_Clock())
+    snapshot = _make_snapshot()
+    decision = _make_decision(snapshot)
+    plan = _make_plan(store, snapshot=snapshot, decision=decision)
+    unbound = _mismatch_ticket(
+        store, resource_id="inst-1", action=STOP, plan_id=None
+    )
+    assert unbound.plan_id is None
+
+    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock())
+    request = _request(
+        plan=plan, snapshot=snapshot, decision=decision, ticket=unbound
+    )
+    refusal = coordinator._ticket_gate(request)
+    assert refusal is not None
+    assert refusal[0] is RefusalReason.TICKET_MISMATCH_PLAN

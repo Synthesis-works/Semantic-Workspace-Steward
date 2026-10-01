@@ -24,7 +24,12 @@ from pathlib import Path
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from sws_agent.approval import InMemoryApprovalStore
+from sws_agent.approval import (
+    ApprovalStoreCorruptionError,
+    ApprovalStoreUnavailableError,
+    InMemoryApprovalStore,
+)
+from sws_agent.config import SWS_APPROVAL_DB_ENV
 from sws_agent.constants import (
     ExecutionMode,
     PotentialAction,
@@ -710,3 +715,157 @@ def test_get_cost_estimates_surfaces_primary_failure():
     assert len(report.failures) == 1
     assert report.failures[0].category == "primary"
     assert report.failures[0].fatal is True
+
+
+# --- M12 Phase 3A: durable approval-store error boundary ---
+
+
+class FailingApprovalStore:
+    """Approval store whose every operation fails with a given error.
+
+    Structural stand-in for ``DurableApprovalStore``: it exposes the store
+    surface the backend uses and refuses all of it, so tests can assert the
+    MCP boundary fails closed without constructing a real database.
+    """
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.calls: list[str] = []
+
+    def _refuse(self, op: str):
+        self.calls.append(op)
+        raise self.exc
+
+    def pending(self):
+        return self._refuse("pending")
+
+    def get(self, ticket_id: str):
+        return self._refuse("get")
+
+    def create_ticket(self, *args, **kwargs):
+        return self._refuse("create_ticket")
+
+    def grant(self, ticket_id: str, **kwargs):
+        return self._refuse("grant")
+
+    def deny(self, ticket_id: str, **kwargs):
+        return self._refuse("deny")
+
+    def consume(self, ticket_id: str, **kwargs):
+        return self._refuse("consume")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ApprovalStoreCorruptionError("approval ledger failed integrity check"),
+        ApprovalStoreUnavailableError("approval ledger is locked"),
+    ],
+    ids=["corruption", "unavailable"],
+)
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("list_approvals", {}),
+        (
+            "request_approval",
+            {
+                "resource_id": "fn-1",
+                "resource_type": "lambda_function",
+                "action": "stop_resource",
+                "rationale": "deploy window",
+            },
+        ),
+        ("decide_ticket", {"ticket_id": "t1", "decision": "grant"}),
+        ("decide_ticket", {"ticket_id": "t1", "decision": "deny"}),
+    ],
+    ids=["list", "request", "grant", "deny"],
+)
+def test_durable_store_failures_surface_as_tool_error(exc, tool, args):
+    """A corrupt/unavailable ledger is an error, never a silent empty list.
+
+    Each approval tool is exercised against a store that refuses everything.
+    The boundary must translate the failure into ``ToolError`` so the caller
+    knows the approval state is unknown, rather than returning an empty
+    pending list or a fabricated ticket that looks like success.
+    """
+    store = FailingApprovalStore(exc)
+    backend = DefaultSwsBackend(approval_store=store)
+    server = SwsMcpServer(backend=backend)
+
+    with pytest.raises(ToolError) as caught:
+        _run(server.call_tool(tool, args))
+
+    assert str(exc) in str(caught.value)
+    assert store.calls, "the store was never consulted"
+
+
+def test_unknown_ticket_behavior_is_preserved():
+    """The pre-existing UnknownTicketError mapping still holds."""
+    backend = DefaultSwsBackend(approval_store=InMemoryApprovalStore())
+    server = SwsMcpServer(backend=backend)
+
+    with pytest.raises(ToolError, match="no such ticket|not found|unknown"):
+        _run(server.call_tool("decide_ticket", {"ticket_id": "missing", "decision": "grant"}))
+
+
+def test_no_fallback_to_in_memory_when_durable_store_fails():
+    """Fail-closed means no second approval authority appears.
+
+    The injected store is the only authority consulted; it is not swapped for
+    an ``InMemoryApprovalStore`` on failure, and no tool succeeds.
+    """
+    store = FailingApprovalStore(
+        ApprovalStoreCorruptionError("approval ledger failed integrity check")
+    )
+    server = SwsMcpServer(backend=DefaultSwsBackend(approval_store=store))
+
+    for tool, args in (
+        ("list_approvals", {}),
+        ("decide_ticket", {"ticket_id": "t1", "decision": "grant"}),
+    ):
+        with pytest.raises(ToolError):
+            _run(server.call_tool(tool, args))
+
+    assert "pending" in store.calls
+    # Only the injected (failing) store was ever touched.
+    assert isinstance(server._backend._approval_store, FailingApprovalStore)
+
+
+# --- M12 Phase 3A: the runtime migration must NOT have happened ---
+
+
+def test_default_backend_still_uses_in_memory_store():
+    """Production default is unchanged: no store injected means in-memory."""
+    backend = DefaultSwsBackend()
+    assert isinstance(backend._approval_store, InMemoryApprovalStore)
+    assert backend._planner._store is backend._approval_store
+
+
+def test_approval_db_env_is_not_consulted_by_the_backend_class(monkeypatch):
+    """Store selection is the composition root's job, not the backend's.
+
+    ``DefaultSwsBackend()`` on its own always uses the in-memory default even
+    when ``SWS_APPROVAL_DB`` is set. Only the composition root consults the
+    variable, so constructing the backend elsewhere can never silently pick
+    up a durable ledger.
+    """
+    monkeypatch.setenv(
+        SWS_APPROVAL_DB_ENV, str(Path("D:/sws-test/approvals.sqlite3"))
+    )
+
+    backend = DefaultSwsBackend()
+    assert isinstance(backend._approval_store, InMemoryApprovalStore)
+
+
+def test_phase_3a_did_not_add_tools():
+    """The surface is unchanged: still exactly nine tools."""
+    backend = DefaultSwsBackend(
+        approval_store=FailingApprovalStore(
+            ApprovalStoreUnavailableError("approval ledger is locked")
+        )
+    )
+    server = SwsMcpServer(backend=backend)
+    assert len(server.registry.names()) == len(BUILTIN_TOOL_NAMES) == 9
+    assert set(server.registry.names()) == set(BUILTIN_TOOL_NAMES)
+    assert len(_run(server.list_tools())) == 9

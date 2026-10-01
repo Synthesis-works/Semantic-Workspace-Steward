@@ -55,7 +55,7 @@ from typing import Any, Final, Mapping, Protocol, runtime_checkable
 from uuid import uuid4
 
 from ._identity import utc_now
-from .approval import InMemoryApprovalStore, UnknownTicketError
+from .approval import UnknownTicketError
 from .audit import AuditRecordKind, AuditStore, execution_payload
 from .constants import (
     SWS_MAX_OBSERVATION_AGE_SECONDS,
@@ -69,6 +69,7 @@ from .constants import (
     SWSResourceType,
     VerificationStatus,
 )
+from .interfaces import ApprovalStore
 from .models import (
     ExecutionRequest,
     ExecutionResult,
@@ -83,6 +84,54 @@ from .verification import (
     ObservationProvider,
     OutcomeVerifier,
 )
+
+
+_TICKET_STATE_REFUSALS: dict[
+    ApprovalStatus, tuple[RefusalReason, str]
+] = {
+    ApprovalStatus.PENDING: (
+        RefusalReason.TICKET_PENDING,
+        "attached ticket is still pending approval",
+    ),
+    ApprovalStatus.DENIED: (
+        RefusalReason.TICKET_DENIED,
+        "attached ticket was denied",
+    ),
+    ApprovalStatus.EXPIRED: (
+        RefusalReason.TICKET_EXPIRED,
+        "attached ticket has expired",
+    ),
+    ApprovalStatus.CONSUMED: (
+        RefusalReason.TICKET_CONSUMED,
+        "ticket was already consumed by another attempt",
+    ),
+    ApprovalStatus.REVOKED: (
+        RefusalReason.TICKET_REVOKED,
+        "attached ticket was revoked after approval",
+    ),
+}
+"""M12: refusal for every approval state that cannot authorize an attempt.
+
+GRANTED is deliberately absent: it is the only state that reaches the binding
+checks in :meth:`ExecutionCoordinator._ticket_gate`. DENIED and REVOKED are
+kept distinct because a DENIED ticket was never approved while a REVOKED one
+was approved and later withdrawn.
+"""
+
+_UNMAPPED_TICKET_STATES: frozenset[ApprovalStatus] = (
+    frozenset(ApprovalStatus)
+    - frozenset(_TICKET_STATE_REFUSALS)
+    - {ApprovalStatus.GRANTED}
+)
+if _UNMAPPED_TICKET_STATES:  # pragma: no cover - import-time invariant
+    # Fail fast rather than at the first execution attempt. An approval state
+    # with no refusal entry would make the ticket gate treat it as GRANTED and
+    # pass it, which is fail-open on the one gate that stands between a stored
+    # string and a real mutation.
+    raise RuntimeError(
+        "every non-GRANTED ApprovalStatus needs a ticket-gate refusal; "
+        f"unmapped: {sorted(s.value for s in _UNMAPPED_TICKET_STATES)}"
+    )
 
 
 @dataclass(frozen=True)
@@ -246,6 +295,13 @@ class ExecutionCoordinator:
     provider rather than the request, postconditions are action-derived, and
     identity plus freshness are mandatory on both sides.
 
+    M12: the approval dependency is the ``interfaces.ApprovalStore``
+    protocol rather than a concrete class, so a durable implementation can
+    replace the in-memory test double with no change here. The ticket gate
+    now maps every non-GRANTED state to its own refusal; previously an
+    unrecognized state fell through to "expired", and consumption was
+    detected from an orthogonal boolean rather than from status.
+
     Refusals write no audit record: SWS never records a false durable claim,
     and a refused request performs no AWS call.
     """
@@ -253,7 +309,7 @@ class ExecutionCoordinator:
     def __init__(
         self,
         *,
-        approval_store: InMemoryApprovalStore,
+        approval_store: ApprovalStore,
         handler: MutationHandler | None = None,
         observer: ObservationProvider | None = None,
         verifier: OutcomeVerifier | None = None,
@@ -761,6 +817,16 @@ class ExecutionCoordinator:
     def _ticket_gate(
         self, request: ExecutionRequest
     ) -> tuple[RefusalReason, str] | None:
+        """Refuse unless the attached ticket is a live, bound, unexpired GRANT.
+
+        M12: every non-GRANTED state maps to a distinct refusal. The M9 gate
+        tested three states and used "expired" as a catch-all, which would
+        have misreported a CONSUMED or REVOKED ticket as expired; it also
+        detected consumption from the orthogonal ``consumed`` boolean, so a
+        CONSUMED ticket was checked as if it were merely GRANTED and relied
+        on a later boolean test to reject it. Status is now the single
+        authority.
+        """
         ticket = request.ticket
         if ticket is None:
             return (
@@ -774,21 +840,13 @@ class ExecutionCoordinator:
                 RefusalReason.MISSING_TICKET,
                 "attached ticket is not present in the approval store",
             )
-        if stored.status is not ApprovalStatus.GRANTED:
-            if stored.status is ApprovalStatus.PENDING:
-                return (
-                    RefusalReason.TICKET_PENDING,
-                    "attached ticket is still pending approval",
-                )
-            if stored.status is ApprovalStatus.DENIED:
-                return (
-                    RefusalReason.TICKET_DENIED,
-                    "attached ticket was denied",
-                )
-            return (
-                RefusalReason.TICKET_EXPIRED,
-                "attached ticket has expired",
-            )
+        refusal = (
+            None
+            if stored.status is ApprovalStatus.GRANTED
+            else _TICKET_STATE_REFUSALS[stored.status]
+        )
+        if refusal is not None:
+            return refusal
         if stored.resource_id != request.resource_id:
             return (
                 RefusalReason.TICKET_MISMATCH_RESOURCE,
@@ -803,11 +861,6 @@ class ExecutionCoordinator:
             return (
                 RefusalReason.TICKET_MISMATCH_PLAN,
                 "ticket is not bound to this plan",
-            )
-        if stored.consumed:
-            return (
-                RefusalReason.TICKET_CONSUMED,
-                "ticket was already consumed by another attempt",
             )
         return None
 

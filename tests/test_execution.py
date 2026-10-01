@@ -716,7 +716,68 @@ def test_refusal_ticket_consumed():
     _refused_request_gate(RefusalReason.TICKET_CONSUMED, request, store)
 
 
-def test_refusal_decision_mismatch_resource():
+def test_refusal_ticket_revoked():
+    """M12: a revoked grant is refused as REVOKED, not mislabelled EXPIRED."""
+    store = InMemoryApprovalStore(now=_Clock())
+    snapshot = _make_snapshot()
+    decision = _make_decision(snapshot)
+    plan = _make_plan(store, snapshot=snapshot, decision=decision)
+    store.revoke(_grant(store, plan).ticket_id, decided_by="alice")
+    revoked = store.get(plan.ticket.ticket_id)
+    request = _request(
+        plan=plan,
+        snapshot=snapshot,
+        decision=decision,
+        ticket=revoked,
+    )
+    _refused_request_gate(RefusalReason.TICKET_REVOKED, request, store)
+
+
+def test_refusal_ticket_expired_grant():
+    """M12: a grant past its execution deadline is refused as EXPIRED."""
+    clock = _Clock()
+    store = InMemoryApprovalStore(
+        now=clock, execution_ttl=timedelta(minutes=5)
+    )
+    snapshot = _make_snapshot()
+    decision = _make_decision(snapshot)
+    plan = _make_plan(store, snapshot=snapshot, decision=decision)
+    store.grant(plan.ticket.ticket_id)
+    clock.advance(6 * 60)
+    expired = store.get(plan.ticket.ticket_id)
+    assert expired.status is ApprovalStatus.EXPIRED
+    request = _request(
+        plan=plan,
+        snapshot=snapshot,
+        decision=decision,
+        ticket=expired,
+    )
+    _refused_request_gate(RefusalReason.TICKET_EXPIRED, request, store)
+
+
+def test_ticket_gate_maps_every_non_granted_state_distinctly():
+    """M12: no approval state may fall through to a catch-all refusal.
+
+    M9 tested three states and treated everything else as "expired". A
+    CONSUMED or REVOKED ticket would therefore have been reported to the
+    operator as expired, which misstates what the human actually did.
+    """
+    from sws_agent.execution import _TICKET_STATE_REFUSALS
+
+    mapped = {
+        ApprovalStatus.PENDING: RefusalReason.TICKET_PENDING,
+        ApprovalStatus.DENIED: RefusalReason.TICKET_DENIED,
+        ApprovalStatus.EXPIRED: RefusalReason.TICKET_EXPIRED,
+        ApprovalStatus.CONSUMED: RefusalReason.TICKET_CONSUMED,
+        ApprovalStatus.REVOKED: RefusalReason.TICKET_REVOKED,
+    }
+    assert {s: r for s, (r, _) in _TICKET_STATE_REFUSALS.items()} == mapped
+    assert len({r for r, _ in _TICKET_STATE_REFUSALS.values()}) == len(mapped)
+    non_granted = set(ApprovalStatus) - {ApprovalStatus.GRANTED}
+    assert set(_TICKET_STATE_REFUSALS) == non_granted
+
+
+def test_decision_mismatch_resource():
     request, store = _refusal_context(
         decision=_make_decision(_make_snapshot()).model_copy(
             update={"resource_id": "other-inst"}
@@ -1558,14 +1619,21 @@ def test_second_consume_raises():
         store.consume(plan.ticket.ticket_id)
 
 
-def test_consumed_ticket_stays_granted_but_marked():
+def test_consumed_ticket_becomes_consumed_status():
+    """M12: consumption is a first-class status, not a GRANTED ticket + a bool.
+
+    M9 left a redeemed ticket reporting ``GRANTED`` with ``consumed=True``,
+    so a spent approval was indistinguishable from a live one by status
+    alone. The ``consumed`` field survives only as a validated mirror.
+    """
     store = InMemoryApprovalStore(now=_Clock())
     snapshot = _make_snapshot()
     decision = _make_decision(snapshot)
     plan = _make_plan(store, snapshot=snapshot, decision=decision)
     consumed = store.consume(_grant(store, plan).ticket_id)
-    assert consumed.status is ApprovalStatus.GRANTED
+    assert consumed.status is ApprovalStatus.CONSUMED
     assert consumed.consumed is True
+    assert consumed.revision == 2
 
 
 # ---------------------------------------------------------------------------

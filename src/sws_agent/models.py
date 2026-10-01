@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .constants import (
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
@@ -299,23 +299,53 @@ class AnalysisReport(BaseModel):
 
 
 class ApprovalTicket(BaseModel):
-    """A human-approval ticket awaiting a decision.
+    """A human-approval ticket and its durable lineage (M12).
 
-    Tickets model the human-approval boundary for future side-effecting
-    actions. A ticket enters the store as PENDING and may transition
-    exactly once to GRANTED, DENIED, or EXPIRED. Ticket creation and
-    transition are managed by the approval store (approval.py); this model
-    only validates the ticket's shape and enforces case-insensitive
-    normalization at the construction boundary.
+    A ticket is the record of a human decision to permit one specific
+    side-effecting intent. Ticket creation and every state transition are
+    managed by the approval store (``approval.py``); this model validates the
+    ticket's shape, normalizes case-insensitive inputs at the construction
+    boundary, and enforces the status/consumed invariant.
+
+    M12 lifecycle. ``status`` is the single authoritative representation of
+    the ticket's state. The legal transitions are:
+
+        PENDING -> GRANTED | DENIED | EXPIRED | REVOKED
+        GRANTED -> CONSUMED | EXPIRED | REVOKED
+
+    ``DENIED``, ``EXPIRED``, ``CONSUMED``, and ``REVOKED`` are terminal.
+
+    ``consumed`` is retained as a **compatibility mirror** of
+    ``status is CONSUMED``, not as an independent flag. M9 modelled
+    consumption as an orthogonal boolean, which left a redeemed approval
+    reporting ``GRANTED`` and therefore indistinguishable from a live one by
+    status alone. The mirror is preserved because the ticket model is
+    serialized into audit payloads; a model validator below rejects any
+    construction where the two disagree, so no caller can observe or create a
+    ``CONSUMED`` ticket that still claims to be ``GRANTED``.
+
+    M12 lineage additions, all optional and additive:
+
+    * ``revision`` -- monotonic counter starting at 0 on issue and advanced by
+      exactly 1 on every committed transition. It is the precondition value
+      for the transactional compare-and-swap that M12 Phase 3 adds to the
+      durable store; the in-memory store advances it deterministically but
+      performs no CAS.
+    * ``execution_intent_key`` -- the M10 canonical intent key
+      (``execution.execution_intent_key``, a digest over snapshot id, resource
+      id, and action) that this ticket authorizes. Phase 1 adds the field
+      only; stamping it from the plan is Phase 5, so it is ``None`` for every
+      ticket created by the current planner.
+    * ``evidence_digest`` -- reserved for the digest of the evidence the
+      approver actually saw. Phase 1 adds no hashing scheme and leaves this
+      ``None``; Phase 5 defines the canonical representation.
+    * ``execution_deadline`` -- the instant after which a ``GRANTED`` ticket
+      expires. This is deliberately distinct from the store's decision TTL,
+      which bounds only how long a ticket may await a decision. M9 applied no
+      upper bound to a grant at all.
 
     ``plan_id`` (M8, optional) links the ticket to the ``ActionPlan`` that
     created it; a ticket created outside the planner has no plan.
-
-    ``consumed`` (M9, additive, always ``False`` for freshly created
-    tickets) marks a GRANTED ticket that has already been redeemed by an
-    execution attempt. Consumption is a one-way transition enforced by the
-    approval store (approval.py); a consumed ticket can never authorize
-    another attempt.
     """
 
     ticket_id: str = Field(min_length=1)
@@ -329,6 +359,10 @@ class ApprovalTicket(BaseModel):
     decision_reason: str = ""
     plan_id: str | None = Field(default=None, min_length=1)
     consumed: bool = False
+    revision: int = Field(default=0, ge=0)
+    execution_intent_key: str | None = Field(default=None, min_length=1)
+    evidence_digest: str | None = Field(default=None, min_length=1)
+    execution_deadline: datetime | None = None
 
     @field_validator("action", "status", mode="before")
     @classmethod
@@ -336,6 +370,49 @@ class ApprovalTicket(BaseModel):
         if isinstance(value, str):
             return value.strip().lower()
         return value
+
+    @model_validator(mode="after")
+    def _consumed_mirrors_status(self) -> ApprovalTicket:
+        """Reject any ticket whose ``consumed`` flag contradicts ``status``.
+
+        ``status`` is authoritative. Without this invariant a caller could
+        construct a ``CONSUMED`` ticket that still reports ``consumed=False``
+        (and so appears redeemable) or a ``GRANTED`` ticket that reports
+        ``consumed=True`` (and so appears already redeemed). Either mistake
+        would let the execution gate misjudge a live approval.
+        """
+        expected = self.status is ApprovalStatus.CONSUMED
+        if self.consumed is not expected:
+            raise ValueError(
+                "consumed must mirror status: "
+                f"status={self.status.value!r} requires consumed={expected!r}, "
+                f"got consumed={self.consumed!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _granted_requires_execution_deadline(self) -> ApprovalTicket:
+        """Reject a ``GRANTED`` ticket that carries no ``execution_deadline``.
+
+        A granted approval is only bounded by its execution deadline: that is
+        the only thing standing between it and never expiring. Without the
+        field the ticket can never lapse, so any damage that drops the value --
+        a partial restore, a bad migration, a torn page write -- would silently
+        widen a bounded approval into a permanent one and let it be redeemed
+        indefinitely. M9 shipped exactly that fail-open shape.
+
+        Enforcing it on the model means neither store can represent the state:
+        ``InMemoryApprovalStore.grant`` and ``DurableApprovalStore.grant`` both
+        stamp a deadline, and a row read back from the ledger is rejected before
+        the execution gate ever sees it.
+        """
+        if self.status is ApprovalStatus.GRANTED and self.execution_deadline is None:
+            raise ValueError(
+                "a GRANTED approval must carry execution_deadline: without it "
+                "the ticket can never expire, so damage that dropped the value "
+                "would widen a bounded approval into a permanent one"
+            )
+        return self
 
 
 class ActionPlan(BaseModel):

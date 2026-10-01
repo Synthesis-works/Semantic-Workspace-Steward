@@ -165,16 +165,37 @@ class ClaimKind(str, enum.Enum):
 
 
 class ApprovalStatus(str, enum.Enum):
-    """Lifecycle states of a human-approval ticket.
+    """Lifecycle states of a human-approval ticket (M12).
 
-    Tickets enter the store as PENDING and transition exactly once to
-    GRANTED, DENIED, or EXPIRED; no other transition is valid.
+    M12 replaces the M9 "exactly one transition out of PENDING" rule with an
+    explicit legal-transition table. PENDING and GRANTED are the only
+    non-terminal states; DENIED, EXPIRED, CONSUMED, and REVOKED are terminal
+    and admit no outgoing transition.
+
+        PENDING -> GRANTED | DENIED | EXPIRED | REVOKED
+        GRANTED -> CONSUMED | EXPIRED | REVOKED
+
+    Two changes are load-bearing and were identified as defects by the M12
+    investigation:
+
+    * CONSUMED is a first-class status. M9 modelled consumption as an
+      orthogonal ``consumed`` boolean on a ticket that remained GRANTED, so a
+      redeemed approval was indistinguishable from a live one by status alone
+      and could not be enumerated or audited by state.
+    * REVOKED is new. Nothing in M9 could withdraw an already-granted
+      approval, and GRANTED previously never expired, so a grant was valid
+      for the entire remaining life of the process.
+
+    The legal-transition table itself lives in ``approval.py``; this enum is
+    the closed vocabulary of states only.
     """
 
     PENDING = "pending"
     GRANTED = "granted"
     DENIED = "denied"
     EXPIRED = "expired"
+    CONSUMED = "consumed"
+    REVOKED = "revoked"
 
 
 class CollectionFailureCategory(str, enum.Enum):
@@ -432,6 +453,11 @@ class RefusalReason(str, enum.Enum):
     TICKET_MISMATCH_RESOURCE = "ticket_mismatch_resource"
     TICKET_MISMATCH_PLAN = "ticket_mismatch_plan"
     TICKET_CONSUMED = "ticket_consumed"
+    # M12: a granted approval can now be withdrawn before it is redeemed.
+    # This is a distinct refusal from TICKET_DENIED because a DENIED ticket
+    # was never approved while a REVOKED ticket was approved and later
+    # withdrawn; collapsing them would misreport what the human did.
+    TICKET_REVOKED = "ticket_revoked"
     DECISION_MISMATCH = "decision_mismatch"
     SNAPSHOT_MISMATCH = "snapshot_mismatch"
     RESOURCE_IDENTITY_MISMATCH = "resource_identity_mismatch"

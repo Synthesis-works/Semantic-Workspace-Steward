@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from .constants import PotentialAction
 from .models import (
     AnalysisReport,
+    ApprovalTicket,
     AuthorizationResult,
     ExplanationResult,
     PolicyDecision,
@@ -74,6 +76,81 @@ class ApprovalProvider(Protocol):
     """
 
     def request_approval(self, decision: PolicyDecision) -> AuthorizationResult: ...
+
+
+@runtime_checkable
+class ApprovalStore(Protocol):
+    """Durable, single-use human-approval ticket store (M12).
+
+    The authoritative state of a human approval lives here and nowhere
+    else. The M12 investigation found that the pre-M12 arrangement allowed
+    the approval state machine and the durable audit ledger to have
+    independent lifetimes, so a grant recorded on disk could be silently
+    unredeemable after a restart. This protocol is the seam that lets the
+    durable implementation replace the in-memory test double without any
+    caller changing.
+
+    Contract every implementation must satisfy:
+
+    * **Closed state machine.** Transitions are exactly those in
+      ``approval.LEGAL_APPROVAL_TRANSITIONS``:
+      ``PENDING -> GRANTED | DENIED | EXPIRED | REVOKED`` and
+      ``GRANTED -> CONSUMED | EXPIRED | REVOKED``. ``DENIED``, ``EXPIRED``,
+      ``CONSUMED``, and ``REVOKED`` are terminal. Any other request raises
+      ``approval.InvalidTransitionError``.
+    * **Exactly-once redemption.** ``consume`` may succeed at most once per
+      ticket. A CONSUMED ticket is terminal, so a second call raises rather
+      than re-marking it.
+    * **Monotonic revision.** Every committed transition advances
+      ``ticket.revision`` by exactly one. Callers may read it as a
+      precondition; whether an implementation enforces compare-and-swap
+      against it is a property of the implementation, not of this protocol.
+    * **Bounded validity.** A PENDING ticket expires if undecided past the
+      decision TTL, and a GRANTED ticket expires if unredeemed past its
+      ``execution_deadline``. Both bounds are enforced on read, so an
+      implementation must return the terminal state rather than a stale one.
+    * **No derivation.** ``create_ticket`` records the intent key and
+      evidence digest exactly as supplied. Computing either value is the
+      caller's responsibility, so that the identity an approver authorized is
+      decided in one place rather than inferred inconsistently.
+
+    Implementations raise ``approval.UnknownTicketError`` for an unknown id.
+    Persistence, clocking, and TTL configuration are implementation details
+    and are deliberately absent from this surface.
+    """
+
+    def create_ticket(
+        self,
+        resource_id: str,
+        action: PotentialAction,
+        rationale: str = "",
+        ticket_id: str | None = None,
+        plan_id: str | None = None,
+        execution_intent_key: str | None = None,
+        evidence_digest: str | None = None,
+    ) -> ApprovalTicket: ...
+
+    def get(self, ticket_id: str) -> ApprovalTicket: ...
+
+    def grant(
+        self, ticket_id: str, *, decided_by: str = "", reason: str = ""
+    ) -> ApprovalTicket: ...
+
+    def deny(
+        self, ticket_id: str, *, decided_by: str = "", reason: str = ""
+    ) -> ApprovalTicket: ...
+
+    def expire(
+        self, ticket_id: str, *, decided_by: str = "", reason: str = ""
+    ) -> ApprovalTicket: ...
+
+    def revoke(
+        self, ticket_id: str, *, decided_by: str = "", reason: str = ""
+    ) -> ApprovalTicket: ...
+
+    def consume(self, ticket_id: str) -> ApprovalTicket: ...
+
+    def pending(self) -> list[ApprovalTicket]: ...
 
 
 @runtime_checkable

@@ -22,9 +22,9 @@ creating a PENDING ticket when the gate requires human approval).
 from __future__ import annotations
 
 from ._identity import new_id, utc_now
-from .approval import InMemoryApprovalStore
 from .authorization import ActionAuthorizer
 from .constants import ExecutionMode, PotentialAction, SWSResourceType
+from .interfaces import ApprovalStore
 from .models import ActionPlan, AuthorizationRequest, PolicyDecision
 
 
@@ -49,7 +49,7 @@ class ActionPlanner:
     def __init__(
         self,
         *,
-        approval_store: InMemoryApprovalStore,
+        approval_store: ApprovalStore,
         authorizer: ActionAuthorizer | None = None,
         execution_mode: ExecutionMode = ExecutionMode.SAFE,
         now=None,

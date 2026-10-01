@@ -8,7 +8,7 @@ tightening on ResourceRelationship.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -53,12 +53,15 @@ def test_approval_ticket_defaults_to_pending():
 
 
 def test_approval_ticket_normalizes_action_and_status():
+    # A GRANTED ticket must carry an execution deadline; this test is about
+    # casing, so it supplies one to reach the normalizer.
     ticket = ApprovalTicket(
         ticket_id="t1",
         resource_id="r1",
         action="STOP_RESOURCE",
         status="GRANTED",
         created_at=CREATED_AT,
+        execution_deadline=CREATED_AT + timedelta(hours=1),
     )
     assert ticket.action is PotentialAction.STOP_RESOURCE
     assert ticket.status is ApprovalStatus.GRANTED
@@ -74,6 +77,43 @@ def test_approval_ticket_normalizes_lowercase_inputs():
     )
     assert ticket.action is PotentialAction.STOP_RESOURCE
     assert ticket.status is ApprovalStatus.PENDING
+
+
+def test_approval_ticket_rejects_granted_without_execution_deadline():
+    """A grant with no deadline can never expire, so it is unrepresentable.
+
+    M9 shipped exactly this shape: a GRANTED approval with nothing bounding it,
+    which stayed redeemable indefinitely. Rejecting it at the model boundary
+    stops either store from ever holding the state.
+    """
+    with pytest.raises(ValidationError, match="execution_deadline"):
+        ApprovalTicket(
+            ticket_id="t1",
+            resource_id="r1",
+            action=PotentialAction.STOP_RESOURCE,
+            status=ApprovalStatus.GRANTED,
+            created_at=CREATED_AT,
+        )
+
+
+def test_approval_ticket_allows_non_granted_without_execution_deadline():
+    """Only GRANTED needs a deadline; the other five states must not require one."""
+    for status in (
+        ApprovalStatus.PENDING,
+        ApprovalStatus.DENIED,
+        ApprovalStatus.EXPIRED,
+        ApprovalStatus.CONSUMED,
+        ApprovalStatus.REVOKED,
+    ):
+        ticket = ApprovalTicket(
+            ticket_id="t1",
+            resource_id="r1",
+            action=PotentialAction.STOP_RESOURCE,
+            status=status,
+            created_at=CREATED_AT,
+            consumed=status is ApprovalStatus.CONSUMED,
+        )
+        assert ticket.execution_deadline is None
 
 
 def test_approval_ticket_rejects_empty_ticket_id():

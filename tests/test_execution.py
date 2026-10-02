@@ -18,10 +18,12 @@ surface.
 from __future__ import annotations
 
 import json
+import tempfile
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
 from types import MappingProxyType
+from uuid import uuid4
 
 import pytest
 
@@ -57,6 +59,11 @@ from sws_agent.execution import (
     canonical_postconditions,
     execution_intent_key,
     reconcile_open_transactions,
+)
+from sws_agent.execution_ledger import (
+    DurableExecutionLedger,
+    ExecutionReservationState,
+    ReservationOwnershipError,
 )
 from sws_agent.verification import ObservationError
 from sws_agent.models import (
@@ -362,6 +369,30 @@ def _jsonl_audit(path: Path, clock: _Clock) -> JsonlAuditStore:
     return JsonlAuditStore(path, now=clock, id_source=_SeqIds("audit"))
 
 
+# M13 Phase 4: every coordinator that registers a handler also needs an
+# execution ledger. It is not optional bookkeeping -- the reservation it holds is
+# what makes the pre-effect approval CAS sufficient, so a handler without one is
+# refused outright.
+_LEDGER_PATHS: dict[int, Path] = {}
+
+
+def _ledger(tmp_path: Path | None = None) -> DurableExecutionLedger:
+    """A fresh durable execution ledger, one file per call.
+
+    ``tmp_path`` is honoured when given so the file lands in the test's own
+    directory. Without it the ledger still gets a unique file per call: reusing
+    one would make an ``(intent_key, ticket_id)`` pair collide across tests and
+    report contention where none exists.
+    """
+    directory = tmp_path if tmp_path is not None else Path(tempfile.mkdtemp())
+    directory.mkdir(parents=True, exist_ok=True)
+    return DurableExecutionLedger(
+        directory / f"executions-{uuid4().hex}.sqlite3",
+        now=lambda: FIXED_NOW,
+        id_source=_SeqIds("res"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry: metadata only, immutable, nothing implemented.
 # ---------------------------------------------------------------------------
@@ -439,6 +470,7 @@ def _refused_request_gate(
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,  # type: ignore[arg-type]
@@ -475,6 +507,7 @@ def _a5_refused(
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world if provider is None else provider,
         audit_store=audit,  # type: ignore[arg-type]
@@ -858,6 +891,7 @@ def test_coordinator_requests_its_own_observation():
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=provider,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -875,6 +909,7 @@ def test_provider_issued_observation_satisfies_a5():
     world = _World()
     result = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -891,6 +926,7 @@ def test_missing_observation_provider_is_fail_closed():
     audit = _SpyAuditStore()
     result = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=None,
         audit_store=audit,  # type: ignore[arg-type]
@@ -1016,6 +1052,7 @@ def test_maximum_observation_age_is_configurable():
     )
     result = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=slightly_stale,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -1196,6 +1233,7 @@ def test_verified_success_when_observation_matches():
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -1217,6 +1255,7 @@ def test_partially_verified_when_canonical_fact_is_unobserved():
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         # Reports identity but no state at all: the canonical "state" fact
         # is unobservable, so the claim cannot be confirmed.
@@ -1247,6 +1286,7 @@ def test_conflicting_expected_poststate_is_refused():
     audit = _SpyAuditStore()
     result = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,  # type: ignore[arg-type]
@@ -1281,6 +1321,7 @@ def test_superset_caller_facts_are_refused():
     audit = _SpyAuditStore()
     result = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,  # type: ignore[arg-type]
@@ -1300,6 +1341,7 @@ def test_call_error_reports_failed():
     world.call_error = True
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -1319,6 +1361,7 @@ def test_timeout_is_unknown_never_failed():
     world.timeout = True
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -1342,6 +1385,7 @@ def test_observer_raising_after_attempt_is_unknown():
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=_FlakyProvider(raises=ObservationError("lost the response")),
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -1361,6 +1405,7 @@ def test_missing_observer_with_handler_is_refused_not_executed():
     world = _World()
     result = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=None,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -1387,6 +1432,7 @@ def test_post_attempt_observer_raising_unexpected_error_still_closes_transaction
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=_FlakyProvider(raises=_UnexpectedError("client-side exception")),
         audit_store=audit,
@@ -1409,6 +1455,7 @@ def test_no_blind_retry_after_ambiguous_attempt():
     world.timeout = True
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -1444,35 +1491,105 @@ def test_handler_without_durable_audit_store_is_refused():
     assert world.handler_calls == []
 
 
-def test_duplicate_attempt_detected_across_coordinators_via_ledger(tmp_path: Path):
+def test_reservation_conflict_spends_nothing(tmp_path: Path):
+    """A lost reservation race must not consume the authorization.
+
+    This is the property the pre-effect ordering buys, and it needs the losing
+    worker to have passed the gate while the ticket still read GRANTED -- which
+    is exactly what two concurrent workers see before either reserves. The
+    interleaving is modelled by having another worker hold the reservation
+    against a *separate* approval store, where the ticket this worker holds is
+    still live and unspent.
+    """
+    clock = _Clock()
+    ledger = _ledger(tmp_path)
+    world = _World()
+
+    # Two independent approval stores for the same plan and snapshot: each
+    # worker legitimately holds its own GRANTED ticket.
+    mine = InMemoryApprovalStore(now=clock)
+    request, _plan, snapshot = _gated_request_with_ticket(mine)
+
+    theirs = InMemoryApprovalStore(now=clock)
+    their_plan = _make_plan(theirs, snapshot=snapshot, decision=_make_decision(snapshot))
+    their_ticket = _grant(theirs, their_plan)
+
+    # The other worker reserved the identical pair first.
+    ledger.reserve(
+        intent_key=execution_intent_key(
+            snapshot_id=snapshot.snapshot_id,
+            resource_id=request.resource_id,
+            action=request.action,
+        ),
+        ticket_id=request.ticket.ticket_id,
+        ticket_revision=their_ticket.revision,
+        worker_id="worker-other",
+    )
+
+    coordinator = ExecutionCoordinator(
+        approval_store=mine,
+        execution_ledger=ledger,
+        handler=world,
+        observer=world,
+        audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
+        id_source=lambda: "exec-1",
+        worker_id="worker-mine",
+        now=clock,
+    )
+    refused = coordinator.execute(request)
+    assert refused.outcome is REFUSED
+    assert refused.refusal is RefusalReason.EXECUTION_ALREADY_RESERVED
+    assert refused.reservation_id is None
+    assert world.handler_calls == []
+    # The authorization this worker brought is untouched and still spendable.
+    assert mine.get(request.ticket.ticket_id).status is ApprovalStatus.GRANTED
+    assert len(ledger.all_executions()) == 1
+
+
+def test_same_ticket_replay_is_refused_before_reserving(tmp_path: Path):
+    """Replaying a consumed ticket never reaches the reservation.
+
+    The gate refuses on ticket status, so the replay costs no reservation and
+    no handler call. The reservation is the backstop for a *concurrent* loser,
+    which the gate cannot see; it is not the first line of defence.
+    """
     clock = _Clock()
     store = InMemoryApprovalStore(now=clock)
-    audit = _jsonl_audit(tmp_path / "audit.jsonl", clock)
+    ledger = _ledger(tmp_path)
     request, _plan, _snapshot = _gated_request_with_ticket(store)
     world = _World()
+
     first = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=ledger,
         handler=world,
         observer=world,
-        audit_store=audit,
+        audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
-        now=_Clock(),
+        worker_id="worker-1",
+        now=clock,
     )
-    assert first.execute(request).outcome is ExecutionOutcome.VERIFIED_SUCCESS
-    refreshed = request.model_copy(
-        update={"ticket": _refresh_grant(store, request.ticket.ticket_id)}
-    )
+    result = first.execute(request)
+    assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
+    assert result.reservation_id is not None
+
+    # A brand-new coordinator with no in-memory attempt or intent state, over
+    # the same durable ledger: exactly the situation a process restart creates.
     second = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=ledger,
         handler=world,
         observer=world,
-        audit_store=audit,
-        id_source=lambda: "exec-1",
-        now=_Clock(),
+        audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
+        id_source=lambda: "exec-2",
+        worker_id="worker-2",
+        now=clock,
     )
-    result = second.execute(refreshed)
-    assert result.outcome is REFUSED
-    assert result.refusal is RefusalReason.DUPLICATE_ATTEMPT
+    refused = second.execute(request)
+    assert refused.outcome is REFUSED
+    assert refused.refusal is RefusalReason.TICKET_CONSUMED
+    assert len(world.handler_calls) == 1
+    assert len(ledger.all_executions()) == 1
 
 
 def _refresh_grant(store: InMemoryApprovalStore, ticket_id: str) -> ApprovalTicket:
@@ -1501,6 +1618,7 @@ def test_ledger_correlates_the_execution_transaction(tmp_path: Path):
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,
@@ -1542,6 +1660,7 @@ def test_ledger_records_no_secrets(tmp_path: Path):
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,
@@ -1686,24 +1805,41 @@ def test_intent_key_does_not_depend_on_plan_or_ticket_identity():
     assert execution_intent_key(**base) == execution_intent_key(**base)
 
 
-def test_replanned_same_intent_with_new_plan_id_is_refused(tmp_path: Path):
-    """M10: the M9 hole -- a new plan id used to reset duplicate detection."""
+def test_replanned_same_intent_after_success_is_refused(tmp_path: Path):
+    """M13 Phase 4: a fresh ticket may not repeat an effect already performed.
+
+    This supersedes the Phase 3 reading of ADR0003. That ADR correctly rejected
+    keying uniqueness on the intent alone -- a revoked ticket and its
+    replacement share one intent key, so intent-only keying would block a
+    legitimate re-approval forever. But it left the *effect* unguarded, because
+    the pair key names an authorization instance rather than the thing being
+    acted on. Phase 4 keeps the pair key and adds an intent-level decision on
+    top of it.
+
+    The distinction that matters: a new ticket is a new *authorization*, not a
+    new *effect*. Here the first execution is ``VERIFIED_SUCCESS``, so a second
+    execution of the same intent would perform the same external effect again
+    with nothing to distinguish the two attempts but a fresh uuid.
+    """
     clock = _Clock()
     store = InMemoryApprovalStore(now=clock)
-    audit = _jsonl_audit(tmp_path / "audit.jsonl", clock)
+    ledger = _ledger(tmp_path)
     request, _plan, snapshot = _gated_request_with_ticket(store)
     world = _World()
     first = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=ledger,
         handler=world,
         observer=world,
-        audit_store=audit,
+        audit_store=_jsonl_audit(tmp_path / "first.jsonl", clock),
         id_source=lambda: "exec-1",
+        worker_id="worker-1",
         now=clock,
     )
     assert first.execute(request).outcome is ExecutionOutcome.VERIFIED_SUCCESS
 
-    # Re-plan the identical intent under a brand-new action_plan_id.
+    # Re-plan the identical intent under a brand-new action_plan_id, which also
+    # mints a brand-new ticket. Same intent key, different pair.
     replan = _make_plan(
         store, snapshot=snapshot, decision=_make_decision(snapshot), plan_id="plan-2"
     )
@@ -1714,22 +1850,123 @@ def test_replanned_same_intent_with_new_plan_id_is_refused(tmp_path: Path):
             "ticket": _grant(store, replan),
         }
     )
+    assert replanned.ticket.ticket_id != request.ticket.ticket_id
+
     second = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=ledger,
         handler=world,
         observer=world,
-        audit_store=audit,
+        audit_store=_jsonl_audit(tmp_path / "second.jsonl", clock),
         id_source=lambda: "exec-2",
+        worker_id="worker-2",
         now=clock,
     )
     result = second.execute(replanned)
-    assert result.outcome is REFUSED
-    assert result.refusal is RefusalReason.DUPLICATE_ATTEMPT
+
+    assert result.outcome is ExecutionOutcome.REFUSED
+    assert result.note is not None
+    assert "already" in result.note
+    # The refusal happened at the ledger, so the new approval was never spent
+    # and the handler was never reached a second time.
     assert len(world.handler_calls) == 1
+    assert store.get(replanned.ticket.ticket_id).status is ApprovalStatus.GRANTED
+    assert len(ledger.all_executions()) == 1
 
 
-def test_intent_idempotency_survives_a_process_restart(tmp_path: Path):
-    """M10: the duplicate scan reads the durable ledger, not memory."""
+def test_replanned_same_intent_after_a_failed_outcome_is_permitted(
+    tmp_path: Path,
+):
+    """A known unsuccessful attempt is what makes a second execution meaningful.
+
+    This is the case ADR0003's rejection of intent-only keying was actually
+    protecting, and it still works. ``FAILED`` is the single prior outcome that
+    justifies a reattempt: the system holds evidence the operation did not
+    achieve its postcondition, so a separately authorized try is a real
+    correction rather than a duplicate. The new execution records which failure
+    it supersedes, so the permission is auditable.
+    """
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _ledger(tmp_path)
+    request, _plan, snapshot = _gated_request_with_ticket(store)
+
+    class _FailingWorld(_World):
+        """Leaves the resource running so verification records ``FAILED``.
+
+        Overriding ``handle`` rather than ``verify`` keeps the evidence path
+        intact: the observation still comes from ``observe``, exactly as in
+        production, and the coordinator genuinely compares an expected
+        postcondition against what the world reports.
+        """
+
+        def handle(self, request: ExecutionRequest) -> MutationAttempt:
+            self.handler_calls.append(request)
+            # Dispatch succeeds, but the resource never reaches "stopped".
+            return MutationAttempt(sanitized={"dispatched": True})
+
+    world = _FailingWorld()
+    first = ExecutionCoordinator(
+        approval_store=store,
+        execution_ledger=ledger,
+        handler=world,
+        observer=world,
+        audit_store=_jsonl_audit(tmp_path / "first.jsonl", clock),
+        id_source=lambda: "exec-1",
+        worker_id="worker-1",
+        now=clock,
+    )
+    assert first.execute(request).outcome is ExecutionOutcome.FAILED
+    failed_row = ledger.all_executions()[0]
+    assert failed_row.outcome is ExecutionOutcome.FAILED
+
+    replan = _make_plan(
+        store, snapshot=snapshot, decision=_make_decision(snapshot), plan_id="plan-2"
+    )
+    replanned = request.model_copy(
+        update={
+            "action_plan_id": "plan-2",
+            "plan": replan,
+            "ticket": _grant(store, replan),
+        }
+    )
+
+    succeeding = _World()
+    second = ExecutionCoordinator(
+        approval_store=store,
+        execution_ledger=ledger,
+        handler=succeeding,
+        observer=succeeding,
+        audit_store=_jsonl_audit(tmp_path / "second.jsonl", clock),
+        id_source=lambda: "exec-2",
+        worker_id="worker-2",
+        now=clock,
+    )
+    result = second.execute(replanned)
+
+    assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
+    assert len(ledger.all_executions()) == 2
+    # Read back by pair rather than by index: all_executions() is ordered by
+    # (intent_key, ticket_id), and both rows share the intent.
+    rows = {r.reservation_id: r for r in ledger.all_executions()}
+    reattempt = next(
+        r for r in rows.values()
+        if r.reservation_id != failed_row.reservation_id
+    )
+    assert reattempt.ticket_id == replanned.ticket.ticket_id
+    assert reattempt.supersedes_reservation_id == failed_row.reservation_id
+    assert failed_row.supersedes_reservation_id is None
+    ledger.verify_lineage()
+
+
+def test_claim_survives_a_process_restart(tmp_path: Path):
+    """M13 Phase 4: the reservation is durable, so a restart cannot re-enter.
+
+    A brand-new coordinator over a reopened execution ledger carries no
+    in-memory attempt or intent state, so this is the situation a process
+    restart creates. The same ``(intent, ticket)`` pair is refused from durable
+    state alone.
+    """
     clock = _Clock()
     store = InMemoryApprovalStore(now=clock)
     path = tmp_path / "audit.jsonl"
@@ -1737,47 +1974,35 @@ def test_intent_idempotency_survives_a_process_restart(tmp_path: Path):
     world = _World()
     first = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(tmp_path),
         handler=world,
         observer=world,
         audit_store=_jsonl_audit(path, clock),
         id_source=lambda: "exec-1",
+        worker_id="worker-1",
         now=clock,
     )
     assert first.execute(request).outcome is ExecutionOutcome.VERIFIED_SUCCESS
 
-    # A brand-new coordinator over a freshly reopened ledger: no in-memory
-    # attempt or intent state carries over, exactly like a restart.
-    store_after = InMemoryApprovalStore(now=clock)
+    # Reopen the very same ledger file, as a restarted process would.
     reopened = ExecutionCoordinator(
-        approval_store=store_after,
+        approval_store=store,
+        execution_ledger=DurableExecutionLedger(
+            first._ledger.path,  # noqa: SLF001 - reopening is the point
+            now=lambda: FIXED_NOW,
+        ),
         handler=world,
         observer=world,
         audit_store=_jsonl_audit(path, clock),
         id_source=lambda: "exec-2",
+        worker_id="worker-2",
         now=clock,
     )
-    replay = _request(
-        plan=ActionPlanner(
-            approval_store=store_after,
-            execution_mode=SAFE,
-            plan_id_source=lambda: "plan-9",
-            now=lambda: FIXED_NOW,
-        ).plan(
-            resource_id="inst-1",
-            resource_type=SWSResourceType.EC2_INSTANCE,
-            action=STOP,
-            decision=_make_decision(snapshot),
-        ),
-        snapshot=snapshot,
-        decision=_make_decision(snapshot),
-        ticket=None,
-        action_plan_id="plan-9",
-    )
-    replay = replay.model_copy(update={"ticket": _grant(store_after, replay.plan)})
-    result = reopened.execute(replay)
-    assert result.outcome is REFUSED
-    assert result.refusal is RefusalReason.DUPLICATE_ATTEMPT
+    refused = reopened.execute(request)
+    assert refused.outcome is REFUSED
+    assert refused.refusal is RefusalReason.TICKET_CONSUMED
     assert len(world.handler_calls) == 1
+    assert len(reopened._ledger.all_executions()) == 1  # noqa: SLF001
 
 
 def test_new_snapshot_reopens_the_intent(tmp_path: Path):
@@ -1789,6 +2014,7 @@ def test_new_snapshot_reopens_the_intent(tmp_path: Path):
     world = _World()
     first = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,
@@ -1814,6 +2040,7 @@ def test_new_snapshot_reopens_the_intent(tmp_path: Path):
     world.state = "running"
     second = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,
@@ -1867,6 +2094,7 @@ def test_action_without_postcondition_is_refused(monkeypatch):
     world = _World()
     result = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,  # type: ignore[arg-type]
@@ -1909,6 +2137,7 @@ def test_action_without_eligible_resource_types_is_refused():
     world = _World()
     result = ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
@@ -1948,6 +2177,7 @@ def test_reconciliation_is_empty_for_a_clean_ledger(tmp_path: Path):
     world = _World()
     ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,
@@ -1985,6 +2215,7 @@ def test_reconciliation_finds_a_transaction_truncated_after_the_attempt(
     world.timeout = True  # an ambiguous attempt: exactly the crash-prone case
     ExecutionCoordinator(
         approval_store=store,
+        execution_ledger=_ledger(),
         handler=world,
         observer=world,
         audit_store=audit,
@@ -2048,6 +2279,7 @@ def test_reconciliation_is_read_only_and_deterministic(tmp_path: Path):
         world.timeout = True
         ExecutionCoordinator(
             approval_store=store,
+            execution_ledger=_ledger(),
             handler=world,
             observer=world,
             audit_store=audit,
@@ -2196,7 +2428,354 @@ def test_durable_ticket_with_different_plan_id_still_refused(tmp_path: Path):
     refusal = coordinator._ticket_gate(request)
     assert refusal is not None
     assert refusal[0] is RefusalReason.TICKET_MISMATCH_PLAN
-    store.close()
+
+
+# ---------------------------------------------------------------------------
+# M13 Phase 4 (ADR 0004): reserve -> consume -> mark_attempted -> handler.
+# The ordering itself is the safety property, so each test pins one link.
+# ---------------------------------------------------------------------------
+
+
+def _ordering_coordinator(
+    store: InMemoryApprovalStore,
+    *,
+    ledger: DurableExecutionLedger,
+    world: _World,
+    audit: object | None = None,
+    worker_id: str = "worker-1",
+) -> ExecutionCoordinator:
+    return ExecutionCoordinator(
+        approval_store=store,
+        execution_ledger=ledger,
+        handler=world,
+        observer=world,
+        audit_store=audit,  # type: ignore[arg-type]
+        id_source=lambda: "exec-1",
+        worker_id=worker_id,
+        now=_Clock(),
+    )
+
+
+def test_approval_is_consumed_before_the_handler_runs(tmp_path: Path):
+    """The core ADR 0004 invariant: no handler call precedes the CAS.
+
+    Phase 2 measured four of four processes crossing the boundary and one of
+    four winning the CAS. Ordering is the only thing that can prevent the
+    effect, so this asserts the ticket is already CONSUMED at the instant the
+    handler observes the world.
+    """
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _ledger(tmp_path)
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    ticket_id = request.ticket.ticket_id
+    world = _World()
+
+    status_seen_by_handler: list[str] = []
+
+    class _ObservingWorld(_World):
+        def handle(self, req):
+            # Read the durable approval from inside the boundary.
+            status_seen_by_handler.append(store.get(ticket_id).status.value)
+            return super().handle(req)
+
+    world = _ObservingWorld()
+    result = _ordering_coordinator(
+        store,
+        ledger=ledger,
+        world=world,
+        audit=_SpyAuditStore(),
+    ).execute(request)
+
+    assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
+    assert status_seen_by_handler == [ApprovalStatus.CONSUMED.value]
+    assert store.get(ticket_id).consumed is True
+
+
+def test_reservation_binds_the_exact_revision_that_was_consumed(tmp_path: Path):
+    """The consumed revision is the reserved one, never a refreshed read."""
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _ledger(tmp_path)
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    ticket_id = request.ticket.ticket_id
+    world = _World()
+
+    result = _ordering_coordinator(
+        store, ledger=ledger, world=world, audit=_SpyAuditStore()
+    ).execute(request)
+    assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
+
+    reservation = ledger.all_executions()[0]
+    assert reservation.ticket_id == ticket_id
+    # The granted ticket was at revision 1; consuming advanced it by exactly one.
+    assert reservation.ticket_revision == 1
+    assert store.get(ticket_id).revision == 2
+    assert result.reservation_id == reservation.reservation_id
+
+
+def test_consume_uses_a_caller_supplied_stale_ticket_object(tmp_path: Path):
+    """A stale request ticket cannot redeem a newer revision.
+
+    ``request.ticket`` is caller-supplied and may carry an old revision. The
+    coordinator reads the live revision from the store, reserves that, and
+    consumes exactly it -- so handing back a stale object cannot shift which
+    approval instance gets spent.
+    """
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _ledger(tmp_path)
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    ticket_id = request.ticket.ticket_id
+    world = _World()
+
+    stale = request.ticket  # captured while GRANTED at revision 1
+    result = _ordering_coordinator(
+        store, ledger=ledger, world=world, audit=_SpyAuditStore()
+    ).execute(request)
+    assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
+    assert stale.revision == 1
+    assert ledger.all_executions()[0].ticket_revision == 1
+    assert store.get(ticket_id).revision == 2
+
+
+def test_ticket_moved_after_reservation_is_refused_before_the_handler(
+    tmp_path: Path,
+):
+    """A ticket that moves between reservation and CAS spends nothing.
+
+    Modelled by a store whose ticket advances after the reservation is written
+    but before the consumption. The coordinator binds what it reserved and does
+    not refresh it, so the CAS fails, the handler is never called, and the
+    orphaned reservation is left in place rather than silently cleaned up.
+    """
+    clock = _Clock()
+    ledger = _ledger(tmp_path)
+    world = _World()
+
+    class _RacingStore(InMemoryApprovalStore):
+        """Advances the ticket after the coordinator's live revision read.
+
+        The coordinator reads the live revision once to bind the reservation,
+        so revoking on that read models the human withdrawing approval in the
+        window between the reservation being written and the CAS running.
+        """
+
+        def get(self, tid, **kwargs):  # noqa: ANN003
+            stored = super().get(tid, **kwargs)
+            calls = getattr(self, "_reads", 0)
+            self._reads = calls + 1
+            if calls == 1 and stored.status is ApprovalStatus.GRANTED:
+                super().revoke(tid, reason="operator withdrew it mid-flight")
+            return super().get(tid, **kwargs)
+
+    racing = _RacingStore(now=clock)
+    race_request = _gated_request_with_ticket(racing)[0]
+    result = _ordering_coordinator(
+        racing, ledger=ledger, world=world, audit=_SpyAuditStore()
+    ).execute(race_request)
+
+    assert result.outcome is REFUSED
+    assert result.refusal is RefusalReason.TICKET_REVISION_MISMATCH
+    assert result.reservation_id is not None
+    assert world.handler_calls == []
+    # The orphaned row stays: RESERVED, never marked attempted, never released.
+    orphans = ledger.all_executions()
+    assert len(orphans) == 1
+    assert orphans[0].ticket_id == race_request.ticket.ticket_id
+    assert orphans[0].state is ExecutionReservationState.RESERVED
+    assert orphans[0].may_have_crossed_boundary is False
+    # The racing ticket was revoked mid-flight, never consumed: a refused CAS
+    # must not leave an authorization spent.
+    assert (
+        racing.get(race_request.ticket.ticket_id).status is ApprovalStatus.REVOKED
+    )
+    assert racing.get(race_request.ticket.ticket_id).consumed is False
+
+
+def test_mark_attempted_precedes_the_handler_and_outcome_closes_the_row(
+    tmp_path: Path,
+):
+    """The row is ATTEMPTED while the handler runs, and terminal afterwards."""
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _ledger(tmp_path)
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    seen: list[ExecutionReservationState] = []
+
+    class _LedgerPeek(_World):
+        def handle(self, req):
+            seen.append(
+                ledger.all_executions()[0].state  # type: ignore[union-attr]
+            )
+            return super().handle(req)
+
+    result = _ordering_coordinator(
+        store, ledger=ledger, world=_LedgerPeek(), audit=_SpyAuditStore()
+    ).execute(request)
+
+    # ATTEMPTED, never RESERVED: a crash mid-dispatch must not leave a row
+    # claiming the boundary was not crossed.
+    assert seen == [ExecutionReservationState.ATTEMPTED]
+    final = ledger.all_executions()[0]
+    assert final.state is ExecutionReservationState.RESOLVED
+    assert final.outcome is ExecutionOutcome.VERIFIED_SUCCESS
+    assert final.may_have_crossed_boundary is True
+    assert final.worker_id == "worker-1"
+    assert result.reservation_id == final.reservation_id
+
+
+def test_ambiguous_attempt_settles_unresolved_never_retried(tmp_path: Path):
+    """UNKNOWN closes the row as terminal UNRESOLVED, not as a retry signal."""
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _ledger(tmp_path)
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    world = _World()
+    world.timeout = True
+
+    result = _ordering_coordinator(
+        store, ledger=ledger, world=world, audit=_SpyAuditStore()
+    ).execute(request)
+    assert result.outcome is ExecutionOutcome.UNKNOWN
+
+    final = ledger.all_executions()[0]
+    assert final.state is ExecutionReservationState.UNRESOLVED
+    assert final.is_terminal is True
+    assert final.may_have_crossed_boundary is True
+    # Surfaced for an operator, never automatically actionable.
+    assert ledger.unresolved_executions() == (final,)
+    assert ledger.open_executions() == ()
+
+
+def test_a_ledger_that_cannot_record_an_outcome_reports_unknown(tmp_path: Path):
+    """A durable authority that will not corroborate gets no success reported."""
+
+    class _RefusesOutcome(DurableExecutionLedger):
+        def record_outcome(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise RuntimeError("ledger unavailable")
+
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _RefusesOutcome(
+        tmp_path / "stubborn.sqlite3", now=lambda: FIXED_NOW
+    )
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    world = _World()
+
+    result = _ordering_coordinator(
+        store, ledger=ledger, world=world, audit=_SpyAuditStore()
+    ).execute(request)
+
+    assert result.outcome is ExecutionOutcome.UNKNOWN
+    assert result.verification is VerificationStatus.UNKNOWN
+    assert "could not record this outcome" in result.note
+    # Left open, which is exactly what an operator must find.
+    left_open = ledger.all_executions()[0]
+    assert left_open.state is ExecutionReservationState.ATTEMPTED
+    assert ledger.unresolved_executions() == (left_open,)
+
+
+def test_worker_id_is_stable_across_the_transaction(tmp_path: Path):
+    """Ownership is decided by an id fixed at construction, not per request."""
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _ledger(tmp_path)
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    world = _World()
+
+    first = _ordering_coordinator(
+        store, ledger=ledger, world=world, audit=_SpyAuditStore()
+    )
+    second = _ordering_coordinator(
+        store, ledger=ledger, world=world, audit=_SpyAuditStore()
+    )
+    assert first._worker_id == "worker-1"  # noqa: SLF001
+    assert second._worker_id == "worker-1"  # noqa: SLF001
+
+    first.execute(request)
+    row = ledger.all_executions()[0]
+    assert row.worker_id == "worker-1"
+    # A different worker cannot settle someone else's claim.
+    with pytest.raises(ReservationOwnershipError):
+        ledger.mark_attempted(
+            row.intent_key, row.ticket_id, worker_id="someone-else"
+        )
+
+
+def test_default_worker_id_is_generated_once_and_not_per_request(tmp_path: Path):
+    """The default identity exists so tests need not inject one, and so a
+    coordinator's ownership does not change between requests."""
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    coordinator = ExecutionCoordinator(
+        approval_store=store,
+        id_source=lambda: "exec-1",
+        now=clock,
+    )
+    captured = coordinator._worker_id  # noqa: SLF001
+    assert captured
+    assert coordinator._worker_id == captured  # noqa: SLF001
+
+
+def test_handler_without_an_execution_ledger_is_refused():
+    """A boundary with no durable claim is never crossed."""
+    store = InMemoryApprovalStore(now=_Clock())
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    world = _World()
+    coordinator = ExecutionCoordinator(
+        approval_store=store,
+        handler=world,
+        observer=world,
+        audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
+        id_source=lambda: "exec-1",
+        now=_Clock(),
+    )
+    result = coordinator.execute(request)
+    assert result.outcome is REFUSED
+    assert result.refusal is RefusalReason.DURABLE_LEDGER_REQUIRED
+    assert world.handler_calls == []
+
+
+def test_not_executed_writes_no_reservation(tmp_path: Path):
+    """The plan-only path stays inert: no handler, therefore no claim."""
+    store = InMemoryApprovalStore(now=_Clock())
+    ledger = _ledger(tmp_path)
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    coordinator = ExecutionCoordinator(
+        approval_store=store,
+        execution_ledger=ledger,
+        id_source=lambda: "exec-1",
+        now=_Clock(),
+    )
+    result = coordinator.execute(request)
+    assert result.outcome is ExecutionOutcome.NOT_EXECUTED
+    assert result.reservation_id is None
+    assert ledger.all_executions() == ()
+    assert store.get(request.ticket.ticket_id).consumed is False
+
+
+def test_audit_duplicate_scans_no_longer_gate_execution(tmp_path: Path):
+    """The audit store is evidence, not the dedup authority.
+
+    M13 Phase 4 removes ``_durable_attempt_exists`` / ``_durable_intent_exists``
+    from the gate. This asserts they are gone rather than merely unused, because
+    a method that can still be called is a method a later change can restore.
+    """
+    assert not hasattr(ExecutionCoordinator, "_durable_attempt_exists")
+    assert not hasattr(ExecutionCoordinator, "_durable_intent_exists")
+
+
+def test_new_refusal_reasons_are_registered():
+    assert RefusalReason.EXECUTION_ALREADY_RESERVED.value in (
+        SWS_SUPPORTED_REFUSAL_REASONS
+    )
+    assert RefusalReason.TICKET_REVISION_MISMATCH.value in (
+        SWS_SUPPORTED_REFUSAL_REASONS
+    )
+    assert RefusalReason.EXECUTION_ALREADY_RESERVED is not (
+        RefusalReason.DUPLICATE_ATTEMPT
+    )
 
 
 def test_in_memory_plan_binding_behavior_is_unchanged(tmp_path: Path):

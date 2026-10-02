@@ -69,7 +69,13 @@ from .constants import (
     SWSResourceType,
     VerificationStatus,
 )
-from .interfaces import ApprovalStore
+from .interfaces import (
+    ApprovalStore,
+    ExecutionLedger,
+    ExecutionLedgerUnavailableError,
+    IntentAlreadyExecutedError,
+    ReservationConflictError,
+)
 from .models import (
     ExecutionRequest,
     ExecutionResult,
@@ -302,6 +308,19 @@ class ExecutionCoordinator:
     unrecognized state fell through to "expired", and consumption was
     detected from an orthogonal boolean rather than from status.
 
+    M13 Phase 4 (ADR 0004): approval is consumed **before** the external
+    effect, and a durable reservation is what makes that sufficient. The
+    order is reserve -> consume -> mark_attempted -> handler, so a CAS
+    failure happens before anything irreversible rather than after it. The
+    execution ledger is authoritative for deduplication; the audit-store
+    scans that used to answer "may I proceed?" are gone, because they
+    answered from a process-local cache and ADR 0003 measured them losing
+    records under real concurrency.
+
+    ``worker_id`` is injected and defaults to an identity generated once at
+    construction. It is never regenerated per request, so a worker's ownership
+    of a reservation holds for the whole transaction.
+
     Refusals write no audit record: SWS never records a false durable claim,
     and a refused request performs no AWS call.
     """
@@ -310,15 +329,18 @@ class ExecutionCoordinator:
         self,
         *,
         approval_store: ApprovalStore,
+        execution_ledger: ExecutionLedger | None = None,
         handler: MutationHandler | None = None,
         observer: ObservationProvider | None = None,
         verifier: OutcomeVerifier | None = None,
         audit_store: AuditStore | None = None,
         id_source: Callable[[], str] | None = None,
+        worker_id: str | None = None,
         now: Callable[[], datetime] | None = None,
         max_observation_age_seconds: int = SWS_MAX_OBSERVATION_AGE_SECONDS,
     ) -> None:
         self._store = approval_store
+        self._ledger = execution_ledger
         self._handler = handler
         self._observer = observer
         self._verifier = (
@@ -326,6 +348,13 @@ class ExecutionCoordinator:
         )
         self._audit_store = audit_store
         self._id_source = id_source or (lambda: uuid4().hex)
+        # Generated once, here, and never per request. Ownership that changed
+        # between the reservation and the transition would prove nothing: the
+        # whole point is that the worker which claimed the execution is the only
+        # one permitted to cross the boundary for it. A generated identifier is
+        # used rather than a hostname or PID because uniqueness is what is being
+        # enforced, and a colliding hostname on a shared host is a real failure.
+        self._worker_id = worker_id or self._id_source()
         self._now = now or utc_now
         self._max_observation_age = timedelta(
             seconds=max_observation_age_seconds
@@ -353,10 +382,8 @@ class ExecutionCoordinator:
                 completed_at=self._now(),
             )
 
-        spec = ACTION_EXECUTION_REGISTRY[request.action]
-        intent_key = self._intent_key(request)
         self._attempted.add(request.action_plan_id)
-        self._intents.add(intent_key)
+        self._intents.add(self._intent_key(request))
         self._write(
             stage=ExecutionStage.PRE,
             request=request,
@@ -382,6 +409,121 @@ class ExecutionCoordinator:
                     "but nothing was executed"
                 ),
             )
+
+        # ADR 0004: claim, authorize, then cross. Reservation first, so the CAS
+        # below arbitrates nothing -- a losing worker never reaches it. The
+        # revision consumed is the one the reservation captured; it is never
+        # re-read or refreshed here, because that would let the ledger assert a
+        # revision the approval has already moved past.
+        intent_key = self._intent_key(request)
+        ticket_id = request.ticket.ticket_id if request.ticket is not None else ""
+        try:
+            reservation = self._ledger.reserve(
+                intent_key=intent_key,
+                ticket_id=ticket_id,
+                ticket_revision=self._granted_revision(request),
+                worker_id=self._worker_id,
+                action_plan_id=request.action_plan_id,
+                resource_id=request.resource_id,
+                action=request.action,
+            )
+        except IntentAlreadyExecutedError as exc:
+            # A prior execution of this *intent* blocks a second execution of the
+            # effect, whatever ticket authorized it. This is a different fact
+            # from the pair conflict below and must not be reported as one: the
+            # authorization instance is new and unclaimed, but the thing it would
+            # act on may already have been acted on. Naming the pair instead
+            # would send an operator looking for a ticket conflict that does not
+            # exist.
+            return ExecutionResult(
+                execution_id=execution_id,
+                action_plan_id=request.action_plan_id,
+                resource_id=request.resource_id,
+                action=request.action,
+                execution_mode=request.execution_mode,
+                outcome=ExecutionOutcome.REFUSED,
+                refusal=RefusalReason.EXECUTION_ALREADY_RESERVED,
+                refusal_detail=str(exc),
+                started_at=started_at,
+                completed_at=self._now(),
+                note=(
+                    "this intent already has an execution; the effect may "
+                    "already have been performed, so nothing was consumed"
+                ),
+            )
+        except ReservationConflictError as exc:
+            # Another worker already owns this exact (intent, ticket) pair. This
+            # is the authoritative cross-process refusal and it happens before
+            # anything is spent or crossed. Reporting it as a duplicate *attempt*
+            # would be vaguer than what is actually known: not that several
+            # attempts were seen, but that this authorization instance is claimed.
+            return ExecutionResult(
+                execution_id=execution_id,
+                action_plan_id=request.action_plan_id,
+                resource_id=request.resource_id,
+                action=request.action,
+                execution_mode=request.execution_mode,
+                outcome=ExecutionOutcome.REFUSED,
+                refusal=RefusalReason.EXECUTION_ALREADY_RESERVED,
+                refusal_detail=(
+                    f"intent {intent_key} and ticket {ticket_id} are already "
+                    f"claimed by another execution ({type(exc).__name__})"
+                ),
+                started_at=started_at,
+                completed_at=self._now(),
+                note="the execution is already reserved; nothing was consumed",
+            )
+        except ExecutionLedgerUnavailableError as exc:
+            # The ledger being unwritable is not permission to proceed without
+            # it. Refusing is the fail-closed reading.
+            return ExecutionResult(
+                execution_id=execution_id,
+                action_plan_id=request.action_plan_id,
+                resource_id=request.resource_id,
+                action=request.action,
+                execution_mode=request.execution_mode,
+                outcome=ExecutionOutcome.REFUSED,
+                refusal=RefusalReason.DURABLE_LEDGER_REQUIRED,
+                refusal_detail=(
+                    "the execution ledger could not record a reservation "
+                    f"({type(exc).__name__})"
+                ),
+                started_at=started_at,
+                completed_at=self._now(),
+                note="no reservation was written; nothing was consumed",
+            )
+
+        consumed_note = self._consume_reserved(request, reservation)
+        if consumed_note is not None:
+            # The reservation stays written. It records that this worker claimed
+            # the pair and then could not spend the authorization, which is a
+            # standing fact for an operator rather than something to clean up:
+            # an abandoned claim and a crashed claim are indistinguishable here.
+            return ExecutionResult(
+                execution_id=execution_id,
+                action_plan_id=request.action_plan_id,
+                resource_id=request.resource_id,
+                action=request.action,
+                execution_mode=request.execution_mode,
+                outcome=ExecutionOutcome.REFUSED,
+                refusal=RefusalReason.TICKET_REVISION_MISMATCH,
+                refusal_detail=consumed_note,
+                reservation_id=reservation.reservation_id,
+                started_at=started_at,
+                completed_at=self._now(),
+                note=consumed_note,
+            )
+
+        # Recorded before the handler, never after. A crash between the two is
+        # indistinguishable from a crash inside the handler, and the
+        # conservative reading is the safe one: RESERVED asserts the boundary
+        # was not crossed, so claiming it was would be a lie.
+        self._ledger.mark_attempted(
+            intent_key,
+            ticket_id,
+            worker_id=self._worker_id,
+            expected_revision=reservation.revision,
+        )
 
         attempt: MutationAttempt | None = None
         handler_note = ""
@@ -469,16 +611,21 @@ class ExecutionCoordinator:
         note_parts = [handler_note or ""] + list(
             verification_record.details if verification_record is not None else []
         )
-        consumed = False
-        if spec.requires_human_approval and request.ticket is not None:
-            try:
-                self._store.consume(request.ticket.ticket_id)
-                consumed = True
-            except Exception as exc:  # noqa: BLE001 - reported, never fabricated
-                note_parts.append(
-                    f"ticket {request.ticket.ticket_id} could not be "
-                    f"consumed: {type(exc).__name__}"
-                )
+        # M13 Phase 4: the outcome is closed out even when it is UNKNOWN, so the
+        # ledger never keeps an open transaction. UNKNOWN maps to UNRESOLVED in
+        # the ledger, which is terminal and never automatically retried -- the
+        # correct home for an attempt whose result could not be established.
+        if not self._record_execution_outcome(intent_key, ticket_id, outcome):
+            # The ledger refused to record what happened. A durable authority
+            # that cannot corroborate an outcome does not get to have one
+            # reported on its behalf, so the honest result is UNKNOWN even
+            # though the post-attempt verification may have succeeded.
+            outcome = ExecutionOutcome.UNKNOWN
+            verification_status = VerificationStatus.UNKNOWN
+            note_parts.append(
+                "the execution ledger could not record this outcome; the "
+                "execution remains open and is not treated as settled"
+            )
         self._write(
             stage=ExecutionStage.POST,
             request=request,
@@ -486,7 +633,7 @@ class ExecutionCoordinator:
             outcome=outcome,
             verification=None,
             attempt=attempt,
-            consumed=consumed,
+            consumed=True,
             note="; ".join(part for part in note_parts if part),
         )
         return ExecutionResult(
@@ -498,10 +645,73 @@ class ExecutionCoordinator:
             outcome=outcome,
             verification=verification_status,
             attempt_id=execution_id,
+            reservation_id=reservation.reservation_id,
             started_at=started_at,
             completed_at=self._now(),
             note="; ".join(part for part in note_parts if part),
         )
+
+    def _granted_revision(self, request: ExecutionRequest) -> int:
+        """Return the live revision of the ticket this execution is bound to.
+
+        Read from the approval store rather than from the request, because
+        ``request.ticket`` is caller-supplied and its revision may be stale by
+        the time the gate finishes. The reservation binds this value, and
+        :meth:`_consume_reserved` requires the CAS to match it, so a caller
+        cannot smuggle in an old revision to redeem a newer approval.
+        """
+        ticket = request.ticket
+        assert ticket is not None  # guaranteed: the ticket gate ran
+        return self._store.get(ticket.ticket_id).revision
+
+    def _consume_reserved(
+        self, request: ExecutionRequest, reservation: Any
+    ) -> str | None:
+        """Spend the approval at exactly the reserved revision.
+
+        Returns ``None`` on success, or a short reason string when the ticket
+        could not be consumed. The revision is ``reservation.ticket_revision``
+        -- never a fresh read and never a value this coordinator manufactures.
+        The reservation captured the authorization instance, and spending a
+        different one would leave the ledger asserting a revision the approval
+        has already moved past, which is the gap ADR 0004 exists to close.
+        """
+        ticket = request.ticket
+        assert ticket is not None  # guaranteed: the ticket gate ran
+        try:
+            self._store.consume(
+                ticket.ticket_id,
+                expected_revision=reservation.ticket_revision,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never fabricated
+            return (
+                f"ticket {ticket.ticket_id} at revision "
+                f"{reservation.ticket_revision} could not be consumed: "
+                f"{type(exc).__name__}"
+            )
+        return None
+
+    def _record_execution_outcome(
+        self, intent_key: str, ticket_id: str, outcome: ExecutionOutcome
+    ) -> bool:
+        """Settle the reservation. Returns False when the ledger refused it.
+
+        A ledger that will not record an outcome is not a reason to report a
+        verified success it cannot corroborate, so the failure is reported as
+        UNKNOWN rather than raised. The row stays ``ATTEMPTED`` in that case,
+        which is precisely the open transaction an operator must be able to
+        find.
+        """
+        try:
+            self._ledger.record_outcome(
+                intent_key,
+                ticket_id,
+                outcome,
+                worker_id=self._worker_id,
+            )
+        except Exception:  # noqa: BLE001 - never fabricate a corroborated outcome
+            return False
+        return True
 
     def _post_attempt_observe(
         self, request: ExecutionRequest
@@ -732,14 +942,25 @@ class ExecutionCoordinator:
                 f"{request.action.value} has no eligible resource types",
             )
 
-        # M10: crossing the mutation boundary without a durable ledger would
-        # make the intent key unenforceable across restarts, so a handler is
-        # only usable together with an audit store.
+        # M10/M13 Phase 4: crossing the mutation boundary without a durable
+        # ledger would make the intent key unenforceable across restarts, so a
+        # handler is only usable together with an audit store. Since ADR 0004
+        # the execution ledger is the authoritative dedup mechanism, so a
+        # handler also requires one: the reservation is what makes the
+        # pre-effect approval CAS sufficient. Both are the same fail-closed
+        # condition -- never cross a boundary with no durable record of it --
+        # so both report DURABLE_LEDGER_REQUIRED.
         if self._handler is not None and self._audit_store is None:
             return (
                 RefusalReason.DURABLE_LEDGER_REQUIRED,
                 "a registered mutation handler requires a durable audit "
                 "store so the intent key can be enforced across restarts",
+            )
+        if self._handler is not None and self._ledger is None:
+            return (
+                RefusalReason.DURABLE_LEDGER_REQUIRED,
+                "a registered mutation handler requires a durable execution "
+                "ledger so the authorization is claimed before it is spent",
             )
 
         resource = self._find_resource(request.snapshot, request.resource_id)
@@ -790,16 +1011,17 @@ class ExecutionCoordinator:
                 RefusalReason.ALREADY_EXECUTED,
                 "plan is already marked executed",
             )
-        if (
-            request.action_plan_id in self._attempted
-            or self._durable_attempt_exists(request.action_plan_id)
-        ):
+        # M13 Phase 4: these two checks are process-local and therefore advisory
+        # only. The authoritative, cross-process duplicate refusal is the
+        # reservation in ``execute``; the audit-store scans that used to answer
+        # here were measured in ADR 0003 as losing records under real
+        # concurrency, so they can no longer decide whether execution proceeds.
+        if request.action_plan_id in self._attempted:
             return (
                 RefusalReason.DUPLICATE_ATTEMPT,
                 "an execution attempt already exists for this plan",
             )
-        intent_key = self._intent_key(request)
-        if intent_key in self._intents or self._durable_intent_exists(intent_key):
+        if self._intent_key(request) in self._intents:
             return (
                 RefusalReason.DUPLICATE_ATTEMPT,
                 "an execution attempt already exists for this intent "
@@ -914,42 +1136,6 @@ class ExecutionCoordinator:
                 "decision run does not match the attached snapshot run",
             )
         return None
-
-    def _durable_attempt_exists(self, action_plan_id: str) -> bool:
-        if self._audit_store is None:
-            return False
-        for envelope in self._audit_store.records():
-            if envelope.kind is not AuditRecordKind.EXECUTION:
-                continue
-            if envelope.action_plan_id != action_plan_id:
-                continue
-            stage = (envelope.payload or {}).get("stage")
-            if stage in ("attempt", "result", "post"):
-                return True
-        return False
-
-    def _durable_intent_exists(self, intent_key: str) -> bool:
-        """True when the ledger already holds an attempt for this intent.
-
-        M10: the scan keys on the deterministic intent key, which is
-        recomputed from each stored record's ``snapshot_id`` +
-        ``resource_id`` + ``payload["action"]``. A re-planned identical intent
-        (new ``action_plan_id``, same snapshot/resource/action) is therefore
-        still recognised, including after a process restart. No ledger schema
-        change is involved.
-        """
-        if self._audit_store is None:
-            return False
-        for envelope in self._audit_store.records():
-            if envelope.kind is not AuditRecordKind.EXECUTION:
-                continue
-            payload = envelope.payload or {}
-            if payload.get("stage") not in ("attempt", "result", "post"):
-                continue
-            if _intent_key_of(envelope) != intent_key:
-                continue
-            return True
-        return False
 
     def _write(
         self,

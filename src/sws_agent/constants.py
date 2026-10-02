@@ -464,6 +464,18 @@ class RefusalReason(str, enum.Enum):
     STALE_OBSERVATION = "stale_observation"
     ALREADY_EXECUTED = "already_executed"
     DUPLICATE_ATTEMPT = "duplicate_attempt"
+    # M13 Phase 4: a reservation conflict is not a duplicate *attempt*. It says
+    # another worker already owns this exact (intent_key, ticket_id) pair, so the
+    # authorization instance named here has been claimed. DUPLICATE_ATTEMPT stays
+    # reserved for the plan/intent level checks that predate the execution ledger,
+    # because a reservation conflict is a statement about who holds the claim
+    # rather than about how many attempts were observed.
+    EXECUTION_ALREADY_RESERVED = "execution_already_reserved"
+    # The ticket moved between the reservation and the consumption CAS. The
+    # coordinator binds the exact revision it reserved and will not re-read or
+    # manufacture a current one, so this is a refusal and not a retry: the ledger
+    # row it just wrote stays in place for an operator.
+    TICKET_REVISION_MISMATCH = "ticket_revision_mismatch"
     EXECUTION_NOT_IMPLEMENTED = "execution_not_implemented"
     # M10: preflight-evidence hardening. A5 evidence must be issued by the
     # injected observation provider, must be temporally bounded, must carry

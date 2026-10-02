@@ -61,6 +61,16 @@ bound to the exact `ticket_revision` it was claimed against, and a mismatch is
 reported as `TicketRevisionConflictError` rather than as mere contention,
 because it names a different authorization instance.
 
+> **Amended by ADR 0004 ("The pair key is not authority to act").** The claim key
+> above is unchanged and the "keying on the intent alone" objection still holds for
+> *uniqueness*. What changed is the meaning of the pair: it names an authorization
+> instance, not the effect, so it is not by itself authority to act. `reserve` now
+> additionally refuses a fresh ticket whenever a prior same-intent execution is
+> `RESERVED`, `ATTEMPTED`, `UNRESOLVED`, or resolved with an outcome other than
+> `FAILED`. The re-approved attempt this paragraph worried about is not permanently
+> blocked — it is permitted once the prior execution records `FAILED`, and that
+> supersession is recorded. The intent key became a guard rather than a key.
+
 Claiming is exactly-once and atomic: the read, the absence check, and the
 insert share one `BEGIN IMMEDIATE` transaction, so contending processes
 serialize at the database. The claim binds a worker, and a losing worker must

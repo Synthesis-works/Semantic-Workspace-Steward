@@ -44,15 +44,24 @@ Uniqueness is on ``(intent_key, ticket_id)``, where ``intent_key`` is the
 existing ``execution_intent_key`` over ``(snapshot_id, resource_id, action)``.
 
 ``ticket_id`` is deliberately **not** folded into the hash. Phase 2 measured
-the consequence of keying on intent alone: the same
-snapshot/resource/action yields an identical intent key across a revoked
-ticket and its replacement, so a reservation keyed only on ``intent_key``
-would permanently block a legitimately re-approved retry. Keeping
-authorization identity as a second dimension of the key means the same
-logical intent under a *new* approval is a new authorization instance,
-while the same intent under the same approval is always the same
-execution. A different snapshot is a different logical intent and is
-distinct either way.
+  the consequence of keying on intent alone: the same
+  snapshot/resource/action yields an identical intent key across a revoked
+  ticket and its replacement, so a reservation keyed only on ``intent_key``
+  would permanently block a legitimately re-approved retry. Keeping
+  authorization identity as a second dimension of the key means the same
+  logical intent under a *new* approval is a new authorization instance,
+  while the same intent under the same approval is always the same
+  execution. A different snapshot is a different logical intent and is
+  distinct either way.
+
+  Phase 4 kept the pair as the *claim* key and made the intent a *guard*
+  instead. The above objection still holds for uniqueness -- intent alone
+  cannot be the key -- but a fresh ticket is not thereby authorized to
+  repeat the effect: ``reserve`` separately refuses one whenever a prior
+  same-intent execution is not ``FAILED``, and records
+  ``supersedes_reservation_id`` when it is. So the re-approved retry this
+  section worried about is not permanently blocked, and a second ticket
+  cannot replay an effect that already happened. See ADR 0004.
 
 State machine
 -------------
@@ -112,8 +121,10 @@ database-level backstop for the case where two processes somehow both
 reach the insert.
 
 This module does **not** consume approvals, does not call AWS, and does not
-implement a mutation handler. ``ExecutionCoordinator`` does not reference
-it yet; it is an isolated, independently tested primitive.
+implement a mutation handler. It imports nothing from ``approval``,
+``approval_ledger``, or ``execution``, and that stays true: the coordinator
+depends on the :class:`~sws_agent.interfaces.ExecutionLedger` protocol, never on
+this implementation, so the direction of the dependency cannot invert.
 """
 
 from __future__ import annotations
@@ -130,8 +141,55 @@ from typing import Final
 from uuid import uuid4
 
 from .constants import ExecutionOutcome, PotentialAction
+from .interfaces import (
+    AlreadyAttemptedError,
+    AlreadyReservedError,
+    AlreadyResolvedError,
+    ExecutionLedgerCorruptionError,
+    ExecutionLedgerError,
+    ExecutionLedgerUnavailableError,
+    IntentAlreadyExecutedError,
+    InvalidExecutionTransitionError,
+    ReservationConflictError,
+    ReservationOwnershipError,
+    ReservationRevisionConflictError,
+    SupersedesIntentMismatchError,
+    TicketRevisionConflictError,
+    UnknownReservationError,
+)
 
-EXECUTION_LEDGER_SCHEMA_VERSION: Final[int] = 1
+# The exception taxonomy is defined in `interfaces`, because a caller holding an
+# `ExecutionLedger` must be able to distinguish these failure modes without
+# knowing which store it was handed -- `execution.py` reports three of them
+# differently and may not be coupled to SQLite. They are re-exported here as the
+# same class objects (not aliases or subclasses) so the historical import path
+# keeps working and `isinstance` is unaffected.
+__all__ = (
+    "DEFAULT_EXECUTION_BUSY_TIMEOUT_SECONDS",
+    "DEFAULT_EXECUTION_STALE_AFTER",
+    "EXECUTION_LEDGER_SCHEMA_VERSION",
+    "LEGAL_EXECUTION_TRANSITIONS",
+    "TERMINAL_EXECUTION_STATES",
+    "AlreadyAttemptedError",
+    "AlreadyReservedError",
+    "AlreadyResolvedError",
+    "DurableExecutionLedger",
+    "ExecutionLedgerCorruptionError",
+    "ExecutionLedgerError",
+    "ExecutionLedgerUnavailableError",
+    "ExecutionReservation",
+    "ExecutionReservationState",
+    "IntentAlreadyExecutedError",
+    "InvalidExecutionTransitionError",
+    "ReservationConflictError",
+    "ReservationOwnershipError",
+    "ReservationRevisionConflictError",
+    "SupersedesIntentMismatchError",
+    "TicketRevisionConflictError",
+    "UnknownReservationError",
+)
+
+EXECUTION_LEDGER_SCHEMA_VERSION: Final[int] = 2
 """Schema version of the durable execution ledger.
 
 Bumped only by an explicit migration. Opening a ledger whose recorded
@@ -238,102 +296,8 @@ _OPEN_STATES: Final[frozenset[ExecutionReservationState]] = frozenset(
 
 
 # --- Errors -----------------------------------------------------------------
-# Conventions mirror approval.py: one base class per store, with a distinct
-# subclass per failure mode a caller may need to tell apart.
-
-
-class ExecutionLedgerError(Exception):
-    """Base class for execution-ledger failures."""
-
-
-class UnknownReservationError(ExecutionLedgerError):
-    """Raised when no reservation exists for the requested pair."""
-
-
-class ExecutionLedgerUnavailableError(ExecutionLedgerError):
-    """Raised when the ledger cannot be opened, written, or committed.
-
-    Covers a closed store, an unwritable path, and a writer that lost the
-    race for the database lock. The store never degrades to an in-memory
-    implementation or to a partial write.
-    """
-
-
-class ExecutionLedgerCorruptionError(ExecutionLedgerError):
-    """Raised when durable execution data fails its integrity checks.
-
-    The store fails closed: it never reconstructs a plausible state from
-    damaged data, because a plausible-but-wrong execution record could hide
-    a claim that is still live.
-    """
-
-
-class ReservationConflictError(ExecutionLedgerError):
-    """Base class for "this execution is already claimed" refusals.
-
-    Distinct from :class:`ReservationRevisionConflictError` on purpose, and
-    for the same reason ``DuplicateTicketError`` is distinct in approval: a
-    conflict means *this identity is taken* and the caller must not act,
-    whereas a revision conflict means *the state you meant to act on has
-    already moved* and the caller must re-read before deciding. Both are
-    refusals to proceed; only one of them is safe to retry blindly, and
-    neither is.
-    """
-
-
-class AlreadyReservedError(ReservationConflictError):
-    """Raised when a live ``RESERVED`` claim already exists for the pair."""
-
-
-class AlreadyAttemptedError(ReservationConflictError):
-    """Raised when an ``ATTEMPTED`` execution already exists for the pair.
-
-    The external boundary is recorded as crossed, so no other worker may
-    claim this execution under any circumstance.
-    """
-
-
-class AlreadyResolvedError(ReservationConflictError):
-    """Raised when the execution already reached a terminal state."""
-
-
-class TicketRevisionConflictError(ReservationConflictError):
-    """Raised when the pair exists but bound to a different ticket revision.
-
-    A reservation is bound to the exact approval revision it was created
-    against, so it cannot be silently reused by a caller holding a
-    different view of the same ticket.
-    """
-
-
-class ReservationOwnershipError(ReservationConflictError):
-    """Raised when a worker tries to transition a reservation it does not hold.
-
-    ``reserve`` binds an execution to one ``worker_id``, and only that worker
-    may advance it. Without this gate the binding would be decorative: any
-    caller that happened to learn an ``(intent_key, ticket_id)`` pair could
-    call ``mark_attempted`` or ``record_outcome`` on it, and could in
-    particular stamp a definite outcome onto another worker's execution. A
-    reservation's whole purpose is that the claim is exclusive, so the
-    transitions that decide what happened must be exclusive too.
-
-    This is a :class:`ReservationConflictError` because the caller's response
-    is the same in both cases -- do not proceed -- but it is a distinct type
-    because the fault is different: ``AlreadyAttemptedError`` means the
-    execution is no longer yours to run, while this means it never was.
-    """
-
-
-class ReservationRevisionConflictError(ExecutionLedgerError):
-    """Raised when a transition's expected revision is not the stored one.
-
-    The store guards every state change with a compare-and-swap on
-    ``revision`` and never retries silently.
-    """
-
-
-class InvalidExecutionTransitionError(ExecutionLedgerError):
-    """Raised when a transition is not in the execution transition table."""
+# The taxonomy is defined in `interfaces` and imported above; see the re-export
+# note there.
 
 
 # --- Record -----------------------------------------------------------------
@@ -362,6 +326,7 @@ class ExecutionReservation:
     action: PotentialAction | None = None
     outcome: ExecutionOutcome | None = None
     stale_after: timedelta = DEFAULT_EXECUTION_STALE_AFTER
+    supersedes_reservation_id: str | None = None
 
     @property
     def is_open(self) -> bool:
@@ -445,6 +410,7 @@ _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         revision       INTEGER NOT NULL,
         created_at     TEXT NOT NULL,
         updated_at     TEXT NOT NULL,
+        supersedes_reservation_id TEXT,
         UNIQUE (intent_key, ticket_id)
     )
     """,
@@ -467,6 +433,28 @@ reservation for that pair can exist, no matter how many processes race and
 regardless of what any application-level check concluded first. Every
 other constraint here is for query shape or operator legibility; this one
 is load-bearing.
+
+``supersedes_reservation_id`` records, in durable state, which prior
+same-intent execution a permitted reattempt was authorized against. It is a
+plain ``TEXT`` column with no foreign key: the ledger commits exactly one row
+per transaction and has no cascade story, and a self-referential constraint
+would only let a corrupted file constrain its own corruption. The reference
+is validated in ``reserve`` instead, and the invariant it protects -- a
+reattempt may only supersede a ``FAILED`` execution of the *same* intent -- is
+therefore enforced by the only operation able to create the reference.
+
+That rule is deliberately *not* expressible as a SQL constraint, and the
+reason is worth recording because it looks like something the database should
+do. A partial ``UNIQUE`` index cannot express it, because an index constrains
+only the rows it contains and a fresh reservation carries ``outcome IS NULL``:
+it would never enter an outcome-scoped index, so the index could never stop a
+second execution from starting. A state-scoped index fails in the opposite
+direction -- the first permitted ``FAILED`` reattempt settles into ``resolved``
+and collides with the very index meant to allow it. The decision needs the
+outcome, and an outcome is only meaningful read against its own row's state.
+That is application logic, and it is safe inside ``reserve`` only because the
+``BEGIN IMMEDIATE`` transaction already holds the write lock across both the
+read and the insert.
 
 There is deliberately no event table. The approval ledger needs one because
 it commits two related rows per transition and must prove they landed
@@ -563,6 +551,23 @@ class DurableExecutionLedger:
         with a different revision is a
         :class:`TicketRevisionConflictError`, not a fresh claim, because the
         authorization instance it names is not the one already recorded.
+
+        The pair key alone is not sufficient authority to perform an effect,
+        because it identifies an *authorization instance* rather than the
+        effect itself. Two different approvals of the same intent are two
+        different pairs, so the pair constraint alone would let a fresh ticket
+        perform an effect an earlier authorization may already have performed.
+        :meth:`reserve` therefore also decides, atomically and in the same
+        transaction, whether the intent itself is still executable, and raises
+        :class:`IntentAlreadyExecutedError` unless the only prior same-intent
+        execution recorded ``FAILED``. A ``FAILED`` prior is permitted and its
+        reservation id is recorded in ``supersedes_reservation_id``, so the
+        permission is auditable rather than merely implied.
+
+        This decision lives here and not in the caller deliberately. Exposing
+        it as a separate read would restore exactly the read-then-act race the
+        ledger exists to close: a coordinator could read, another worker could
+        commit, and the reservation could then proceed on a stale answer.
         """
         if not intent_key:
             raise ValueError("intent_key is required to reserve an execution")
@@ -583,13 +588,39 @@ class DurableExecutionLedger:
             existing = self._select_pair(conn, intent_key, ticket_id)
             if existing is not None:
                 self._raise_conflict_for(existing, ticket_revision)
+            # The pair key identifies one authorization instance. This check
+            # answers the separate question the pair key cannot: has *this
+            # effect* already been performed, or begun, under an earlier
+            # authorization? It runs inside the same BEGIN IMMEDIATE
+            # transaction as the insert, so no writer can commit between the
+            # read and the write and reintroduce the read-then-act race that
+            # motivated the ledger in the first place. Ordering it after the
+            # pair check keeps a same-pair replay reported as the specific pair
+            # conflict rather than the broader intent refusal.
+            blocking = self._select_blocking_prior(conn, intent_key)
+            if blocking is not None:
+                self._raise_intent_conflict_for(blocking)
+            # No prior execution blocks this intent, so the only thing that
+            # can legitimately be superseded is a prior FAILED attempt. Its
+            # reference is recorded durably so a later reader can answer why
+            # this intent was permitted a second execution, rather than
+            # inferring it from two rows sharing an intent key.
+            prior_failed = self._select_reattemptable_prior(conn, intent_key)
+            supersedes = (
+                str(prior_failed["reservation_id"])
+                if prior_failed is not None
+                else None
+            )
+            if supersedes is not None:
+                self._verify_supersession(conn, intent_key, supersedes)
             try:
                 conn.execute(
                     "INSERT INTO execution_reservation ("
                     "reservation_id, intent_key, ticket_id, ticket_revision, "
                     "action_plan_id, resource_id, action, worker_id, state, "
-                    "outcome, revision, created_at, updated_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "outcome, revision, created_at, updated_at, "
+                    "supersedes_reservation_id"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         reservation_id,
                         intent_key,
@@ -604,6 +635,7 @@ class DurableExecutionLedger:
                         0,
                         _format_ts(moment),
                         _format_ts(moment),
+                        supersedes,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -1074,6 +1106,208 @@ class DurableExecutionLedger:
             (intent_key, ticket_id),
         ).fetchone()
 
+    def _select_blocking_prior(
+        self, conn: sqlite3.Connection, intent_key: str
+    ) -> sqlite3.Row | None:
+        """Return the prior same-intent execution that blocks a new ticket.
+
+        Returns the row only when it must *block*: an in-flight claim, an
+        attempt that may have crossed the boundary, or a terminal outcome that
+        records a known or unknown effect. A prior ``FAILED`` is not returned,
+        because a known unsuccessful attempt is precisely the case a separately
+        authorized reattempt exists for -- but its row is still needed so the
+        caller can record lineage, so ``reserve`` re-reads it separately.
+
+        Ordering is deterministic so a caller that wants the *reason* can
+        report it: in-flight states before terminal ones, then oldest first.
+        """
+        return conn.execute(
+            "SELECT * FROM execution_reservation "
+            "WHERE intent_key = ? "
+            "AND ("
+            "  state IN ('reserved', 'attempted')"
+            "  OR (state = 'resolved' AND outcome IN ("
+            "       'verified_success', 'partially_verified'))"
+            "  OR state = 'unresolved'"
+            ") "
+            "ORDER BY CASE state WHEN 'attempted' THEN 0 WHEN 'reserved' THEN 1 "
+            "ELSE 2 END, created_at, reservation_id "
+            "LIMIT 1",
+            (intent_key,),
+        ).fetchone()
+
+    def _select_reattemptable_prior(
+        self, conn: sqlite3.Connection, intent_key: str
+    ) -> sqlite3.Row | None:
+        """Return the newest prior same-intent row recorded ``FAILED``.
+
+        A ``FAILED`` outcome is the only prior fact that permits a second
+        execution of the same intent, so it is the only one whose row becomes
+        durable lineage. If several ``FAILED`` attempts exist, the most recent
+        is the immediate predecessor, and naming it keeps the chain readable
+        rather than implying the new attempt follows the first failure only.
+        """
+        return conn.execute(
+            "SELECT * FROM execution_reservation "
+            "WHERE intent_key = ? AND state = 'resolved' AND outcome = 'failed' "
+            "ORDER BY updated_at DESC, reservation_id DESC "
+            "LIMIT 1",
+            (intent_key,),
+        ).fetchone()
+
+    def _raise_intent_conflict_for(self, row: sqlite3.Row) -> None:
+        """Refuse a fresh ticket for an intent whose effect may already exist.
+
+        Called only for the states :meth:`_select_blocking_prior` classified
+        as blocking, so this never fires for a ``FAILED`` prior -- that case
+        is a permitted reattempt and must carry lineage instead.
+        """
+        state = ExecutionReservationState(row["state"])
+        intent = f"intent {row['intent_key']!r}"
+        if state is ExecutionReservationState.RESERVED:
+            raise IntentAlreadyExecutedError(
+                f"{intent} already has a RESERVED execution "
+                f"{row['reservation_id']!r} held by worker {row['worker_id']!r}; "
+                "absence of ATTEMPTED is not proof the external world is "
+                "untouched, and M13 performs no automatic stale-reservation "
+                "takeover, so a fresh ticket must not open a second execution"
+            )
+        if state is ExecutionReservationState.ATTEMPTED:
+            raise IntentAlreadyExecutedError(
+                f"{intent} already has an ATTEMPTED execution "
+                f"{row['reservation_id']!r}; the external boundary is recorded "
+                "as crossed and no durable outcome exists yet, so no other "
+                "execution may proceed"
+            )
+        if state is ExecutionReservationState.UNRESOLVED:
+            raise IntentAlreadyExecutedError(
+                f"{intent} has an UNRESOLVED execution "
+                f"{row['reservation_id']!r} (outcome {row['outcome']!r}); it is "
+                "terminal and nothing established whether the external effect "
+                "occurred, so a new ticket does not by itself authorize a "
+                "retry -- that requires an explicit reconciliation override"
+            )
+        raise IntentAlreadyExecutedError(
+            f"{intent} already has a RESOLVED execution "
+            f"{row['reservation_id']!r} with outcome {row['outcome']!r}; the "
+            "effect is known to have occurred and must not be repeated"
+        )
+
+    def verify_lineage(self) -> None:
+        """Check every recorded supersession reference for consistency.
+
+        Read-only and total: it inspects every row and raises on the first
+        inconsistency. Four things are checked, each of which a corrupted or
+        hand-edited file could violate without any single row looking wrong:
+
+        * the referenced reservation exists;
+        * it belongs to the same ``intent_key``;
+        * it is recorded ``FAILED`` -- a reattempt may never supersede an
+          attempt that did not fail;
+        * it does not supersede itself, and the chain does not form a cycle,
+          so "which attempt came first" always terminates.
+
+        Deliberately **not** part of ``verify_on_open``. ``verify`` establishes
+        that the ledger is structurally sound and internally consistent as a
+        store; this establishes a separate semantic claim about supersession
+        lineage, and it is the more expensive of the two because every row must
+        be read and its chain walked. Keeping them separate means the cheap
+        structural gate that guards every open does not silently acquire an
+        O(rows) semantic proof whose failure mode is harder to diagnose, and it
+        leaves room to schedule the lineage proof where it is actually wanted
+        (a scheduled integrity sweep) without changing what "open succeeded"
+        means. Callers that want the full semantic proof ask for it explicitly.
+
+        ``reserve`` prevents all four at creation time, so a clean file passes
+        trivially. This exists for the same reason ``verify`` does: M13
+        established that a durable authority must be able to prove it is
+        telling the truth about its own contents, and lineage is part of that
+        claim.
+        """
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT reservation_id, intent_key, supersedes_reservation_id "
+                "FROM execution_reservation"
+            ).fetchall()
+            by_id = {str(row["reservation_id"]): row for row in rows}
+            for row in rows:
+                reference = row["supersedes_reservation_id"]
+                if reference is None:
+                    continue
+                reservation_id = str(row["reservation_id"])
+                target = by_id.get(str(reference))
+                if target is None:
+                    raise ExecutionLedgerCorruptionError(
+                        f"execution ledger {self._path} reservation "
+                        f"{reservation_id!r} claims to supersede "
+                        f"{reference!r}, which does not exist"
+                    )
+                if str(target["intent_key"]) != str(row["intent_key"]):
+                    raise ExecutionLedgerCorruptionError(
+                        f"execution ledger {self._path} reservation "
+                        f"{reservation_id!r} (intent {row['intent_key']!r}) "
+                        f"claims to supersede {reference!r}, which belongs to "
+                        f"intent {target['intent_key']!r}"
+                    )
+                if reservation_id == str(reference):
+                    raise ExecutionLedgerCorruptionError(
+                        f"execution ledger {self._path} reservation "
+                        f"{reservation_id!r} claims to supersede itself"
+                    )
+                prior = self._select(conn, str(reference))
+                if prior is None or str(prior["outcome"]) != (
+                    ExecutionOutcome.FAILED.value
+                ):
+                    recorded = None if prior is None else str(prior["outcome"])
+                    raise ExecutionLedgerCorruptionError(
+                        f"execution ledger {self._path} reservation "
+                        f"{reservation_id!r} claims to supersede {reference!r}, "
+                        f"whose recorded outcome is {recorded!r}; only a FAILED "
+                        "execution may be superseded by a reattempt"
+                    )
+                # Walk the chain to prove it terminates. Bounded by row count,
+                # so a corrupted cycle is reported rather than hanging.
+                seen = {reservation_id}
+                cursor = str(reference)
+                while cursor not in seen:
+                    seen.add(cursor)
+                    nxt = by_id.get(cursor)
+                    if nxt is None or nxt["supersedes_reservation_id"] is None:
+                        break
+                    cursor = str(nxt["supersedes_reservation_id"])
+                else:
+                    raise ExecutionLedgerCorruptionError(
+                        f"execution ledger {self._path} supersession chain from "
+                        f"{reservation_id!r} forms a cycle"
+                    )
+
+    def _verify_supersession(
+        self, conn: sqlite3.Connection, intent_key: str, reservation_id: str
+    ) -> None:
+        """Check that a lineage reference names an execution of this intent.
+
+        Lineage is the durable answer to "why was this intent allowed a second
+        execution". If the referenced row belongs to another intent, that
+        answer is unsubstantiated, so the reference is refused rather than
+        recorded.
+        """
+        row = conn.execute(
+            "SELECT intent_key FROM execution_reservation "
+            "WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            raise SupersedesIntentMismatchError(
+                f"cannot record lineage to execution {reservation_id!r}: no such "
+                f"reservation exists for intent {intent_key!r}"
+            )
+        if str(row["intent_key"]) != intent_key:
+            raise SupersedesIntentMismatchError(
+                f"cannot record lineage from intent {intent_key!r} to execution "
+                f"{reservation_id!r}, which belongs to intent "
+                f"{row['intent_key']!r}"
+            )
+
     def _raise_conflict_for(
         self, row: sqlite3.Row, attempted_ticket_revision: int | None = None
     ) -> None:
@@ -1311,6 +1545,7 @@ class DurableExecutionLedger:
             action=action,
             outcome=outcome,
             stale_after=self._stale_after,
+            supersedes_reservation_id=row["supersedes_reservation_id"],
         )
 
 

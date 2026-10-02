@@ -314,9 +314,15 @@ def test_reserved_revision_is_redeemable_and_a_moved_ticket_is_not(
         assert ledger.get(INTENT, TICKET).ticket_revision == issued.revision
         assert approvals.get(TICKET).revision == granted.revision
 
-        # Reserving against the current revision is accepted.
+        # Reserving against the current revision is accepted, and the ledger
+        # binds whatever revision it was handed. This second reservation uses a
+        # distinct intent on purpose: Phase 4 refuses a fresh ticket for an
+        # intent whose first execution is still open, and that guard is about
+        # effect duplication, which is orthogonal to the revision binding this
+        # test exists to pin. Mixing the two here would make a legitimate
+        # revision assertion fail for an unrelated reason.
         fresh = ledger.reserve(
-            intent_key=INTENT,
+            intent_key=INTENT + "-other",
             ticket_id=TICKET + "-2",
             ticket_revision=granted.revision,
             worker_id="w1",

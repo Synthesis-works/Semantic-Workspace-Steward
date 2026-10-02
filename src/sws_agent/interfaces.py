@@ -173,6 +173,159 @@ class ApprovalStore(Protocol):
     def pending(self) -> list[ApprovalTicket]: ...
 
 
+# --- Execution-ledger exception taxonomy -----------------------------------
+#
+# These live here rather than in the SQLite implementation because a caller
+# holding an `ExecutionLedger` must be able to tell its failure modes apart
+# without knowing which store it was handed. The coordinator is the case in
+# point: it reports three refusals whose operator responses differ, and it
+# cannot do that by string-matching a generic error.
+#
+# Conventions mirror approval.py: one base class per store, with a distinct
+# subclass per failure mode a caller may need to tell apart.
+
+
+class ExecutionLedgerError(Exception):
+    """Base class for execution-ledger failures."""
+
+
+class UnknownReservationError(ExecutionLedgerError):
+    """Raised when no reservation exists for the requested pair."""
+
+
+class ExecutionLedgerUnavailableError(ExecutionLedgerError):
+    """Raised when the ledger cannot be opened, written, or committed.
+
+    Covers a closed store, an unwritable path, and a writer that lost the
+    race for the database lock. The store never degrades to an in-memory
+    implementation or to a partial write.
+    """
+
+
+class ExecutionLedgerCorruptionError(ExecutionLedgerError):
+    """Raised when durable execution data fails its integrity checks.
+
+    The store fails closed: it never reconstructs a plausible state from
+    damaged data, because a plausible-but-wrong execution record could hide
+    a claim that is still live.
+
+    Deliberately *not* a :class:`ReservationConflictError`. A conflict is an
+    ordinary answer to "may I execute this?", whereas corruption means the
+    ledger cannot answer that question at all. Reporting damaged durable state
+    as contention would tell a caller to retry, and retrying on the strength of
+    an unverifiable record is exactly what the fail-closed rule forbids.
+    """
+
+
+class ReservationConflictError(ExecutionLedgerError):
+    """Base class for "this execution is already claimed" refusals.
+
+    Distinct from :class:`ReservationRevisionConflictError` on purpose, and
+    for the same reason ``DuplicateTicketError`` is distinct in approval: a
+    conflict means *this identity is taken* and the caller must not act,
+    whereas a revision conflict means *the state you meant to act on has
+    already moved* and the caller must re-read before deciding. Both are
+    refusals to proceed; only one of them is safe to retry blindly, and
+    neither is.
+    """
+
+
+class AlreadyReservedError(ReservationConflictError):
+    """Raised when a live ``RESERVED`` claim already exists for the pair."""
+
+
+class AlreadyAttemptedError(ReservationConflictError):
+    """Raised when an ``ATTEMPTED`` execution already exists for the pair.
+
+    The external boundary is recorded as crossed, so no other worker may
+    claim this execution under any circumstance.
+    """
+
+
+class AlreadyResolvedError(ReservationConflictError):
+    """Raised when the execution already reached a terminal state."""
+
+
+class IntentAlreadyExecutedError(ReservationConflictError):
+    """Raised when a prior same-intent execution blocks a fresh ticket.
+
+    Distinct from the pair-scoped conflicts above because the two answer
+    different questions. The pair conflicts mean *this authorization instance
+    is already claimed*; this means *this effect may already have been
+    performed, or may yet be performed, under an earlier authorization*.
+
+    Every prior state of the same ``intent_key`` blocks except a recorded
+    ``FAILED``. A ``RESERVED`` claim blocks because M13 has no automatic
+    stale-reservation takeover, so the previous worker may still be running.
+    An ``ATTEMPTED`` row blocks because the external boundary is recorded as
+    crossed. A settled known effect blocks because it demonstrably happened.
+    ``UNRESOLVED``/``UNKNOWN`` blocks because nothing established whether it
+    happened at all, and that ambiguity must not be laundered into a retry by
+    the arrival of a new ticket.
+
+    Only ``FAILED`` -- a known unsuccessful outcome, where a separately
+    authorized reattempt is meaningful -- permits a second execution of the
+    same intent, and that reservation records ``supersedes_reservation_id``
+    so the lineage survives in durable state rather than being inferred from
+    two rows sharing an intent key.
+    """
+
+
+class SupersedesIntentMismatchError(ExecutionLedgerError):
+    """Raised when a lineage reference names a different intent's execution.
+
+    Lineage exists to answer "why was a second execution of this intent
+    permitted". If the referenced reservation belongs to another intent, that
+    answer is wrong or absent, and recording it would leave a durable claim
+    that cannot be substantiated. Refusing is the only safe response.
+    """
+
+
+class TicketRevisionConflictError(ReservationConflictError):
+    """Raised when the pair exists but bound to a different ticket revision.
+
+    A reservation is bound to the exact approval revision it was created
+    against, so it cannot be silently reused by a caller holding a
+    different view of the same ticket.
+
+    This is a *binding* failure rather than an execution duplicate: the
+    approval moved between the reservation and the consumption, so the two
+    no longer describe the same authorization. Reporting it as a duplicate
+    would send an operator looking for a second worker when the real cause is
+    a ticket that changed underneath the reservation.
+    """
+
+
+class ReservationOwnershipError(ReservationConflictError):
+    """Raised when a worker tries to transition a reservation it does not hold.
+
+    ``reserve`` binds an execution to one ``worker_id``, and only that worker
+    may advance it. Without this gate the binding would be decorative: any
+    caller that happened to learn an ``(intent_key, ticket_id)`` pair could
+    call ``mark_attempted`` or ``record_outcome`` on it, and could in
+    particular stamp a definite outcome onto another worker's execution. A
+    reservation's whole purpose is that the claim is exclusive, so the
+    transitions that decide what happened must be exclusive too.
+
+    This is a :class:`ReservationConflictError` because the caller's response
+    is the same in both cases -- do not proceed -- but it is a distinct type
+    because the fault is different: ``AlreadyAttemptedError`` means the
+    execution is no longer yours to run, while this means it never was.
+    """
+
+
+class ReservationRevisionConflictError(ExecutionLedgerError):
+    """Raised when a transition's expected revision is not the stored one.
+
+    The store guards every state change with a compare-and-swap on
+    ``revision`` and never retries silently.
+    """
+
+
+class InvalidExecutionTransitionError(ExecutionLedgerError):
+    """Raised when a transition is not in the execution transition table."""
+
+
 @runtime_checkable
 class ExecutionLedger(Protocol):
     """Durable, exclusive claim on a single execution (M13 Phase 3).
@@ -194,9 +347,20 @@ class ExecutionLedger(Protocol):
 
     Contract every implementation must satisfy:
 
-    * **Exactly-once claim.** ``reserve`` may succeed at most once per
-      ``(intent_key, ticket_id)``. A second call raises rather than
-      re-claiming, and the caller must not proceed to any external effect.
+* **Exactly-once claim.** ``reserve`` may succeed at most once per
+    ``(intent_key, ticket_id)``. A second call raises rather than
+    re-claiming, and the caller must not proceed to any external effect.
+  * **Intent-level effect guard.** The pair key names an *authorization
+    instance*, not the effect being performed, so it is not by itself
+    authority to act. ``reserve`` must additionally decide, atomically in the
+    same operation, whether the intent is still executable, and refuse a fresh
+    ticket whenever a prior same-intent execution is ``RESERVED``,
+    ``ATTEMPTED``, ``UNRESOLVED``, or resolved with an outcome other than
+    ``FAILED``. Only a recorded ``FAILED`` -- a known unsuccessful attempt --
+    permits a second execution, and that reservation must record which prior
+    execution it supersedes. Exposing this as a separate read is not
+    sufficient: it would restore a read-then-act race between processes, which
+    is the failure this seam exists to prevent.
     * **Read current state.** Every operation reads durable state. An
       implementation must not answer from a cache populated at open, because
       that is precisely the failure this seam exists to close.
@@ -214,9 +378,20 @@ class ExecutionLedger(Protocol):
       an automatic takeover of an abandoned claim: a worker that crashed
       before its external call and one that crashed during it leave
       identical durable state.
-    * **No approval authority.** This seam reads ``ticket_id`` and
-      ``ticket_revision`` only as opaque bindings. It never consumes an
-      approval and never decides whether an action is authorized.
+* **No approval authority.** This seam reads ``ticket_id`` and
+    ``ticket_revision`` only as opaque bindings. It never consumes an
+    approval and never decides whether an action is authorized.
+* **No automatic override.** Refusing an ``UNRESOLVED`` prior is not a
+      dead end with a workaround: permitting a second execution of an intent
+      whose effect is unknown requires an explicit reconciliation mechanism with
+      its own authorization and audit semantics, which M13 deliberately does not
+      provide. A new approval ticket is not such a mechanism -- it says nothing
+      about whether the earlier effect occurred.
+    * **Lineage is derived, not supplied.** ``reserve`` takes no parameter
+      naming the prior execution to supersede, so a caller cannot point a
+      reservation at an arbitrary row. The reference is a consequence of what
+      was already durably recorded, and ``verify_lineage`` proves afterwards
+      that the stored relations are self-consistent.
 
     Implementations raise ``execution_ledger.UnknownReservationError`` for an
     unclaimed pair and a ``ReservationConflictError`` subclass when the pair
@@ -260,6 +435,33 @@ class ExecutionLedger(Protocol):
     def open_executions(self) -> tuple[Any, ...]: ...
 
     def unresolved_executions(self) -> tuple[Any, ...]: ...
+
+    def verify(self) -> None:
+        """Fail closed unless durable execution data is internally consistent.
+
+        Part of the contract rather than a diagnostic convenience: a ledger is
+        expected to apply this to itself when it opens, so an implementation
+        that cannot prove its own contents cannot honour the contract at all.
+        It raises :class:`ExecutionLedgerCorruptionError` rather than returning
+        a result, and never reconstructs a plausible state from damaged data.
+        """
+        ...
+
+    def verify_lineage(self) -> None:
+        """Prove every recorded supersession relation is well formed.
+
+        ``reserve`` cannot produce a reference to another intent, to a
+        non-``FAILED`` execution, or to itself, so this is not a re-check of
+        the decision path. It exists for the case that path cannot cover: a
+        file edited, restored from an inconsistent backup, or written by a
+        build with a different bug.
+
+        A durable authority that cannot prove its own contents is not an
+        authority, so this raises on corruption rather than returning a
+        result. The walk is bounded, so a cycle is reported as corruption
+        instead of looping.
+        """
+        ...
 
 
 @runtime_checkable

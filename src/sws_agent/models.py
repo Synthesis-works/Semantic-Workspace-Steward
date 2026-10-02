@@ -630,6 +630,11 @@ class ExecutionResult(BaseModel):
     passed but no mutation implementation exists, so nothing was crossed.
     Otherwise the outcome reflects the post-attempt verification
     (VERIFIED_SUCCESS / PARTIALLY_VERIFIED / FAILED / UNKNOWN).
+
+    M13 Phase 4: ``reservation_id`` names the durable execution claim that
+    authorised this attempt, so a result points at the ledger row rather than
+    only at the plan. It is ``None`` whenever no reservation was written: every
+    refusal, and every ``NOT_EXECUTED`` result reached without a handler.
     """
 
     execution_id: str = Field(min_length=1)
@@ -642,6 +647,7 @@ class ExecutionResult(BaseModel):
     refusal_detail: str = ""
     verification: VerificationStatus | None = None
     attempt_id: str | None = Field(default=None, min_length=1)
+    reservation_id: str | None = Field(default=None, min_length=1)
     started_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )

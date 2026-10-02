@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -121,12 +122,30 @@ def test_approval_db_absolute_path_resolves_to_path(monkeypatch, tmp_path):
 
 
 def test_approval_db_absolute_path_on_other_drive_is_accepted(monkeypatch):
-    """The helper does no platform guessing; it only requires absoluteness."""
-    monkeypatch.setenv(SWS_APPROVAL_DB_ENV, "D:/data/sws/approvals.sqlite3")
+    """The helper does no platform guessing; it only requires absoluteness.
+
+    The case under test is an absolute path on a volume the process is not
+    currently working in -- a second drive on Windows, a root outside the
+    working directory on POSIX -- and the helper must accept it rather than
+    second-guess the operator.
+
+    The literal is spelled in the host platform's own terms because
+    ``D:/...`` is absolute on Windows and *relative* on POSIX, where the very
+    same string would be rejected as exactly the configuration hazard this
+    function exists to refuse. Asserting the Windows form unconditionally
+    would therefore have tested the rejection branch on the CI runner rather
+    than the acceptance branch the name promises.
+    """
+    other_volume = (
+        Path("D:/data/sws/approvals.sqlite3")
+        if os.name == "nt"
+        else Path("/data/sws/approvals.sqlite3")
+    )
+    monkeypatch.setenv(SWS_APPROVAL_DB_ENV, str(other_volume))
     resolved = approval_db_from_env()
     assert resolved is not None
     assert resolved.is_absolute()
-    assert str(resolved) == str(Path("D:/data/sws/approvals.sqlite3"))
+    assert str(resolved) == str(other_volume)
 
 
 def test_approval_db_surrounding_whitespace_is_stripped(monkeypatch, tmp_path):

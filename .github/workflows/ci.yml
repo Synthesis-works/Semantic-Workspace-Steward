@@ -20,7 +20,17 @@ jobs:
           cache: pip
 
       - name: Install package
-        run: pip install -e ".[dev]"
+        # The hermetic suite in tests/ spans the MCP server and the local web
+        # simulator, so it needs the extras those modules declare. Installing
+        # only [dev] left httpx absent and failed collection in nine test
+        # modules -- including test_audit, test_aws and test_mcp_server, which
+        # reach the simulator package transitively.
+        #
+        # The AWS and explanation extras stay uninstalled on purpose: the suite
+        # imports boto3/botocore and strands lazily, test_aws.py guards its
+        # optional-library assertion with importorskip, and provisioning the SDK
+        # here would invite the live-AWS validation the suite is built to avoid.
+        run: pip install -e ".[dev,mcp,simulator]"
 
       - name: Run hermetic tests
         # No AWS credentials are provided: this suite is fully hermetic.

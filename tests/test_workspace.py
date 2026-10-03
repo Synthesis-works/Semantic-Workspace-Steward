@@ -1057,33 +1057,180 @@ def test_default_resource_types_are_explicit_and_ec2_is_not_one_of_them():
     assert SWSResourceType.EC2_INSTANCE in INVENTORY_COLLECTORS
 
 
-def test_multi_region_run_is_fine_without_ec2():
-    """The single-region restriction belongs to EC2, not to the workspace."""
+class RecordingLambdaClient:
+    """Per-region Lambda client that records the region it was asked about."""
+
+    def __init__(self, region, recorder):
+        self._region = region
+        self._recorder = recorder
+
+    def list_functions(self, Marker=None):
+        self._recorder["lambda"].append(self._region)
+        name = f"fn-{self._region}"
+        return {
+            "Functions": [
+                {
+                    "FunctionName": name,
+                    "FunctionArn": (
+                        f"arn:aws:lambda:{self._region}:123456789012:function:{name}"
+                    ),
+                }
+            ]
+        }
+
+    def list_tags(self, Resource):
+        self._recorder["lambda_tags"].append(self._region)
+        return {"Tags": {"Owner": "alice"}}
+
+
+class RecordingEc2Client:
+    """Per-region EC2 client that records the region it was asked about."""
+
+    def __init__(self, region, recorder):
+        self._region = region
+        self._recorder = recorder
+
+    def describe_instances(self):
+        self._recorder["ec2"].append(self._region)
+        return FakeEc2Paginator(
+            [
+                {
+                    "Reservations": [
+                        {
+                            "OwnerId": "123456789012",
+                            "Instances": [
+                                {
+                                    "InstanceId": f"i-{self._region}",
+                                    "State": {"Code": 16, "Name": "running"},
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        )
+
+
+class _RegionalClient:
+    def __init__(self, region, recorder):
+        self._lambda = RecordingLambdaClient(region, recorder)
+        self._ec2 = RecordingEc2Client(region, recorder)
+
+    def list_functions(self, Marker=None):
+        return self._lambda.list_functions(Marker)
+
+    def list_tags(self, Resource):
+        return self._lambda.list_tags(Resource)
+
+    def describe_instances(self):
+        return self._ec2.describe_instances()
+
+
+class RegionAwareRootClient:
+    """Mirrors the M13-B ``aws.AwsMultiClient`` capability over in-memory fakes.
+
+    Each region gets a genuinely separate Lambda and EC2 client, so a
+    multi-region assertion proves the collector read *each* region rather than
+    re-reading one and relabelling it.
+    """
+
+    def __init__(self):
+        self.recorder = {"lambda": [], "lambda_tags": [], "ec2": []}
+        self._by_region: dict[str, _RegionalClient] = {}
+
+    def list_buckets(self):
+        return {"Buckets": []}
+
+    def get_bucket_location(self, Bucket):
+        return {"LocationConstraint": None}
+
+    def get_bucket_tagging(self, Bucket):
+        return {"TagSet": []}
+
+    def get_cost_and_usage(self, **params):
+        return {"ResultsByTime": []}
+
+    def client_for_region(self, region):
+        if region not in self._by_region:
+            self._by_region[region] = _RegionalClient(region, self.recorder)
+        return self._by_region[region]
+
+
+def test_multi_region_run_with_a_region_blind_client_is_partial_not_clean():
+    """Asking for two regions through a one-region client is incomplete coverage.
+
+    ``FakeRootClient`` is region-blind, so SWS genuinely cannot confirm whether
+    ``eu-west-1`` holds functions it has not seen. Reporting that snapshot clean
+    would present an absence as a certainty; reporting it ``partial`` keeps the
+    records it did read while saying so.
+    """
     snapshot = _run(FakeRootClient(), regions=["us-east-1", "eu-west-1"])
-    assert snapshot.partial is False
+    assert snapshot.partial is True
     assert snapshot.regions == ["us-east-1", "eu-west-1"]
+    uncovered = [
+        f for f in snapshot.failures if f.resource_type is SWSResourceType.LAMBDA_FUNCTION
+    ]
+    assert len(uncovered) == 1
+    assert uncovered[0].category is CollectionFailureCategory.PRIMARY
+    assert "eu-west-1" in uncovered[0].message
 
 
-def test_multi_region_ec2_run_raises_before_any_collector_runs():
-    """Refusing beats mislabeling, and it must cost no wasted collection.
+def test_multi_region_lambda_reads_each_region_once_when_addressable():
+    """The pre-M13-B defect: one region re-read (and re-tagged) per request."""
+    client = RegionAwareRootClient()
+    snapshot = _run(client, regions=["us-east-1", "eu-west-1"])
+    assert snapshot.partial is False
+    assert client.recorder["lambda"] == ["us-east-1", "eu-west-1"]
+    assert client.recorder["lambda_tags"] == ["us-east-1", "eu-west-1"]
+    assert len(snapshot.resources) == 2
 
-    The client seam reads one configured region, so a two-region EC2 request
-    could only duplicate one region's instances under invented locations. The
-    check runs before collection so a rejected call cannot leave a partial
-    trace that looks like a failed run.
+
+def test_multi_region_lambda_never_duplicates_a_record_for_one_region():
+    """Two regions, two distinct functions -- not the same function twice."""
+    client = RegionAwareRootClient()
+    snapshot = _run(client, regions=["us-east-1", "eu-west-1"])
+    ids = sorted(r.resource_id for r in snapshot.resources)
+    assert len(ids) == len(set(ids)) == 2
+
+
+def test_multi_region_ec2_reads_each_region_once_when_addressable():
+    """Each region is read through a client bound to that region."""
+    client = RegionAwareRootClient()
+    snapshot = _run(client, regions=["us-east-1", "eu-west-1"], collect_ec2=True)
+    assert snapshot.partial is False
+    assert client.recorder["ec2"] == ["us-east-1", "eu-west-1"]
+    assert snapshot.counts[SWSResourceType.EC2_INSTANCE] == 2
+    by_id = {
+        r.resource_id: r.region
+        for r in snapshot.resources
+        if r.resource_type is SWSResourceType.EC2_INSTANCE
+    }
+    assert by_id == {"i-us-east-1": "us-east-1", "i-eu-west-1": "eu-west-1"}
+
+
+def test_multi_region_ec2_run_refuses_a_region_blind_client_and_builds_no_snapshot():
+    """Refusing beats mislabeling; no snapshot may be produced at all.
+
+    The refusal now comes from the collector, which is the single place that
+    knows a client's region capability. S3 and Lambda have legitimately traced
+    by then, but because the exception propagates out of ``collect_workspace``
+    no snapshot is built -- so nothing can be mistaken for a completed run.
     """
     ec2 = FakeEc2Client([_ec2_page(_ec2_instance("i-1"))])
     s3 = FakeS3Client(buckets=[{"Name": "bucket-a"}])
     client = FakeRootClient(s3=s3, ec2=ec2)
-    trace = TraceRecorder()
-    with pytest.raises(ValueError, match="exactly one region"):
+    with pytest.raises(ValueError, match="cannot address regions"):
         collect_workspace(
             client=client,
             regions=["us-east-1", "eu-west-1"],
             now=NOW,
-            trace=trace,
             collect_ec2=True,
         )
     assert ec2.calls == 0
-    assert len(trace) == 0
-    assert trace.to_dicts() == []
+
+
+def test_single_region_ec2_run_is_unaffected_by_the_seam_change():
+    ec2 = FakeEc2Client([_ec2_page(_ec2_instance("i-1"))])
+    snapshot = _run(FakeRootClient(ec2=ec2), collect_ec2=True)
+    assert snapshot.partial is False
+    assert snapshot.counts[SWSResourceType.EC2_INSTANCE] == 1

@@ -157,6 +157,41 @@ _EXHAUSTED: Any = object()
 """Sentinel distinguishing "the iterator ended" from a page that is ``None``."""
 
 
+def _addressable_regions(client: Any, regions: list[str]) -> tuple[list[str], list[str]]:
+    """Split ``regions`` into the ones this client can read and the ones it cannot.
+
+    Returns ``(readable, unreadable)``.
+
+    A regional boto3 client answers for exactly one region. A client exposing
+    ``client_for_region`` (``aws.AwsMultiClient``) can genuinely address any
+    region it is asked about, so every requested region is readable. Any other
+    injected client -- every hand-built fake, the simulator -- is *region-blind*:
+    it can report only whichever region it was built for.
+
+    This distinction exists so a collector can never relabel one region's
+    response as another's. When a caller asks for regions the client cannot
+    address, the collector either refuses (EC2, which has no other way to learn
+    an instance's region) or records the coverage gap explicitly (Lambda, which
+    reads each instance's true region from its ARN).
+    """
+    if callable(getattr(client, "client_for_region", None)):
+        return list(regions), []
+    return regions[:1], list(regions[1:])
+
+
+def _client_for_region(client: Any, region: str) -> Any:
+    """Return the client bound to ``region``.
+
+    Safe only when ``region`` came from ``_addressable_regions``' readable
+    half: for a region-blind client that is the single region it was built for,
+    so returning ``client`` unchanged is correct rather than a guess.
+    """
+    resolver = getattr(client, "client_for_region", None)
+    if callable(resolver):
+        return resolver(region)
+    return client
+
+
 def _collect_items(
     pages: Iterable[tuple[list[dict[str, Any]], bool]],
     map_item: Callable[[dict[str, Any]], ResourceRecord | None],
@@ -319,12 +354,14 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
     def collect(self, *, limit: int | None = None) -> list[ResourceRecord]:
         limit = normalize_limit(limit)
         self._trace_start(f"collecting {self._resource_type.value} inventory")
+        readable, unreadable = _addressable_regions(self._client, self._regions)
         records: list[ResourceRecord] = []
         truncated = False
         try:
-            for region in self._regions:
+            for region in readable:
+                regional = _client_for_region(self._client, region)
                 region_records, region_truncated = self._collect_region(
-                    limit - len(records)
+                    regional, limit - len(records)
                 )
                 records.extend(region_records)
                 truncated = truncated or region_truncated
@@ -333,10 +370,26 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
         except Exception as exc:  # primary list operation failure (fail-closed)
             self._trace_fail(f"{self._resource_type.value} inventory failed: {exc}")
             return []
+        if unreadable:
+            # M13-B: the records gathered so far are real and keep their true
+            # regions (each was parsed from its own ARN), so they are preserved.
+            # What is not established is whether the regions this client could
+            # not address hold functions SWS has now missed, so the run reports
+            # an incomplete collection of this type rather than a complete one.
+            # The pre-M13-B behavior -- reading the same region once per
+            # requested region -- duplicated every record and every tag lookup
+            # while still proving nothing about the regions never read.
+            self._trace_fail(
+                f"lambda_function inventory covers only {readable[0]!r}; this "
+                f"client cannot address {', '.join(unreadable)}",
+                category=CollectionFailureCategory.PRIMARY,
+            )
         self._trace_succeed(len(records), truncated=truncated)
         return records
 
-    def _collect_region(self, remaining: int) -> tuple[list[ResourceRecord], bool]:
+    def _collect_region(
+        self, regional_client: Any, remaining: int
+    ) -> tuple[list[ResourceRecord], bool]:
         """Collect one region, returning ``(records, truncated)``.
 
         ``truncated`` is True exactly when this region genuinely had more
@@ -347,10 +400,18 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
         no remaining data is not truncation).
         """
         return _collect_items(
-            _lambda_pages(self._client), self._map_function, remaining=remaining
+            _lambda_pages(regional_client),
+            # The Owner-tag lookup must go through the same regional client that
+            # listed the function. ``list_tags`` is a regional Lambda operation,
+            # so asking a client bound to another region would look up the tag of
+            # an identically named function elsewhere -- or fail outright.
+            lambda function: self._map_function(function, regional_client),
+            remaining=remaining,
         )
 
-    def _map_function(self, function: dict) -> ResourceRecord | None:
+    def _map_function(
+        self, function: dict, regional_client: Any
+    ) -> ResourceRecord | None:
         arn = function.get("FunctionArn")
         if not arn:
             self._trace_fail(
@@ -373,15 +434,15 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
             resource_type=SWSResourceType.LAMBDA_FUNCTION,
             name=function.get("FunctionName"),
             region=region,
-            owner_tag=self._function_owner_tag(arn),
+            owner_tag=self._function_owner_tag(arn, regional_client),
             created_at=None,
             metrics={},
             raw=_function_raw(function),
         )
 
-    def _function_owner_tag(self, arn: str) -> str | None:
+    def _function_owner_tag(self, arn: str, regional_client: Any) -> str | None:
         try:
-            response = self._client.list_tags(Resource=arn)
+            response = regional_client.list_tags(Resource=arn)
         except Exception as exc:
             self._trace_fail(
                 f"failed to read tags for Lambda function '{arn}': {exc}",
@@ -479,26 +540,24 @@ def _ec2_instance_pages(
 
 
 class Ec2InstanceCollector(_InventoryCollectorBase):
-    """Collects a bounded inventory of EC2 instances for one region, read-only.
+    """Collects a bounded inventory of EC2 instances across regions, read-only.
 
     Added by M13-A, and deliberately the smallest EC2 read surface that can
     put an instance into a workspace snapshot: one logical
-    ``ec2:DescribeInstances`` operation, drained to completion through the
-    injected paginator seam (``aws.AwsMultiClient``). No mutating EC2
-    operation is called, named, or reachable from here, and
+    ``ec2:DescribeInstances`` operation per region, drained to completion
+    through the injected paginator seam (``aws.AwsMultiClient``). No mutating
+    EC2 operation is called, named, or reachable from here, and
     ``PotentialAction.STOP_RESOURCE`` still has no registered handler.
 
     Honesty notes specific to EC2:
 
-    - Exactly one region is accepted, and that is a limit of the injected seam
-      rather than of EC2. ``AwsMultiClient.describe_instances()`` takes no
-      region argument and is bound to a single configured region, so a
-      multi-region loop would re-read that one region and stamp each copy with
-      a different ``region`` -- fabricating instance locations and duplicating
-      rows in the same snapshot. Refusing the request is the only honest
-      option until the seam can address a region per call; under-collecting
-      silently would be worse still, and stopping an instance is an action that
-      must never rest on a misattributed region.
+    - Regions are read one at a time, each through a client genuinely bound to
+      that region (``client_for_region``). A client that cannot address regions
+      is accepted for a single-region request and *refused* for several: an EC2
+      response carries no region of its own, so labelling one region's instances
+      with another's name would fabricate the identity a future
+      ``ec2:StopInstances`` call would be resolved from. Lambda, whose ARNs do
+      carry a region, records the same gap as an incomplete collection instead.
     - ``state`` is ``State.Name`` passed through byte-for-byte, or ``None``
       when AWS reported no state. It is never lowercased, mapped through
       ``Ec2InstanceState``, or defaulted to a benign value -- an instance whose
@@ -539,25 +598,41 @@ class Ec2InstanceCollector(_InventoryCollectorBase):
         for region in regions:
             if not isinstance(region, str) or not region.strip():
                 raise ValueError("EC2 inventory regions must be non-empty strings")
-        if len(regions) > 1:
-            raise ValueError(
-                "EC2 inventory requires exactly one region: the injected "
-                "describe_instances() seam takes no region and is bound to one "
-                "configured region, so collecting several would return the same "
-                "instances repeatedly under fabricated region labels"
-            )
         self._client = client
         self._regions = list(regions)
 
     def collect(self, *, limit: int | None = None) -> list[ResourceRecord]:
         limit = normalize_limit(limit)
         self._trace_start(f"collecting {self._resource_type.value} inventory")
-        try:
-            records, truncated = self._collect_region(
-                self._client.describe_instances(),
-                self._regions[0],
-                limit,
+        readable, unreadable = _addressable_regions(self._client, self._regions)
+        if unreadable:
+            # Unlike Lambda, an EC2 instance's region cannot be recovered from
+            # the response: ``DescribeInstances`` returns no ARN and no region
+            # field, so the requested region is the only record of where a
+            # returned instance lives. Reading a client bound to some other
+            # region and labelling the result with the requested one would
+            # fabricate instance locations -- and this record is what a future
+            # ``StopInstances`` call would be resolved from. Refuse instead.
+            raise ValueError(
+                "EC2 inventory cannot cover regions "
+                f"{', '.join(unreadable)}: the injected describe_instances() "
+                "seam cannot address regions and an EC2 response carries no "
+                "region of its own. Use a client exposing client_for_region."
             )
+        records: list[ResourceRecord] = []
+        truncated = False
+        try:
+            for region in readable:
+                regional = _client_for_region(self._client, region)
+                region_records, region_truncated = self._collect_region(
+                    regional.describe_instances(),
+                    region,
+                    limit - len(records),
+                )
+                records.extend(region_records)
+                truncated = truncated or region_truncated
+                if len(records) >= limit:
+                    break
         except Exception as exc:  # primary list operation failure (fail-closed)
             self._trace_fail(f"{self._resource_type.value} inventory failed: {exc}")
             return []

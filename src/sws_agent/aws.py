@@ -85,6 +85,17 @@ class AwsMultiClient:
     M11 adds exactly one read-only EC2 method, ``describe_instances``. The
     ``ec2`` client is created on first use by ``ec2_client_factory`` so a
     caller that never observes an instance never builds one.
+
+    M13-B adds ``client_for_region``. The regional collectors (Lambda, EC2)
+    cannot invent a second region from the client they were handed: a boto3
+    regional client answers for exactly one region, so reading a second region
+    through it would return the *first* region's resources. ``client_for_region``
+    resolves a client genuinely bound to the requested region and caches it, so
+    a repeated request reuses one client rather than rebuilding it.
+
+    This adds no AWS capability. It only lets SWS *address* the regions it was
+    already asked about; the set of named operations is unchanged, and there is
+    still no mutation method and no arbitrary-operation escape hatch.
     """
 
     def __init__(
@@ -94,12 +105,44 @@ class AwsMultiClient:
         lambda_client: Any,
         cost_explorer: Any,
         ec2_client_factory: Callable[[], Any] | None = None,
+        region: str | None = None,
+        region_client_factory: Callable[[str], "AwsMultiClient"] | None = None,
     ) -> None:
         self._s3 = s3
         self._lambda_client = lambda_client
         self._cost_explorer = cost_explorer
         self._ec2_client_factory = ec2_client_factory
         self._ec2: Any = None
+        self._region = region
+        self._region_client_factory = region_client_factory
+        self._regional_clients: dict[str, "AwsMultiClient"] = {}
+
+    @property
+    def region(self) -> str | None:
+        """The single region this client answers for, or None if unbound."""
+        return self._region
+
+    def client_for_region(self, region: str) -> "AwsMultiClient":
+        """Return a client genuinely bound to ``region``.
+
+        Raises ``RuntimeError`` when this client was built without a
+        ``region_client_factory`` (every injected test double, and any caller
+        that assembled ``AwsMultiClient`` by hand). Failing loudly is the
+        point: silently returning ``self`` would let a regional collector read
+        one region and label the results with another, which is precisely the
+        misattribution M13-B exists to eliminate. Collectors detect the absence
+        of this method and handle the resulting coverage gap explicitly.
+        """
+        if self._region_client_factory is None:
+            raise RuntimeError(
+                "this client cannot address regions: it was built without a "
+                "region_client_factory"
+            )
+        cached = self._regional_clients.get(region)
+        if cached is None:
+            cached = self._region_client_factory(region)
+            self._regional_clients[region] = cached
+        return cached
 
     def list_buckets(self, **kwargs: Any) -> Any:
         return self._s3.list_buckets(**kwargs)
@@ -200,13 +243,42 @@ class AwsClientFactory:
             # it inherits the same profile/region/retry/timeout plumbing.
             return session.client("ec2", region_name=region, config=client_config)
 
+        # Account-global clients are built once and shared by every regional
+        # client: ``list_buckets`` and Cost Explorer are not region-scoped, so
+        # rebuilding them per region would only cost extra API setup.
+        s3 = session.client("s3", region_name=region, config=client_config)
+        cost_explorer = session.client(
+            "ce", region_name=COST_EXPLORER_REGION, config=client_config
+        )
+
+        def region_client_factory(target_region: str) -> AwsMultiClient:
+            # M13-B: build a client whose *regional* services actually answer
+            # for ``target_region``. Constructing a client performs no AWS call,
+            # so this stays as lazy as the rest of the plumbing; the per-service
+            # clients are themselves created only when first used.
+            def regional_ec2_client_factory() -> Any:
+                return session.client(
+                    "ec2", region_name=target_region, config=client_config
+                )
+
+            return AwsMultiClient(
+                s3=s3,
+                lambda_client=session.client(
+                    "lambda", region_name=target_region, config=client_config
+                ),
+                cost_explorer=cost_explorer,
+                ec2_client_factory=regional_ec2_client_factory,
+                region=target_region,
+                region_client_factory=region_client_factory,
+            )
+
         return AwsMultiClient(
-            s3=session.client("s3", region_name=region, config=client_config),
+            s3=s3,
             lambda_client=session.client(
                 "lambda", region_name=region, config=client_config
             ),
-            cost_explorer=session.client(
-                "ce", region_name=COST_EXPLORER_REGION, config=client_config
-            ),
+            cost_explorer=cost_explorer,
             ec2_client_factory=ec2_client_factory,
+            region=region,
+            region_client_factory=region_client_factory,
         )

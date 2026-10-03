@@ -640,6 +640,9 @@ def test_multi_client_exposes_exactly_seven_operations() -> None:
         "list_tags",
         "get_cost_and_usage",
         "describe_instances",
+        # M13-B: resolves a client bound to another region. It performs no AWS
+        # operation itself; it only lets SWS address a region it was asked about.
+        "client_for_region",
     }
     public = {
         name
@@ -724,3 +727,116 @@ def test_no_ec2_client_is_constructed_until_an_instance_is_observed() -> None:
     multi.describe_instances()
     assert len(builds) == 1  # reused, not rebuilt
     assert session.clients["ec2"].paginator_requests == ["describe_instances"] * 2
+
+# ---------------------------------------------------------------------------
+# M13-B: per-region client seam
+# ---------------------------------------------------------------------------
+
+
+class RegionKeyedSession:
+    """FakeSession variant that caches per (service, region).
+
+    ``FakeSession`` keys only on service name, which is fine for single-region
+    tests but cannot express "this client was built for eu-west-1". M13-B needs
+exactly that distinction to prove each region gets its own client.
+    """
+
+    def __init__(self, profile_name: str | None = None) -> None:
+        self.profile_name = profile_name
+        self.clients: dict[tuple[str, str | None], FakeClient] = {}
+        self.builds: list[tuple[str, str | None]] = []
+        self._responses: dict[str, dict[str, object]] = {}
+
+    def set_response(self, service_name: str, method: str, response: object) -> None:
+        self._responses.setdefault(service_name, {})[method] = response
+
+    def client(
+        self, service_name: str, region_name: str | None = None, config=None
+    ) -> FakeClient:
+        key = (service_name, region_name)
+        existing = self.clients.get(key)
+        if existing is not None:
+            return existing
+        self.builds.append(key)
+        created = FakeClient(service_name, region_name, config)
+        for method, response in self._responses.get(service_name, {}).items():
+            created.set_response(method, response)
+        self.clients[key] = created
+        return created
+
+
+def _multi_readiness(session: RegionKeyedSession, region: str = "us-east-1"):
+    multi = _factory(region=region, session_factory=lambda profile: session)()
+    session.set_response("lambda", "list_functions", {"Functions": []})
+    session.set_response("lambda", "list_tags", {"Tags": {}})
+    session.set_response("ec2", "get_paginator", None)
+    return multi
+
+
+def test_client_for_region_builds_a_client_bound_to_that_region() -> None:
+    session = RegionKeyedSession()
+    multi = _multi_readiness(session)
+    assert multi.region == "us-east-1"
+    regional = multi.client_for_region("eu-west-1")
+    assert regional is not multi
+    assert regional.region == "eu-west-1"
+    assert ("lambda", "eu-west-1") in session.builds
+
+
+def test_client_for_region_caches_one_client_per_region() -> None:
+    """Re-resolving a region must reuse its client, not rebuild it."""
+    session = RegionKeyedSession()
+    multi = _multi_readiness(session)
+    first = multi.client_for_region("eu-west-1")
+    again = multi.client_for_region("eu-west-1")
+    assert first is again
+    assert session.builds.count(("lambda", "eu-west-1")) == 1
+
+
+def test_client_for_region_builds_nothing_until_a_region_is_requested() -> None:
+    """Region clients are lazy, exactly like the root service clients."""
+    session = RegionKeyedSession()
+    _multi_readiness(session)
+    assert not any(region == "eu-west-1" for _, region in session.builds)
+
+
+def test_client_for_region_lets_each_region_read_its_own_functions() -> None:
+    """The point of M13-B: eu-west-1 is read through an eu-west-1 client."""
+    session = RegionKeyedSession()
+    multi = _multi_readiness(session)
+    regional = multi.client_for_region("eu-west-1")
+    session.set_response("lambda", "list_functions", {"Functions": []})
+    regional.list_functions()
+    assert session.clients[("lambda", "eu-west-1")].calls[0][0] == "list_functions"
+    assert session.clients[("lambda", "us-east-1")].calls == []
+
+
+def test_client_for_region_fails_loudly_without_a_region_factory() -> None:
+    """A hand-assembled client must not silently pretend to span regions."""
+    multi = AwsMultiClient(
+        s3=FakeClient("s3", None, None),
+        lambda_client=FakeClient("lambda", None, None),
+        cost_explorer=FakeClient("ce", None, None),
+    )
+    with pytest.raises(RuntimeError, match="cannot address regions"):
+        multi.client_for_region("eu-west-1")
+
+
+def test_client_for_region_adds_no_aws_operation() -> None:
+    """The guard that matters: resolving a region is not an AWS call."""
+    signature = inspect.signature(AwsMultiClient.client_for_region)
+    assert list(signature.parameters) == ["self", "region"]
+    source = inspect.getsource(AwsMultiClient.client_for_region)
+    for forbidden in (
+        "stop_instances",
+        "terminate_instances",
+        "create_tags",
+        "delete_tags",
+        "reboot_instances",
+    ):
+        assert forbidden not in source
+
+
+def test_region_property_is_not_part_of_the_aws_operation_surface() -> None:
+    """``region`` is metadata, so it must not count as an operation."""
+    assert isinstance(AwsMultiClient.region, property)

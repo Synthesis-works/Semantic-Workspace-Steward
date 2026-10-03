@@ -710,7 +710,7 @@ def test_seam_method_takes_no_arbitrary_arguments() -> None:
     assert not [k for k in kinds if k.name.startswith("VAR_")]
 
 
-def test_multi_client_surface_is_exactly_seven_named_operations() -> None:
+def test_multi_client_surface_is_exactly_eight_named_operations() -> None:
     expected = {
         "list_buckets",
         "get_bucket_location",
@@ -719,6 +719,9 @@ def test_multi_client_surface_is_exactly_seven_named_operations() -> None:
         "list_tags",
         "get_cost_and_usage",
         "describe_instances",
+        # M13-B: resolves a client already bound to another region. It issues no
+        # AWS operation itself; it only lets SWS address a region it was asked to.
+        "client_for_region",
     }
     public = {
         name
@@ -731,3 +734,14 @@ def test_multi_client_surface_is_exactly_seven_named_operations() -> None:
 def test_multi_client_has_no_generic_dispatch_helper() -> None:
     for name in ("call", "invoke", "request", "ec2_method", "client", "get_client"):
         assert not hasattr(AwsMultiClient, name), name
+
+
+def test_client_for_region_is_not_a_generic_dispatch_helper() -> None:
+    """The M13-B resolver must stay a named region lookup, not a ``client(svc)``.
+
+    A generic ``client(service_name)`` escape hatch would turn the read-only
+    surface into a way to reach any AWS operation on any service.
+    """
+    parameters = list(inspect.signature(AwsMultiClient.client_for_region).parameters)
+    assert parameters == ["self", "region"]
+    assert "service" not in " ".join(parameters)

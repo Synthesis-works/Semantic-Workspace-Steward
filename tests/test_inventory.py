@@ -921,6 +921,47 @@ def _ec2(client, *, regions=("us-east-1",), trace=None, limit=None):
     ).collect(limit=limit)
 
 
+class _RegionalEc2Seam:
+    def __init__(self, region, owner, instance):
+        self._region = region
+        self._owner = owner
+        self._instance = instance
+
+    def describe_instances(self):
+        self._owner.regions_read.append(self._region)
+        return FakeEc2Paginator(
+            [_page(_reservation(instances=[self._instance]))]
+        )
+
+
+class RegionAwareEc2Client:
+    """Region-addressable EC2 client, mirroring ``AwsMultiClient`` in M13-B.
+
+    Each region gets its own ``describe_instances`` seam returning only that
+    region's instances, so a multi-region assertion proves each region was
+    genuinely read rather than one region being re-read and relabelled.
+    """
+
+    def __init__(self):
+        self.regions_read: list[str] = []
+        self._by_region: dict[str, _RegionalEc2Seam] = {}
+
+    def client_for_region(self, region):
+        if region not in self._by_region:
+            instance = _instance(f"i-{region}")
+            instance["State"]["Name"] = "running"
+            self._by_region[region] = _RegionalEc2Seam(region, self, instance)
+        return self._by_region[region]
+
+    def describe_instances(self):
+        # Reached only if the collector ignored client_for_region and used the
+        # un-regioned seam. Recording "" makes that mistake visible.
+        self.regions_read.append("")
+        return FakeEc2Paginator(
+            [_page(_reservation(instances=[_instance("i-blind")]))]
+        )
+
+
 def _succeeded_events(trace):
     return [
         e
@@ -1174,19 +1215,39 @@ def test_ec2_drains_every_page_of_its_single_region():
 
 
 def test_ec2_refuses_a_multi_region_request_instead_of_mislabeling_instances():
-    """The seam is bound to one region, so a loop would fabricate locations.
+    """A region-blind client cannot honestly cover several regions.
 
-    ``AwsMultiClient.describe_instances()`` takes no region argument. Iterating
-    ``regions`` against it re-reads the same configured region and stamps each
-    copy with a different ``region``, so one instance appears twice under two
-    different locations -- and the second region is never actually read at all.
+    An EC2 response carries no region of its own, so the requested region is
+    the only record of where a returned instance lives. Reading a client bound
+    to one region and stamping the result with another would fabricate the
+    identity a future ``ec2:StopInstances`` call would be resolved from.
     """
     client = FakeEc2Client([_page(_reservation(instances=[_instance("i-1")]))])
-    with pytest.raises(ValueError, match="exactly one region"):
-        Ec2InstanceCollector(client, regions=["us-east-1", "us-west-2"])
+    # Construction succeeds (M13-B removed the constructor-level restriction).
+    collector = Ec2InstanceCollector(client, regions=["us-east-1", "us-west-2"])
+    with pytest.raises(ValueError, match="cannot address regions"):
+        collector.collect()
     assert client.describe_instances_calls == 0
-    with pytest.raises(ValueError, match="exactly one region"):
+    with pytest.raises(ValueError, match="cannot address regions"):
         _ec2(client, regions=["us-east-1", "eu-west-1", "ap-south-1"])
+
+
+def test_ec2_reads_each_requested_region_through_its_own_client():
+    """M13-B: a region-addressable client makes multi-region collection honest."""
+    client = RegionAwareEc2Client()
+    records = _ec2(client, regions=["us-east-1", "eu-west-1"])
+    assert client.regions_read == ["us-east-1", "eu-west-1"]
+    assert {r.resource_id: r.region for r in records} == {
+        "i-us-east-1": "us-east-1",
+        "i-eu-west-1": "eu-west-1",
+    }
+
+
+def test_ec2_single_region_still_works_with_a_region_aware_client():
+    client = RegionAwareEc2Client()
+    records = _ec2(client, regions=["us-east-1"])
+    assert client.regions_read == ["us-east-1"]
+    assert [r.resource_id for r in records] == ["i-us-east-1"]
 
 
 def test_ec2_empty_account_succeeds_with_count_zero():

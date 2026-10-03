@@ -187,10 +187,16 @@ def collect_workspace(
     It defaults to False and is recorded in the snapshot's ``resource_types``
     only when requested, so the snapshot never claims an EC2 read it did not
     perform. The injected ``client`` must expose ``describe_instances`` when it
-    is requested. It also requires exactly one entry in ``regions``, because
-    that client seam is bound to a single configured region; a multi-region
-    request raises ValueError before any collector runs rather than
-    misattributing instances to regions that were never read.
+    is requested.
+
+    Regional coverage (M13-B): a regional boto3 client answers for exactly one
+    region, so the regional collectors resolve a client per requested region
+    when the injected client exposes ``client_for_region``
+    (``aws.AwsMultiClient`` does). An injected client that cannot address
+    regions is never stretched to pretend: Lambda records the uncovered regions
+    as an incomplete collection, and EC2 raises, because an EC2 response carries
+    no region of its own and a fabricated one would misidentify an instance a
+    future stop would target.
 
     Cost collection (M2C-E): passing ``collect_cost=True`` requires
     ``cost_end_date`` (a ``datetime.date``), otherwise ValueError. The
@@ -205,14 +211,6 @@ def collect_workspace(
     for region in regions:
         if not isinstance(region, str) or not region.strip():
             raise ValueError("workspace regions must be non-empty strings")
-
-    if collect_ec2 and len(regions) > 1:
-        raise ValueError(
-            "collect_ec2=True requires exactly one region: the injected "
-            "describe_instances() seam is bound to a single configured region, "
-            "so a multi-region run would repeat one region's instances under "
-            "fabricated region labels"
-        )
 
     if now is not None and now.tzinfo is None:
         raise ValueError("now must be timezone-aware")

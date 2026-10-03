@@ -6,10 +6,12 @@ through constructor-injected in-memory clients with canned responses.
 
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timezone
 
 import pytest
 
+from sws_agent import inventory as inventory_module
 from sws_agent.constants import (
     CollectionFailureCategory,
     SWSResourceType,
@@ -18,6 +20,7 @@ from sws_agent.constants import (
 )
 from sws_agent.inventory import (
     INVENTORY_COLLECTORS,
+    Ec2InstanceCollector,
     LambdaFunctionCollector,
     S3BucketCollector,
     UnsupportedResourceTypeError,
@@ -161,6 +164,7 @@ def test_inventory_collectors_registered_for_supported_types():
     assert set(INVENTORY_COLLECTORS) == {
         SWSResourceType.S3_BUCKET,
         SWSResourceType.LAMBDA_FUNCTION,
+        SWSResourceType.EC2_INSTANCE,
     }
 
 
@@ -726,12 +730,26 @@ def test_collect_all_returns_supported_types_in_order():
 def test_unsupported_resource_types_raise():
     client = FakeS3Client(buckets=[])
     for resource_type in (
-        SWSResourceType.EC2_INSTANCE,
         SWSResourceType.EBS_VOLUME,
         SWSResourceType.COST_DATA,
     ):
         with pytest.raises(UnsupportedResourceTypeError):
             collect_resource_type(resource_type, client=client)
+
+
+def test_ec2_collector_is_registered_but_not_in_the_default_run():
+    """Registration and default scope are different claims.
+
+    ``INVENTORY_COLLECTORS`` says "SWS implements inventory for this type".
+    ``collect_all`` says "this run read this type". EC2 must satisfy the first
+    and be absent from the second unless asked for, so a caller can never read
+    an unrequested EC2 pass as "the account has no instances".
+    """
+    assert SWSResourceType.EC2_INSTANCE in INVENTORY_COLLECTORS
+    results = collect_all(
+        client=FakeS3Client(buckets=[]), regions=["us-east-1"], trace=TraceRecorder()
+    )
+    assert SWSResourceType.EC2_INSTANCE not in results
 
 
 def _failed_events(trace):
@@ -818,3 +836,422 @@ def test_normalize_limit_public_routine_defaults_validates_passthrough():
     for bad in (0, -1, "5", True, 3.5):
         with pytest.raises(ValueError):
             normalize_limit(bad)
+
+
+# ---------------------------------------------------------------------------
+# EC2 (M13-A) — read-only, one DescribeInstances pass, no mutating operation
+# ---------------------------------------------------------------------------
+
+ACCOUNT = "123456789012"
+LAUNCH_TIME = datetime(2026, 2, 1, 9, 30, tzinfo=timezone.utc)
+
+
+class FakeEc2Paginator:
+    """Fake ``ec2:DescribeInstances`` paginator yielding canned pages."""
+
+    def __init__(self, pages, *, error=None):
+        self._pages = list(pages)
+        self._error = error
+        self.paginate_calls = 0
+
+    def paginate(self, **kwargs):
+        self.paginate_calls += 1
+        if self._error is not None:
+            raise self._error
+        return iter(self._pages)
+
+
+class FakeEc2Client:
+    """Stand-in for the ``AwsMultiClient.describe_instances()`` seam.
+
+    Mirrors the real seam: it takes no arguments and returns something with
+    ``.paginate(...)``. Every page handed out is recorded so a test can assert
+    how far the collector actually drained.
+    """
+
+    def __init__(self, pages=None, *, paginator_error=None, seam_error=None):
+        self.describe_instances_calls = 0
+        self._paginators = []
+        self._page_sets = [list(pages or [])]
+        self._paginator_error = paginator_error
+        self._seam_error = seam_error
+
+    def set_pages(self, pages):
+        """Replace the pages the *next* ``describe_instances()`` call yields."""
+        self._page_sets.append(list(pages))
+
+    def describe_instances(self):
+        self.describe_instances_calls += 1
+        if self._seam_error is not None:
+            raise self._seam_error
+        pages = self._page_sets.pop(0) if self._page_sets else []
+        paginator = FakeEc2Paginator(pages, error=self._paginator_error)
+        self._paginators.append(paginator)
+        return paginator
+
+
+def _instance(
+    instance_id="i-0abc123def4567890",
+    state="running",
+    **extra,
+):
+    payload = {}
+    if instance_id is not None:
+        payload["InstanceId"] = instance_id
+    if state is not None:
+        payload["State"] = {"Code": 16, "Name": state}
+    payload.update(extra)
+    return payload
+
+
+def _reservation(owner_id=ACCOUNT, instances=None):
+    payload = {"Instances": list(instances or [])}
+    if owner_id is not None:
+        payload["OwnerId"] = owner_id
+    return payload
+
+
+def _page(*reservations):
+    return {"Reservations": list(reservations)}
+
+
+def _ec2(client, *, regions=("us-east-1",), trace=None, limit=None):
+    return Ec2InstanceCollector(
+        client, regions=list(regions), trace=trace
+    ).collect(limit=limit)
+
+
+def _succeeded_events(trace):
+    return [
+        e
+        for e in trace
+        if e.event_type is TraceEventType.INVENTORY_QUERY
+        and e.status is TraceStatus.SUCCEEDED
+    ]
+
+
+def test_ec2_maps_instance_record():
+    client = FakeEc2Client([_page(_reservation(instances=[_instance()]))])
+    records = _ec2(client)
+    assert len(records) == 1
+    record = records[0]
+    assert isinstance(record, ResourceRecord)
+    assert record.resource_id == "i-0abc123def4567890"
+    assert record.resource_type is SWSResourceType.EC2_INSTANCE
+    assert record.name == "i-0abc123def4567890"
+    assert record.region == "us-east-1"
+    assert record.state == "running"
+    assert record.metrics == {}
+
+
+def test_ec2_reads_account_identity_from_the_reservation_not_the_instance():
+    """``OwnerId`` lives on the reservation, so flattening must carry it."""
+    client = FakeEc2Client([_page(_reservation(instances=[_instance()]))])
+    assert _ec2(client)[0].account_id == ACCOUNT
+
+
+def test_ec2_never_invents_an_account_when_owner_id_is_absent_or_malformed():
+    for owner_id in (None, "", "12345", "abcdefghijkl", 123456789012):
+        client = FakeEc2Client(
+            [_page(_reservation(owner_id=owner_id, instances=[_instance()]))]
+        )
+        records = _ec2(client)
+        assert len(records) == 1, owner_id  # the instance is still identified
+        assert records[0].account_id is None, owner_id
+
+
+def test_ec2_absent_owner_id_is_not_reported_as_a_collection_failure():
+    """The instance is fully identified without an account, so nothing failed."""
+    trace = TraceRecorder()
+    client = FakeEc2Client(
+        [_page(_reservation(owner_id=None, instances=[_instance()]))]
+    )
+    _ec2(client, trace=trace)
+    assert _failed_events(trace) == []
+    assert _succeeded_events(trace)[0].metadata["count"] == 1
+
+
+def test_ec2_leaves_owner_tag_none_and_fabricates_no_tag_lookup():
+    """The collector has no tag API, so an absent tag is not a finding.
+
+    ``owner_tag`` stays ``None`` because no lookup was attempted -- and
+    because attempting-and-failing would have been dishonest, no ENRICHMENT
+    failure is traced either. Policy reads this through
+    ``OWNER_TAG_COLLECTED_RESOURCE_TYPES`` instead of inferring it.
+    """
+    trace = TraceRecorder()
+    client = FakeEc2Client([_page(_reservation(instances=[_instance()]))])
+    record = _ec2(client, trace=trace)[0]
+    assert record.owner_tag is None
+    assert _failed_events(trace) == []
+    source = inspect.getsource(Ec2InstanceCollector)
+    assert "describe_tags" not in source
+    assert "create_tags" not in source
+
+
+def test_ec2_does_not_construct_an_arn():
+    """``DescribeInstances`` returns no ARN; M11 owns that construction rule."""
+    client = FakeEc2Client([_page(_reservation(instances=[_instance()]))])
+    assert _ec2(client)[0].arn is None
+
+
+def test_ec2_state_is_passed_through_byte_for_byte():
+    """The collector records; it never decides what a state means.
+
+    Exact-string pass-through is what lets the policy engine reject a state it
+    does not recognize instead of the collector quietly normalizing one into a
+    neighbour.
+    """
+    for state in ("running", "pending", "stopping", "RUNNING", "running "):
+        client = FakeEc2Client([_page(_reservation(instances=[_instance(state=state)]))])
+        assert _ec2(client)[0].state == state, state
+
+
+def test_ec2_records_no_state_rather_than_a_default():
+    for state in (None, "", "   "):
+        client = FakeEc2Client([_page(_reservation(instances=[_instance(state=state)]))])
+        assert _ec2(client)[0].state is None, state
+
+
+def test_ec2_missing_state_block_records_no_state():
+    client = FakeEc2Client(
+        [
+            _page(
+                _reservation(
+                    instances=[{"InstanceId": "i-nostate", "State": {"Code": 0}}]
+                )
+            )
+        ]
+    )
+    assert _ec2(client)[0].state is None
+
+
+def test_ec2_uses_aware_launch_time_as_created_at():
+    client = FakeEc2Client(
+        [_page(_reservation(instances=[_instance(LaunchTime=LAUNCH_TIME)]))]
+    )
+    assert _ec2(client)[0].created_at == LAUNCH_TIME
+
+
+def test_ec2_naive_launch_time_never_becomes_an_authoritative_timestamp():
+    """A naive timestamp is ambiguous, so ``created_at`` stays None.
+
+    ``canonicalize_resources`` rejects naive timestamps outright, so accepting
+    one here would abort an entire workspace collection. The observed value is
+    still preserved in ``raw`` rather than being discarded.
+    """
+    naive = datetime(2026, 2, 1, 9, 30)
+    client = FakeEc2Client(
+        [_page(_reservation(instances=[_instance(LaunchTime=naive)]))]
+    )
+    record = _ec2(client)[0]
+    assert record.created_at is None
+    assert record.raw["launch_time"] == naive.isoformat()
+
+
+def test_ec2_non_datetime_launch_time_is_ignored_not_raised():
+    client = FakeEc2Client(
+        [_page(_reservation(instances=[_instance(LaunchTime="2026-02-01")]))]
+    )
+    assert _ec2(client)[0].created_at is None
+
+
+def test_ec2_raw_carries_only_the_approved_attribute_set():
+    client = FakeEc2Client(
+        [
+            _page(
+                _reservation(
+                    instances=[
+                        _instance(
+                            InstanceType="t3.micro",
+                            VpcId="vpc-1",
+                            SubnetId="subnet-1",
+                            PrivateIpAddress="10.0.0.4",
+                            Placement={"AvailabilityZone": "us-east-1a"},
+                            # Fields SWS is not authorized to surface.
+                            KeyName="prod-key",
+                            SecurityGroups=[{"GroupId": "sg-1"}],
+                            UserData="#!/bin/sh\n",
+                        )
+                    ]
+                )
+            )
+        ]
+    )
+    raw = _ec2(client)[0].raw
+    assert raw["instance_type"] == "t3.micro"
+    assert raw["vpc_id"] == "vpc-1"
+    assert raw["subnet_id"] == "subnet-1"
+    assert raw["private_ip_address"] == "10.0.0.4"
+    assert raw["availability_zone"] == "us-east-1a"
+    assert raw["state_code"] == 16
+    for leaked in ("KeyName", "SecurityGroups", "UserData", "key_name", "user_data"):
+        assert leaked not in raw, leaked
+
+
+def test_ec2_records_state_code_only_when_aws_sent_it():
+    client = FakeEc2Client(
+        [_page(_reservation(instances=[{"InstanceId": "i-x", "State": {"Name": "running"}}]))]
+    )
+    assert "state_code" not in _ec2(client)[0].raw
+
+
+def test_ec2_skips_instances_without_a_usable_instance_id():
+    for bad in (None, "", "   "):
+        trace = TraceRecorder()
+        client = FakeEc2Client([_page(_reservation(instances=[_instance(instance_id=bad)]))])
+        assert _ec2(client, trace=trace) == []
+        failures = _failed_events(trace)
+        assert len(failures) == 1
+        assert failures[0].metadata["category"] == CollectionFailureCategory.PARSE.value
+
+
+def test_ec2_skips_a_malformed_instance_item():
+    trace = TraceRecorder()
+    client = FakeEc2Client([_page(_reservation(instances=["not-a-dict"]))])
+    assert _ec2(client, trace=trace) == []
+    assert _failed_events(trace)[0].metadata["category"] == (
+        CollectionFailureCategory.PARSE.value
+    )
+
+
+def test_ec2_keeps_good_instances_and_skips_only_the_unidentifiable_ones():
+    trace = TraceRecorder()
+    client = FakeEc2Client(
+        [_page(_reservation(instances=[_instance(), _instance(instance_id=None)]))]
+    )
+    records = _ec2(client, trace=trace)
+    assert [r.resource_id for r in records] == ["i-0abc123def4567890"]
+    assert len(_failed_events(trace)) == 1
+
+
+def test_ec2_paginator_failure_is_a_primary_failure():
+    trace = TraceRecorder()
+    client = FakeEc2Client([_page()], paginator_error=RuntimeError("boom"))
+    assert _ec2(client, trace=trace) == []
+    failures = _failed_events(trace)
+    assert len(failures) == 1
+    assert failures[0].metadata["category"] == CollectionFailureCategory.PRIMARY.value
+
+
+def test_ec2_missing_seam_is_a_primary_failure_not_a_crash():
+    """A client without ``describe_instances`` fails the collection honestly."""
+    trace = TraceRecorder()
+    assert _ec2(FakeS3Client(buckets=[]), trace=trace) == []
+    assert _failed_events(trace)[0].metadata["category"] == (
+        CollectionFailureCategory.PRIMARY.value
+    )
+
+
+def test_ec2_malformed_page_is_a_primary_failure_never_an_empty_one():
+    for page in ("not-a-dict", {"Reservations": "not-a-list"}, {"Reservations": ["x"]}):
+        trace = TraceRecorder()
+        client = FakeEc2Client([page])
+        assert _ec2(client, trace=trace) == [], page
+        assert _failed_events(trace)[0].metadata["category"] == (
+            CollectionFailureCategory.PRIMARY.value
+        )
+
+
+def test_ec2_requires_an_explicit_region_list():
+    for regions in (None, [], [""], [None]):
+        with pytest.raises(ValueError, match="region"):
+            Ec2InstanceCollector(FakeEc2Client(), regions=regions)
+
+
+def test_ec2_drains_every_page_of_its_single_region():
+    client = FakeEc2Client(
+        [
+            _page(_reservation(instances=[_instance("i-1")])),
+            _page(_reservation(instances=[_instance("i-2")])),
+            _page(),
+        ]
+    )
+    records = _ec2(client, regions=["us-east-1"])
+    assert [r.resource_id for r in records] == ["i-1", "i-2"]
+    assert {r.region for r in records} == {"us-east-1"}
+    assert client.describe_instances_calls == 1
+
+
+def test_ec2_refuses_a_multi_region_request_instead_of_mislabeling_instances():
+    """The seam is bound to one region, so a loop would fabricate locations.
+
+    ``AwsMultiClient.describe_instances()`` takes no region argument. Iterating
+    ``regions`` against it re-reads the same configured region and stamps each
+    copy with a different ``region``, so one instance appears twice under two
+    different locations -- and the second region is never actually read at all.
+    """
+    client = FakeEc2Client([_page(_reservation(instances=[_instance("i-1")]))])
+    with pytest.raises(ValueError, match="exactly one region"):
+        Ec2InstanceCollector(client, regions=["us-east-1", "us-west-2"])
+    assert client.describe_instances_calls == 0
+    with pytest.raises(ValueError, match="exactly one region"):
+        _ec2(client, regions=["us-east-1", "eu-west-1", "ap-south-1"])
+
+
+def test_ec2_empty_account_succeeds_with_count_zero():
+    trace = TraceRecorder()
+    client = FakeEc2Client([{"Reservations": []}])
+    assert _ec2(client, trace=trace) == []
+    successes = _succeeded_events(trace)
+    assert successes[0].metadata["count"] == 0
+    assert "truncated" not in successes[0].metadata
+
+
+def test_ec2_reaching_the_limit_on_the_final_page_is_not_truncation():
+    """The exact-limit-on-last-page case must never claim truncated data.
+
+    ``count == limit`` is the shape that a naive implementation would report
+    as truncation; doing so would downgrade every policy decision built on the
+    snapshot for a workspace that was in fact read completely.
+    """
+    trace = TraceRecorder()
+    client = FakeEc2Client(
+        [_page(_reservation(instances=[_instance("i-1"), _instance("i-2")]))]
+    )
+    assert len(_ec2(client, trace=trace, limit=2)) == 2
+    assert "truncated" not in _succeeded_events(trace)[0].metadata
+
+
+def test_ec2_stopping_mid_page_with_items_left_is_truncation():
+    trace = TraceRecorder()
+    client = FakeEc2Client(
+        [_page(_reservation(instances=[_instance("i-1"), _instance("i-2"), _instance("i-3")]))]
+    )
+    assert len(_ec2(client, trace=trace, limit=2)) == 2
+    assert _succeeded_events(trace)[0].metadata["truncated"] is True
+
+
+def test_ec2_stopping_at_a_page_boundary_with_another_page_left_is_truncation():
+    trace = TraceRecorder()
+    client = FakeEc2Client(
+        [
+            _page(_reservation(instances=[_instance("i-1")])),
+            _page(_reservation(instances=[_instance("i-2")])),
+        ]
+    )
+    assert len(_ec2(client, trace=trace, limit=1)) == 1
+    assert _succeeded_events(trace)[0].metadata["truncated"] is True
+
+
+def test_ec2_collection_is_deterministic_and_leaves_the_client_untouched():
+    pages = [_page(_reservation(instances=[_instance("i-2"), _instance("i-1")]))]
+    first = _ec2(FakeEc2Client(pages))
+    second = _ec2(FakeEc2Client(pages))
+    assert [r.model_dump() for r in first] == [r.model_dump() for r in second]
+    assert [r.resource_id for r in first] == ["i-2", "i-1"]  # no hidden sorting
+
+
+def test_ec2_collector_names_no_mutating_ec2_operation():
+    """M13-A stays on the read side of the boundary.
+
+    The seam exposes exactly one EC2 read, so a collector that could reach
+    ``stop_instances`` would be a claim about production capability this
+    milestone explicitly does not make.
+    """
+    source = inspect.getsource(inventory_module).lower()
+    assert "stop_instances" not in source
+    assert "modify_instance_attribute" not in source
+    assert "terminate_instances" not in source
+    for name in dir(Ec2InstanceCollector):
+        assert "stop" not in name.lower(), name

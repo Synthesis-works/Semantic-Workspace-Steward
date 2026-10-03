@@ -1,4 +1,5 @@
-"""Read-only AWS inventory mapping for S3 buckets and Lambda functions.
+"""Read-only AWS inventory mapping for S3 buckets, Lambda functions, and EC2
+instances.
 
 Fresh SWS module (no SMS reuse). Collectors implement the existing
 InventoryCollector protocol from interfaces.py but accept a constructor-
@@ -17,16 +18,29 @@ SUCCEEDED event carries ``truncated: True`` only when collection genuinely
 encountered more data than it returned. ``truncated`` is never inferred
 from ``count == limit`` alone.
 
-Scope (approved M2B):
+Scope (approved M2B, extended read-only by M13-A):
   - S3:  list_buckets, get_bucket_location, get_bucket_tagging.
          Versioning/encryption/policy/public-access enrichment is deferred.
   - Lambda: list_functions (paginated), list_tags.
          Environment variables are never collected.
+  - EC2: describe_instances (paginated), read-only, opt-in per run.
+         Owner tags are never collected (see ``Ec2InstanceCollector``).
+
+M13-A opt-in rule. EC2 collection is opt-in (``collect_ec2=True``) rather than
+part of the default run, for the same reason cost collection is opt-in: the
+read is not always available. ``ec2:DescribeInstances`` is the only EC2
+permission SWS uses, it is scoped to ``Resource: "*"``, and an account without
+it would otherwise make every workspace snapshot permanently ``partial`` for a
+service the caller did not ask about. The default run therefore still reports
+exactly the types it attempted: ``resource_types`` never lists a type whose
+collector was not invoked.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from datetime import datetime
+from itertools import chain
+from typing import Any, Callable, Iterable, Iterator
 
 from .constants import (
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
@@ -34,6 +48,7 @@ from .constants import (
     SWSResourceType,
     TraceEventType,
 )
+from .ec2_observation import ec2_instance_facts
 from .interfaces import TraceSink
 from .models import ResourceRecord
 
@@ -136,6 +151,46 @@ class _InventoryCollectorBase:
             self._trace.fail(
                 TraceEventType.INVENTORY_QUERY, message, metadata=metadata
             )
+
+
+_EXHAUSTED: Any = object()
+"""Sentinel distinguishing "the iterator ended" from a page that is ``None``."""
+
+
+def _collect_items(
+    pages: Iterable[tuple[list[dict[str, Any]], bool]],
+    map_item: Callable[[dict[str, Any]], ResourceRecord | None],
+    *,
+    remaining: int,
+) -> tuple[list[ResourceRecord], bool]:
+    """Drain ``pages`` into records, honoring ``remaining``.
+
+    Returns ``(records, truncated)``. ``truncated`` is True **only** when this
+    drain genuinely left data behind: either a page was broken mid-way with
+    items not yet mapped, or the last page consumed reported that more pages
+    follow. Both signals are supplied by the caller's page source, so neither
+    is ever inferred from ``len(records) == remaining`` -- reaching the limit
+    exactly at the end of the final page is not truncation.
+
+    One implementation for every paginated collector, so the truncation
+    contract cannot drift between them: the exactness of that flag is what
+    ``WorkspaceSnapshot.truncated`` and the policy engine's confidence both
+    rest on.
+    """
+    records: list[ResourceRecord] = []
+    truncated = False
+    for items, has_more in pages:
+        for item in items:
+            if len(records) >= remaining:
+                truncated = True  # mid-page break with unconsumed items
+                break
+            record = map_item(item)
+            if record is not None:
+                records.append(record)
+        if len(records) >= remaining:
+            truncated = truncated or has_more
+            break
+    return records, truncated
 
 
 class S3BucketCollector(_InventoryCollectorBase):
@@ -291,27 +346,9 @@ class LambdaFunctionCollector(_InventoryCollectorBase):
         ``count == limit`` alone (reaching the limit on the final page with
         no remaining data is not truncation).
         """
-        records: list[ResourceRecord] = []
-        marker: str | None = None
-        truncated = False
-        while True:
-            response = self._client.list_functions(
-                **({"Marker": marker} if marker else {})
-            )
-            functions = response.get("Functions") or []
-            for function in functions:
-                if len(records) >= remaining:
-                    truncated = True  # mid-page break with unconsumed functions
-                    break
-                record = self._map_function(function)
-                if record is not None:
-                    records.append(record)
-            marker = response.get("NextMarker")
-            if marker is None or len(records) >= remaining:
-                if len(records) >= remaining and marker is not None:
-                    truncated = True  # stopped at the limit with more pages
-                break
-        return records, truncated
+        return _collect_items(
+            _lambda_pages(self._client), self._map_function, remaining=remaining
+        )
 
     def _map_function(self, function: dict) -> ResourceRecord | None:
         arn = function.get("FunctionArn")
@@ -374,11 +411,268 @@ def _function_raw(function: dict) -> dict[str, Any]:
     }
 
 
+def _lambda_pages(client: Any) -> Iterator[tuple[list[dict[str, Any]], bool]]:
+    """Yield ``(functions, has_more_pages)`` for each Lambda page.
+
+    ``has_more_pages`` is the exact answer to "is there another page after
+    this one", taken from the ``NextMarker`` Lambda itself reported. It is not
+    inferred from the page being full.
+    """
+    marker: str | None = None
+    while True:
+        response = client.list_functions(**({"Marker": marker} if marker else {}))
+        next_marker = response.get("NextMarker")
+        yield response.get("Functions") or [], next_marker is not None
+        if next_marker is None:
+            return
+        marker = next_marker
+
+
+def _ec2_instance_pages(
+    paginator: Any,
+) -> Iterator[tuple[list[tuple[Any, Any]], bool]]:
+    """Yield ``((instance, owner_id), ...)`` plus a has-more flag per page.
+
+    The boto3 paginator reports "there is more" only by yielding it, so
+    ``has_more_pages`` is established by pulling the next page and pushing it
+    back. That is a real read of the iterator rather than an inference from a
+    full page, which is what keeps ``truncated`` honest when the limit lands
+    exactly on a page boundary.
+
+    Each instance is paired with the ``OwnerId`` of the reservation enclosing
+    it. That association is the only place the account identity exists:
+    ``DescribeInstances`` puts ``OwnerId`` on the reservation, so flattening a
+    page without carrying it along would silently discard the account and
+    force ``account_id=None`` on every record.
+
+    A malformed page raises, which the collector's primary-failure handler
+    turns into an honest failed collection: an unreadable response is never
+    reported as an empty one.
+    """
+    iterator = iter(paginator.paginate())
+    while True:
+        page = next(iterator, _EXHAUSTED)
+        if page is _EXHAUSTED:
+            return
+        if not isinstance(page, dict):
+            raise ValueError(
+                f"DescribeInstances returned a malformed page: {type(page).__name__}"
+            )
+        reservations = page.get("Reservations") or []
+        instances: list[tuple[Any, Any]] = []
+        for reservation in reservations:
+            if not isinstance(reservation, dict):
+                raise ValueError(
+                    "DescribeInstances returned a malformed reservation: "
+                    f"{type(reservation).__name__}"
+                )
+            owner_id = reservation.get("OwnerId")
+            instances.extend(
+                (instance, owner_id)
+                for instance in (reservation.get("Instances") or [])
+            )
+        following = next(iterator, _EXHAUSTED)
+        has_more = following is not _EXHAUSTED
+        if has_more:
+            iterator = chain((following,), iterator)
+        yield instances, has_more
+
+
+class Ec2InstanceCollector(_InventoryCollectorBase):
+    """Collects a bounded inventory of EC2 instances for one region, read-only.
+
+    Added by M13-A, and deliberately the smallest EC2 read surface that can
+    put an instance into a workspace snapshot: one logical
+    ``ec2:DescribeInstances`` operation, drained to completion through the
+    injected paginator seam (``aws.AwsMultiClient``). No mutating EC2
+    operation is called, named, or reachable from here, and
+    ``PotentialAction.STOP_RESOURCE`` still has no registered handler.
+
+    Honesty notes specific to EC2:
+
+    - Exactly one region is accepted, and that is a limit of the injected seam
+      rather than of EC2. ``AwsMultiClient.describe_instances()`` takes no
+      region argument and is bound to a single configured region, so a
+      multi-region loop would re-read that one region and stamp each copy with
+      a different ``region`` -- fabricating instance locations and duplicating
+      rows in the same snapshot. Refusing the request is the only honest
+      option until the seam can address a region per call; under-collecting
+      silently would be worse still, and stopping an instance is an action that
+      must never rest on a misattributed region.
+    - ``state`` is ``State.Name`` passed through byte-for-byte, or ``None``
+      when AWS reported no state. It is never lowercased, mapped through
+      ``Ec2InstanceState``, or defaulted to a benign value -- an instance whose
+      state could not be read must reach policy as a record that says so.
+    - ``resource_id`` is the ``InstanceId`` AWS returned. An item with no
+      usable ``InstanceId`` is unidentifiable, so it is skipped with a PARSE
+      failure rather than recorded under a synthesized id.
+    - ``account_id`` is the enclosing reservation's ``OwnerId``, an observed
+      fact, recorded only when it is a well-formed 12-digit account. An absent
+      or malformed ``OwnerId`` is not a collection failure: the instance is
+      still perfectly identified by its id, so the record is kept and simply
+      carries no account identity.
+    - ``arn`` is left ``None``. ``DescribeInstances`` returns no ARN, and
+      M11 already documents the construction rule for one
+      (``ec2_observation.Ec2InstanceObservationProvider``). Constructing it a
+      second time here would create a second definition of the same fact.
+    - ``owner_tag`` is always ``None``, and that is a statement about SWS
+      rather than about the resource: this collector has no tag lookup, so it
+      cannot know whether an instance carries an ``Owner`` tag. No failure is
+      traced, because nothing failed. ``constants.OWNER_TAG_COLLECTED_RESOURCE_TYPES``
+      records this so the policy engine never reads the absence as a finding.
+    - ``created_at`` is ``LaunchTime`` when AWS sent a timezone-aware
+      ``datetime``. A naive or non-datetime ``LaunchTime`` leaves
+      ``created_at`` ``None`` rather than becoming an ambiguous authoritative
+      timestamp; the observed value is still preserved in ``raw``.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        regions: list[str] | None = None,
+        trace: TraceSink | None = None,
+    ):
+        super().__init__(SWSResourceType.EC2_INSTANCE, trace=trace)
+        if not regions:
+            raise ValueError("at least one AWS region is required to collect EC2 inventory")
+        for region in regions:
+            if not isinstance(region, str) or not region.strip():
+                raise ValueError("EC2 inventory regions must be non-empty strings")
+        if len(regions) > 1:
+            raise ValueError(
+                "EC2 inventory requires exactly one region: the injected "
+                "describe_instances() seam takes no region and is bound to one "
+                "configured region, so collecting several would return the same "
+                "instances repeatedly under fabricated region labels"
+            )
+        self._client = client
+        self._regions = list(regions)
+
+    def collect(self, *, limit: int | None = None) -> list[ResourceRecord]:
+        limit = normalize_limit(limit)
+        self._trace_start(f"collecting {self._resource_type.value} inventory")
+        try:
+            records, truncated = self._collect_region(
+                self._client.describe_instances(),
+                self._regions[0],
+                limit,
+            )
+        except Exception as exc:  # primary list operation failure (fail-closed)
+            self._trace_fail(f"{self._resource_type.value} inventory failed: {exc}")
+            return []
+        self._trace_succeed(len(records), truncated=truncated)
+        return records
+
+    def _collect_region(
+        self, paginator: Any, region: str, remaining: int
+    ) -> tuple[list[ResourceRecord], bool]:
+        return _collect_items(
+            _ec2_instance_pages(paginator),
+            lambda item: self._map_instance(item, region),
+            remaining=remaining,
+        )
+
+    def _map_instance(
+        self, item: tuple[Any, Any], region: str
+    ) -> ResourceRecord | None:
+        instance, owner_id = item
+        if not isinstance(instance, dict):
+            self._trace_fail(
+                f"EC2 instance is malformed; skipped: {type(instance).__name__}",
+                resource_id="unknown",
+                category=CollectionFailureCategory.PARSE,
+            )
+            return None
+        instance_id = instance.get("InstanceId")
+        if not isinstance(instance_id, str) or not instance_id.strip():
+            self._trace_fail(
+                "EC2 instance has no InstanceId; skipped",
+                resource_id="unknown",
+                category=CollectionFailureCategory.PARSE,
+            )
+            return None
+        return ResourceRecord(
+            resource_id=instance_id,
+            resource_type=SWSResourceType.EC2_INSTANCE,
+            name=instance_id,
+            region=region,
+            owner_tag=None,
+            created_at=_aware_launch_time(instance.get("LaunchTime")),
+            state=_instance_state(instance),
+            metrics={},
+            raw=_instance_raw(instance),
+            account_id=_well_formed_account_id(owner_id),
+        )
+
+
+def _well_formed_account_id(owner_id: Any) -> str | None:
+    """Return ``owner_id`` when it is a 12-digit AWS account id, else None.
+
+    ``ResourceRecord.account_id`` is pattern-constrained to 12 digits, and a
+    surprising value is better recorded as absent than raised: one odd
+    reservation must not abort a whole workspace collection. No account is ever
+    invented for a response that did not carry one.
+    """
+    if isinstance(owner_id, str) and len(owner_id) == 12 and owner_id.isdigit():
+        return owner_id
+    return None
+
+
+def _instance_state(instance: dict[str, Any]) -> str | None:
+    """Return ``State.Name`` exactly as AWS sent it, or None when absent.
+
+    Never normalized, cased, trimmed, or substituted: the policy engine owns
+    the mapping from a recorded state to an action, and a collector that
+    pre-decided which state it was looking at would make that decision twice.
+    """
+    state = instance.get("State")
+    if not isinstance(state, dict):
+        return None
+    name = state.get("Name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return name
+
+
+def _aware_launch_time(value: Any) -> datetime | None:
+    """Return ``value`` when it is a timezone-aware datetime, else None.
+
+    ``canonicalize_resources`` rejects naive timestamps rather than guessing a
+    timezone. Filtering here keeps one malformed ``LaunchTime`` from aborting
+    an entire workspace collection while still recording what AWS sent.
+    """
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value
+    return None
+
+
+def _instance_raw(instance: dict[str, Any]) -> dict[str, Any]:
+    """Approved, non-secret instance fields only.
+
+    The optional attribute set comes from ``ec2_instance_facts``, the same
+    list the M11 observation provider uses, so the two readers of a
+    DescribeInstances response cannot surface different attributes for the
+    same resource. ``state`` is not repeated here: it has its own field.
+    """
+    raw: dict[str, Any] = ec2_instance_facts(instance)
+    state_code = instance.get("State", {})
+    if isinstance(state_code, dict) and state_code.get("Code") is not None:
+        raw["state_code"] = state_code["Code"]
+    return raw
+
+
 INVENTORY_COLLECTORS: dict[SWSResourceType, Callable[..., _InventoryCollectorBase]] = {
     SWSResourceType.S3_BUCKET: S3BucketCollector,
     SWSResourceType.LAMBDA_FUNCTION: LambdaFunctionCollector,
+    SWSResourceType.EC2_INSTANCE: Ec2InstanceCollector,
 }
-"""Registered inventory collectors, keyed by canonical resource type."""
+"""Registered inventory collectors, keyed by canonical resource type.
+
+Membership means "SWS implements inventory for this type", not "every run
+reads it": ``EC2_INSTANCE`` is opt-in per run (``collect_ec2``) for the IAM
+reason documented at the top of this module.
+"""
 
 
 def collect_resource_type(
@@ -398,11 +692,23 @@ def collect_resource_type(
         raise UnsupportedResourceTypeError(
             f"inventory is not implemented for resource type '{resource_type.value}'"
         )
-    if resource_type is SWSResourceType.LAMBDA_FUNCTION:
+    if resource_type in _REGION_SCOPED_RESOURCE_TYPES:
         collector = factory(client, regions=regions, trace=trace)
     else:
         collector = factory(client, trace=trace)
     return collector.collect(limit=limit)
+
+
+_REGION_SCOPED_RESOURCE_TYPES: frozenset[SWSResourceType] = frozenset(
+    {SWSResourceType.LAMBDA_FUNCTION, SWSResourceType.EC2_INSTANCE}
+)
+"""Types whose collector is regional and therefore requires an explicit
+``regions`` binding at construction.
+
+EC2 and Lambda are both regional services reached through a single injected
+client, so neither may fall back to a default region or an implicit global
+scan: a silently-scoped inventory is not an inventory.
+"""
 
 
 def collect_all(
@@ -411,12 +717,20 @@ def collect_all(
     limit: int | None = None,
     trace: TraceSink | None = None,
     regions: list[str] | None = None,
+    collect_ec2: bool = False,
 ) -> dict[SWSResourceType, list[ResourceRecord]]:
-    """Collect inventory for all supported resource types.
+    """Collect inventory for every requested resource type.
 
-    Returns a dict keyed by resource type with stable ordering (S3 first,
-    then Lambda).
+    Returns a dict keyed by resource type with stable ordering (S3, then
+    Lambda, then EC2).
+
+    ``collect_ec2`` is opt-in. EC2 is left out of the returned mapping entirely
+    when it is False, rather than being included with an empty list, so a
+    caller cannot mistake "not requested" for "the account has no instances".
     """
+    requested = [SWSResourceType.S3_BUCKET, SWSResourceType.LAMBDA_FUNCTION]
+    if collect_ec2:
+        requested.append(SWSResourceType.EC2_INSTANCE)
     return {
         resource_type: collect_resource_type(
             resource_type,
@@ -425,8 +739,5 @@ def collect_all(
             trace=trace,
             regions=regions,
         )
-        for resource_type in (
-            SWSResourceType.S3_BUCKET,
-            SWSResourceType.LAMBDA_FUNCTION,
-        )
+        for resource_type in requested
     }

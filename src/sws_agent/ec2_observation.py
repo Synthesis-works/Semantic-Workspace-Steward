@@ -76,7 +76,7 @@ _ACCOUNT_ID_LENGTH: int = 12
 """AWS account ids are exactly 12 digits (``ResourceObservation`` enforces it)."""
 
 # Only the optional, human-useful attributes M11 is authorized to surface.
-_OPTIONAL_FACT_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
+EC2_OPTIONAL_FACT_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("instance_type", ("InstanceType",)),
     ("launch_time", ("LaunchTime",)),
     ("private_ip_address", ("PrivateIpAddress",)),
@@ -84,6 +84,14 @@ _OPTIONAL_FACT_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("subnet_id", ("SubnetId",)),
     ("availability_zone", ("Placement", "AvailabilityZone")),
 )
+"""The single approved list of optional EC2 instance attributes.
+
+Public, and the only place this list exists: M13-A's inventory collector
+(``inventory.Ec2InstanceCollector``) reads the same ``ec2:DescribeInstances``
+response and must surface exactly the same attributes, so keeping one list here
+is what stops the two readers of that response from drifting into different
+vocabularies for the same resource.
+"""
 
 
 def _require_text(value: Any, label: str) -> str:
@@ -106,16 +114,22 @@ def _dig(source: Any, path: tuple[str, ...]) -> Any:
     return current
 
 
-def _optional_facts(instance: dict[str, Any]) -> dict[str, Any]:
+def ec2_instance_facts(instance: dict[str, Any]) -> dict[str, Any]:
     """Collect the optional, observability-only facts that AWS actually sent.
 
     Nothing is defaulted or invented: an attribute AWS omitted is simply
-    absent from the observation. ``LaunchTime`` arrives as a ``datetime`` from
-    boto3 and is rendered as ISO-8601 so the observation stays JSON-safe in
-    the audit ledger; that is a lossless rendering, not a derived claim.
+    absent from the result. ``LaunchTime`` arrives as a ``datetime`` from
+    boto3 and is rendered as ISO-8601 so the facts stay JSON-safe in the audit
+    ledger; that is a lossless rendering, not a derived claim.
+
+    ``instance_state`` is deliberately *not* included: this helper is about
+    the non-state attributes, and each caller already reads the state itself
+    under its own honesty rules (this provider requires it; the M13-A collector
+    records what was sent). Folding it in here would give one caller a second,
+    silently relaxed path to the same fact.
     """
     facts: dict[str, Any] = {}
-    for name, path in _OPTIONAL_FACT_PATHS:
+    for name, path in EC2_OPTIONAL_FACT_PATHS:
         value = _dig(instance, path)
         if value is None or (isinstance(value, str) and not value.strip()):
             continue
@@ -189,7 +203,7 @@ class Ec2InstanceObservationProvider:
         observed_at = self._now()
 
         facts: dict[str, Any] = {"state": state}
-        facts.update(_optional_facts(instance))
+        facts.update(ec2_instance_facts(instance))
 
         try:
             return ResourceObservation.issued(

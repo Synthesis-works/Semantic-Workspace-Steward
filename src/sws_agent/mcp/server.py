@@ -119,6 +119,13 @@ SERVER_DESCRIPTION: str = (
 # Tools are intentionally limited to read-only analysis, the approval
 # ticket lifecycle, and the pre-execution authorization workflow. No
 # action-execution (e.g. STOP_RESOURCE) tool is exposed.
+#
+# M13-A adds ``collect_ec2`` as an optional argument to the two tools that
+# collect inventory. It adds no tool and changes this tuple: EC2 inventory is
+# the read-only ``ec2:DescribeInstances`` pass, and policy may now *recommend*
+# STOP_RESOURCE from it, but nothing here executes anything. The option is
+# plumbed through both ``collect_workspace`` and ``audit_workspace`` so the two
+# can never disagree about whether an instance was in scope.
 BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "audit_workspace",
     "collect_workspace",
@@ -150,6 +157,7 @@ class SwsBackend(Protocol):
         cost_window_days: int | None = None,
         cost_group_by: list[str] | None = None,
         cost_end_date: date | None = None,
+        collect_ec2: bool = False,
     ) -> WorkspaceSnapshot: ...
 
     def derive_relationships(
@@ -272,6 +280,7 @@ class DefaultSwsBackend:
         cost_window_days: int | None = None,
         cost_group_by: list[str] | None = None,
         cost_end_date: date | None = None,
+        collect_ec2: bool = False,
     ) -> WorkspaceSnapshot:
         run_id = uuid4().hex
         recorder = TraceRecorder()
@@ -285,6 +294,7 @@ class DefaultSwsBackend:
             cost_window_days=cost_window_days,
             cost_group_by=cost_group_by,
             cost_end_date=cost_end_date,
+            collect_ec2=collect_ec2,
         )
         self._audit(
             AuditRecordKind.RUN,
@@ -568,6 +578,7 @@ def _adapter_functions(
         cost_window_days: int | None = None,
         cost_group_by: list[str] | None = None,
         cost_end_date: str | None = None,
+        collect_ec2: bool = False,
     ) -> dict[str, Any]:
         snapshot = backend.collect_workspace(
             regions=regions,
@@ -576,6 +587,7 @@ def _adapter_functions(
             cost_window_days=cost_window_days,
             cost_group_by=cost_group_by,
             cost_end_date=_date_optional(cost_end_date),
+            collect_ec2=collect_ec2,
         )
         return {"snapshot": _jsonable(snapshot.model_dump())}
 
@@ -612,6 +624,7 @@ def _adapter_functions(
         cost_window_days: int | None = None,
         cost_group_by: list[str] | None = None,
         cost_end_date: str | None = None,
+        collect_ec2: bool = False,
     ) -> dict[str, Any]:
         snapshot = backend.collect_workspace(
             regions=regions,
@@ -620,6 +633,7 @@ def _adapter_functions(
             cost_window_days=cost_window_days,
             cost_group_by=cost_group_by,
             cost_end_date=_date_optional(cost_end_date),
+            collect_ec2=collect_ec2,
         )
         relationships = backend.derive_relationships(snapshot)
         decisions = backend.evaluate_workspace(snapshot, relationships)

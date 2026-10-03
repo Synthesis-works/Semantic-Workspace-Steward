@@ -245,7 +245,12 @@ class DemoBackend:
         cost_window_days: int | None = None,
         cost_group_by: list[str] | None = None,
         cost_end_date: date | None = None,
+        collect_ec2: bool = False,
     ) -> WorkspaceSnapshot:
+        # Every collection parameter is ignored, including collect_ec2: this
+        # backend serves one fixed synthetic snapshot and performs no AWS read
+        # of any kind. Accepting the argument keeps the demo implementing the
+        # backend protocol without pretending the demo can collect anything.
         return self.snapshot
 
     def derive_relationships(

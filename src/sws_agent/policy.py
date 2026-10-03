@@ -28,6 +28,30 @@ only controlled types (``same_account`` / ``same_region`` /
 ``same_owner_tag`` must never be reinterpreted as proof of ownership. The
 workspace evaluator accepts relationships as context for forward
 compatibility without letting them change outcomes.
+
+EC2 lifecycle state (M13-A): a resource's recorded ``state`` is the only
+input the engine treats as authority to recommend a side-effecting action. A
+``running`` or ``pending`` instance yields ``STOP_RESOURCE``; ``stopping``,
+``stopped``, ``shutting-down``, and ``terminated`` yield ``LEAVE``; and a
+blank, absent, or unrecognized state is flagged for review rather than mapped
+onto a neighbouring state. Two boundary decisions are load-bearing:
+
+* **A positive observed fact survives a partial snapshot.** The existing M2C-B
+  contract downgrades conclusions drawn from an *absence* when a snapshot is
+  partial or truncated. ``running`` is not an absence: it is a value the API
+  returned for this instance. Refusing to recommend a stop merely because some
+  *other* resource type failed to collect would make M13 unreachable on any
+  real workspace without making the recommendation any safer.
+* **An Owner-tag absence is never a finding for a type that never looks.** The
+  M13-A EC2 collector is bound to the single read-only
+  ``DescribeInstances`` seam, which returns no tags, so every EC2 instance
+  arrives with ``owner_tag=None`` regardless of how it is tagged. Running the
+  missing-owner-tag rule over those records would report unknown ownership for
+  every instance in the account while establishing nothing at all. The
+  owner-tag rules are therefore scoped to
+  ``constants.OWNER_TAG_COLLECTED_RESOURCE_TYPES``; for a type outside it the
+  engine says only what it actually observed, and the absence of an Owner tag
+  is reported as an uncollected attribute rather than as a finding.
 """
 
 from __future__ import annotations
@@ -36,10 +60,18 @@ import hashlib
 from typing import Any, Iterable
 
 from .constants import (
+    EC2_STOP_ELIGIBLE_STATES,
+    EC2_STOP_INELIGIBLE_STATES,
+    OWNER_TAG_COLLECTED_RESOURCE_TYPES,
+    POLICY_RULE_EC2_STATE_UNRECOGNIZED,
+    POLICY_RULE_EC2_STOP_ELIGIBLE,
+    POLICY_RULE_EC2_STOP_NOT_ELIGIBLE,
     POLICY_RULE_MISSING_OWNER_TAG,
     POLICY_RULE_OWNER_UNVERIFIABLE,
+    Ec2InstanceState,
     PotentialAction,
     RiskLevel,
+    SWSResourceType,
 )
 from .models import (
     PolicyDecision,
@@ -65,6 +97,25 @@ def _decision_id(
         [snapshot_id or "", resource_id, rule or ""]
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _ec2_state(resource: ResourceRecord) -> Ec2InstanceState | None:
+    """Resolve a recorded state string to a documented EC2 state, or None.
+
+    Resolution is an exact, case-sensitive match against the values EC2
+    documents. No aliasing, case folding, prefix matching, or defaulting: a
+    string AWS sent that is not in the vocabulary resolves to ``None``, which
+    the caller reports for review. Returning ``None`` must never be read as
+    "nothing to do" -- that reading is exactly the one that would let an
+    unrecognized state slip past a stop decision unexamined.
+    """
+    recorded = resource.state
+    if not isinstance(recorded, str):
+        return None
+    try:
+        return Ec2InstanceState(recorded)
+    except ValueError:
+        return None
 
 
 class WorkspacePolicyEngine:
@@ -93,12 +144,134 @@ class WorkspacePolicyEngine:
         partial = bool(partial)
         truncated = bool(truncated)
 
+        if resource.resource_type is SWSResourceType.EC2_INSTANCE:
+            return self._evaluate_ec2(resource)
+
         if resource.owner_tag is None:
+            if resource.resource_type not in OWNER_TAG_COLLECTED_RESOURCE_TYPES:
+                return self._no_rule_fired(resource)
             if partial or truncated:
                 return self._owner_unverifiable(
                     resource, partial=partial, truncated=truncated
                 )
             return self._missing_owner_tag(resource)
+        return self._no_rule_fired(resource)
+
+    def _evaluate_ec2(self, resource: ResourceRecord) -> PolicyDecision:
+        """Decide an EC2 instance from its observed lifecycle state alone.
+
+        The recorded ``state`` is matched exactly against the documented EC2
+        vocabulary. A value outside it -- including ``None``, an empty string,
+        and a future state AWS might add -- is never coerced to the nearest
+        member and never treated as benign; it is surfaced for review.
+        """
+        state = _ec2_state(resource)
+        if state in EC2_STOP_ELIGIBLE_STATES:
+            return self._ec2_stop_eligible(resource, state)
+        if state in EC2_STOP_INELIGIBLE_STATES:
+            return self._ec2_stop_not_eligible(resource, state)
+        return self._ec2_state_unrecognized(resource)
+
+    @staticmethod
+    def _ec2_stop_eligible(
+        resource: ResourceRecord, state: Ec2InstanceState
+    ) -> PolicyDecision:
+        return PolicyDecision(
+            resource_id=resource.resource_id,
+            recommended_action=PotentialAction.STOP_RESOURCE,
+            risk_level=RiskLevel.MEDIUM,
+            rationale=(
+                f"EC2 instance '{resource.resource_id}' was observed in state "
+                f"'{state.value}', from which a stop is valid and reversible; "
+                "recommending STOP_RESOURCE for human approval. This is a "
+                "recommendation only: no mutation is executed by policy."
+            ),
+            confidence=1.0,
+            needs_approval=True,
+            rule=POLICY_RULE_EC2_STOP_ELIGIBLE,
+            decision_id=_decision_id(
+                resource.resource_id,
+                snapshot_id=None,
+                rule=POLICY_RULE_EC2_STOP_ELIGIBLE,
+            ),
+            evidence=[
+                {
+                    "rule": POLICY_RULE_EC2_STOP_ELIGIBLE,
+                    "attribute": "state",
+                    "value": state.value,
+                },
+                {"attribute": "resource_type", "value": "ec2_instance"},
+            ],
+        )
+
+    @staticmethod
+    def _ec2_stop_not_eligible(
+        resource: ResourceRecord, state: Ec2InstanceState
+    ) -> PolicyDecision:
+        return PolicyDecision(
+            resource_id=resource.resource_id,
+            recommended_action=PotentialAction.LEAVE,
+            rationale=(
+                f"EC2 instance '{resource.resource_id}' was observed in state "
+                f"'{state.value}', in which no stop may be recommended; the "
+                "instance is already stopped, already stopping, or past the "
+                "point where it can be stopped. SWS recommends nothing and "
+                "asserts nothing beyond that observation."
+            ),
+            confidence=1.0,
+            rule=POLICY_RULE_EC2_STOP_NOT_ELIGIBLE,
+            decision_id=_decision_id(
+                resource.resource_id,
+                snapshot_id=None,
+                rule=POLICY_RULE_EC2_STOP_NOT_ELIGIBLE,
+            ),
+            evidence=[
+                {
+                    "rule": POLICY_RULE_EC2_STOP_NOT_ELIGIBLE,
+                    "attribute": "state",
+                    "value": state.value,
+                }
+            ],
+        )
+
+    @staticmethod
+    def _ec2_state_unrecognized(resource: ResourceRecord) -> PolicyDecision:
+        observed = resource.state
+        return PolicyDecision(
+            resource_id=resource.resource_id,
+            recommended_action=PotentialAction.FLAG_FOR_REVIEW,
+            risk_level=RiskLevel.LOW,
+            rationale=(
+                f"EC2 instance '{resource.resource_id}' has no usable "
+                "lifecycle state ("
+                + (
+                    f"recorded as {observed!r}"
+                    if isinstance(observed, str) and observed.strip()
+                    else "none was recorded"
+                )
+                + "), and that value is not one of the documented EC2 "
+                "instance states. Flagging for review rather than mapping it "
+                "onto a neighbouring state: a stop recommendation derived "
+                "from a state SWS does not recognize would not be a fact."
+            ),
+            confidence=1.0,
+            rule=POLICY_RULE_EC2_STATE_UNRECOGNIZED,
+            decision_id=_decision_id(
+                resource.resource_id,
+                snapshot_id=None,
+                rule=POLICY_RULE_EC2_STATE_UNRECOGNIZED,
+            ),
+            evidence=[
+                {
+                    "rule": POLICY_RULE_EC2_STATE_UNRECOGNIZED,
+                    "attribute": "state",
+                    "value": observed,
+                }
+            ],
+        )
+
+    @staticmethod
+    def _no_rule_fired(resource: ResourceRecord) -> PolicyDecision:
         return PolicyDecision(
             resource_id=resource.resource_id,
             recommended_action=PotentialAction.LEAVE,

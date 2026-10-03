@@ -16,10 +16,12 @@ from sws_agent.constants import (
     MAX_COST_WINDOW_DAYS,
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
     CollectionFailureCategory,
+    PotentialAction,
     SWSResourceType,
     TraceEventType,
     TraceStatus,
 )
+from sws_agent.inventory import INVENTORY_COLLECTORS
 from sws_agent.models import (
     CollectionFailure,
     CostEstimate,
@@ -150,13 +152,17 @@ class FakeRootClient:
     """Composite client exposing every method the collectors require.
 
     ``cost`` is optional: when supplied, the client also exposes
-    ``get_cost_and_usage`` for the M2C-E cost collector.
+    ``get_cost_and_usage`` for the M2C-E cost collector. ``ec2`` is optional
+    in the same way: without it the client has no ``describe_instances``
+    method at all, which is what an account whose IAM policy omits
+    ``ec2:DescribeInstances`` looks like from SWS.
     """
 
-    def __init__(self, s3=None, lamb=None, cost=None):
+    def __init__(self, s3=None, lamb=None, cost=None, ec2=None):
         self._s3 = s3 or FakeS3Client(buckets=[])
         self._lamb = lamb or FakeLambdaClient(pages=[])
         self._cost = cost
+        self._ec2 = ec2
 
     def list_buckets(self):
         return self._s3.list_buckets()
@@ -177,6 +183,11 @@ class FakeRootClient:
         if self._cost is None:
             raise AssertionError("get_cost_and_usage called without a cost client")
         return self._cost.get_cost_and_usage(**params)
+
+    def describe_instances(self):
+        if self._ec2 is None:
+            raise AssertionError("describe_instances called without an EC2 client")
+        return self._ec2.describe_instances()
 
 
 def _run(client: FakeRootClient, **overrides):
@@ -858,3 +869,221 @@ def test_cost_presence_does_not_change_policy_outcomes():
     )
     decisions = evaluate_workspace(snapshot)
     assert [d.rule for d in decisions] == ["missing_owner_tag"]
+
+
+# ---------------------------------------------------------------------------
+# EC2 opt-in collection (M13-A)
+# ---------------------------------------------------------------------------
+
+EC2_ACCOUNT = "123456789012"
+EC2_LAUNCH_TIME = datetime(2026, 2, 1, 9, 30, tzinfo=timezone.utc)
+
+
+class FakeEc2Paginator:
+    def __init__(self, pages):
+        self._pages = list(pages)
+
+    def paginate(self, **kwargs):
+        return iter(self._pages)
+
+
+class FakeEc2Client:
+    """Canned ``ec2:DescribeInstances`` seam for workspace-level runs."""
+
+    def __init__(self, pages=None, *, error=None):
+        self._pages = list(pages or [])
+        self._error = error
+        self.calls = 0
+
+    def describe_instances(self):
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return FakeEc2Paginator(self._pages)
+
+
+def _ec2_page(*instances):
+    return {
+        "Reservations": [
+            {"OwnerId": EC2_ACCOUNT, "Instances": list(instances)}
+        ]
+    }
+
+
+def _ec2_instance(instance_id, state="running", **extra):
+    payload = {"InstanceId": instance_id, "State": {"Code": 16, "Name": state}}
+    payload.update(extra)
+    return payload
+
+
+def _ec2_run(**overrides):
+    defaults = {
+        "client": FakeRootClient(
+            ec2=FakeEc2Client(
+                [_ec2_page(_ec2_instance("i-running"), _ec2_instance("i-stopped", "stopped"))]
+            )
+        ),
+        "regions": ["us-east-1"],
+        "now": NOW,
+        "collect_ec2": True,
+    }
+    defaults.update(overrides)
+    return collect_workspace(**defaults)
+
+
+def test_default_run_does_not_read_ec2_or_claim_it_as_intent():
+    """A run must never list a type whose collector it did not invoke.
+
+    ``resource_types`` records intent. Listing EC2 in a run that never read it
+    would report ``counts['ec2_instance'] == 0``, which is indistinguishable
+    from "this account has no instances" -- a fabricated finding.
+    """
+    ec2 = FakeEc2Client([_ec2_page(_ec2_instance("i-1"))])
+    snapshot = _run(FakeRootClient(ec2=ec2))
+    assert ec2.calls == 0
+    assert snapshot.resource_types == [
+        SWSResourceType.S3_BUCKET,
+        SWSResourceType.LAMBDA_FUNCTION,
+    ]
+    assert SWSResourceType.EC2_INSTANCE not in snapshot.counts
+
+
+def test_default_run_stays_clean_against_a_client_with_no_ec2_access():
+    """EC2 being opt-in is what keeps a non-EC2 workspace out of ``partial``."""
+    snapshot = _run(FakeRootClient())
+    assert snapshot.partial is False
+    assert snapshot.failures == []
+    assert snapshot.collected_at is not None
+
+
+def test_opted_in_run_records_the_read_in_both_data_and_intent():
+    ec2 = FakeEc2Client([_ec2_page(_ec2_instance("i-running"), _ec2_instance("i-stopped", "stopped"))])
+    snapshot = _run(FakeRootClient(ec2=ec2), collect_ec2=True)
+    assert ec2.calls == 1
+    assert snapshot.resource_types == [
+        SWSResourceType.S3_BUCKET,
+        SWSResourceType.LAMBDA_FUNCTION,
+        SWSResourceType.EC2_INSTANCE,
+    ]
+    assert snapshot.counts[SWSResourceType.EC2_INSTANCE] == 2
+    assert snapshot.partial is False
+
+
+def test_opted_in_run_carries_the_observed_instance_state_into_the_snapshot():
+    snapshot = _ec2_run()
+    records = {r.resource_id: r for r in snapshot.resources}
+    assert records["i-running"].state == "running"
+    assert records["i-stopped"].state == "stopped"
+    assert records["i-running"].resource_type is SWSResourceType.EC2_INSTANCE
+    assert records["i-running"].region == "us-east-1"
+    assert records["i-running"].account_id == EC2_ACCOUNT
+    assert records["i-running"].owner_tag is None
+
+
+def test_opted_in_snapshot_drives_the_stop_recommendation_end_to_end():
+    """The M13-A path: read an instance, then recommend a stop on it.
+
+    This is the first time an EC2 resource can reach a decision at all. It
+    proves inventory and policy are wired to each other, not merely that each
+    half works alone -- and that what comes out is still a recommendation.
+    """
+    from sws_agent.policy import evaluate_workspace
+
+    snapshot = _ec2_run()
+    decisions = {d.resource_id: d for d in evaluate_workspace(snapshot)}
+    assert decisions["i-running"].recommended_action is PotentialAction.STOP_RESOURCE
+    assert decisions["i-running"].needs_approval is True
+    assert decisions["i-stopped"].recommended_action is PotentialAction.LEAVE
+    assert all(d.snapshot_id == snapshot.snapshot_id for d in decisions.values())
+
+
+def test_ec2_read_failure_makes_the_snapshot_partial_with_a_primary_failure():
+    """A failed opt-in read is surfaced, never swallowed into an empty result."""
+    snapshot = _run(
+        FakeRootClient(ec2=FakeEc2Client(error=RuntimeError("denied"))),
+        collect_ec2=True,
+    )
+    assert snapshot.partial is True
+    ec2_failures = [
+        f for f in snapshot.failures if f.resource_type is SWSResourceType.EC2_INSTANCE
+    ]
+    assert len(ec2_failures) == 1
+    assert ec2_failures[0].fatal is True
+    assert ec2_failures[0].category is CollectionFailureCategory.PRIMARY
+    assert snapshot.counts[SWSResourceType.EC2_INSTANCE] == 0
+
+
+def test_missing_ec2_permission_is_reported_not_treated_as_zero_instances():
+    """No ``describe_instances`` at all is a failure, not an empty account.
+
+    Without this distinction an account lacking the permission would produce a
+    confident "0 instances" and a clean snapshot, which is the one reading
+    that would later justify stopping something.
+    """
+    snapshot = _run(FakeRootClient(), collect_ec2=True)
+    assert snapshot.partial is True
+    assert [f.resource_type for f in snapshot.failures] == [
+        SWSResourceType.EC2_INSTANCE
+    ]
+    assert snapshot.counts[SWSResourceType.EC2_INSTANCE] == 0
+
+
+def test_account_with_no_instances_is_a_clean_zero_not_a_failure():
+    ec2 = FakeEc2Client([{"Reservations": []}])
+    snapshot = _run(FakeRootClient(ec2=ec2), collect_ec2=True)
+    assert snapshot.partial is False
+    assert snapshot.failures == []
+    assert snapshot.counts[SWSResourceType.EC2_INSTANCE] == 0
+
+
+def test_ec2_truncation_surfaces_on_the_snapshot():
+    pages = [
+        _ec2_page(_ec2_instance("i-1")),
+        _ec2_page(_ec2_instance("i-2")),
+    ]
+    snapshot = _run(FakeRootClient(ec2=FakeEc2Client(pages)), collect_ec2=True, limit=1)
+    assert snapshot.truncated is True
+    assert snapshot.counts[SWSResourceType.EC2_INSTANCE] == 1
+
+
+def test_default_resource_types_are_explicit_and_ec2_is_not_one_of_them():
+    """Registering a collector must not silently widen every existing run."""
+    from sws_agent.workspace import DEFAULT_RESOURCE_TYPES
+
+    assert DEFAULT_RESOURCE_TYPES == (
+        SWSResourceType.S3_BUCKET,
+        SWSResourceType.LAMBDA_FUNCTION,
+    )
+    assert SWSResourceType.EC2_INSTANCE in INVENTORY_COLLECTORS
+
+
+def test_multi_region_run_is_fine_without_ec2():
+    """The single-region restriction belongs to EC2, not to the workspace."""
+    snapshot = _run(FakeRootClient(), regions=["us-east-1", "eu-west-1"])
+    assert snapshot.partial is False
+    assert snapshot.regions == ["us-east-1", "eu-west-1"]
+
+
+def test_multi_region_ec2_run_raises_before_any_collector_runs():
+    """Refusing beats mislabeling, and it must cost no wasted collection.
+
+    The client seam reads one configured region, so a two-region EC2 request
+    could only duplicate one region's instances under invented locations. The
+    check runs before collection so a rejected call cannot leave a partial
+    trace that looks like a failed run.
+    """
+    ec2 = FakeEc2Client([_ec2_page(_ec2_instance("i-1"))])
+    s3 = FakeS3Client(buckets=[{"Name": "bucket-a"}])
+    client = FakeRootClient(s3=s3, ec2=ec2)
+    trace = TraceRecorder()
+    with pytest.raises(ValueError, match="exactly one region"):
+        collect_workspace(
+            client=client,
+            regions=["us-east-1", "eu-west-1"],
+            now=NOW,
+            trace=trace,
+            collect_ec2=True,
+        )
+    assert ec2.calls == 0
+    assert len(trace) == 0
+    assert trace.to_dicts() == []

@@ -177,12 +177,14 @@ class SeededBackend:
         cost_window_days: int | None = None,
         cost_group_by: list[str] | None = None,
         cost_end_date: object = None,
+        collect_ec2: bool = False,
     ) -> WorkspaceSnapshot:
         self.collect_requests.append(
             {
                 "regions": list(regions),
                 "limit": limit,
                 "collect_cost": collect_cost,
+                "collect_ec2": collect_ec2,
             }
         )
         return self.snapshot
@@ -407,6 +409,54 @@ def test_collect_workspace_happy_path(server: SwsMcpServer):
     assert result.is_error is False
     snapshot = _payload(result)["snapshot"]
     assert WorkspaceSnapshot.model_validate(snapshot).snapshot_id == "snap-1"
+
+
+def test_collect_workspace_defaults_to_not_reading_ec2(seeded: SeededBackend):
+    """EC2 is opt-in, so an ordinary call performs no EC2 read.
+
+    ``ec2:DescribeInstances`` is the one permission SWS needs that is not
+    resource-scoped, so making it default-on would mark every workspace
+    ``partial`` in accounts that lack it.
+    """
+    server = SwsMcpServer(backend=seeded)
+    _run(server.call_tool("collect_workspace", {"regions": ["us-east-1"]}))
+    assert seeded.collect_requests[-1]["collect_ec2"] is False
+
+
+def test_collect_workspace_forwards_the_ec2_opt_in(seeded: SeededBackend):
+    server = SwsMcpServer(backend=seeded)
+    result = _run(server.call_tool(
+        "collect_workspace", {"regions": ["us-east-1"], "collect_ec2": True}
+    ))
+    assert result.is_error is False
+    assert seeded.collect_requests[-1]["collect_ec2"] is True
+
+
+def test_audit_workspace_forwards_the_ec2_opt_in(seeded: SeededBackend):
+    """Both collecting tools must agree about whether an instance was in scope.
+
+    Plumbing it through only one would let an audit report decisions about a
+    snapshot whose collection scope it did not share.
+    """
+    server = SwsMcpServer(backend=seeded)
+    result = _run(server.call_tool(
+        "audit_workspace", {"regions": ["us-east-1"], "collect_ec2": True}
+    ))
+    assert result.is_error is False
+    assert seeded.collect_requests[-1]["collect_ec2"] is True
+
+
+def test_ec2_opt_in_adds_no_tool_and_no_execution_surface(seeded: SeededBackend):
+    server = SwsMcpServer(backend=seeded)
+    names = server.registry.names()
+    assert len(names) == len(BUILTIN_TOOL_NAMES) == 9
+    assert not any("stop" in name or "execute" in name for name in names)
+    schemas = {tool["name"]: tool["inputSchema"] for tool in _run(server.list_tools())}
+    for tool_name in ("collect_workspace", "audit_workspace"):
+        properties = schemas[tool_name].get("properties", {})
+        assert "collect_ec2" in properties
+        assert properties["collect_ec2"].get("type") == "boolean"
+        assert "collect_ec2" not in schemas[tool_name].get("required", [])
 
 
 def test_get_relationships_happy_path(server: SwsMcpServer, snapshot_dict: dict):

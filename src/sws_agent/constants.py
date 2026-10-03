@@ -220,6 +220,103 @@ class CollectionFailureCategory(str, enum.Enum):
     example a Lambda function with a missing or malformed ARN)."""
 
 
+class Ec2InstanceState(str, enum.Enum):
+    """The closed set of EC2 instance lifecycle states reported by AWS.
+
+    EC2 exposes ``State.Name`` from ``ec2:DescribeInstances`` and
+    ``DescribeInstanceStatus``. The service documents exactly these seven
+    values, so SWS defines the vocabulary once here rather than repeating the
+    string literals in the collector, the policy engine, and the tests.
+
+    This enum is the *policy* vocabulary, not the collection vocabulary. The
+    collector records whatever AWS returned byte-for-byte in
+    ``ResourceRecord.state`` and never maps it through this enum, so a state
+    AWS adds in the future is recorded honestly and then rejected by policy as
+    unrecognized rather than being coerced into one of these members.
+
+    The terminal states (``shutting-down`` / ``terminated``) are permanent:
+    an instance that reaches them cannot be stopped, restarted, or reclaimed.
+    That is the reason they are grouped as never-actionable rather than merely
+    "already satisfied".
+    """
+
+    PENDING = "pending"
+    """Launch requested; the instance has not yet reached ``running``."""
+
+    RUNNING = "running"
+    """The instance is running. ``ec2:StopInstances`` is valid and the stop is
+    reversible with ``ec2:StartInstances``."""
+
+    SHUTTING_DOWN = "shutting-down"
+    """Terminal transition already in progress; the instance cannot be stopped."""
+
+    TERMINATED = "terminated"
+    """Terminal. The instance no longer exists as a running resource."""
+
+    STOPPING = "stopping"
+    """A stop already requested; the instance is converging on ``stopped``."""
+
+    STOPPED = "stopped"
+    """Not running, but the instance still exists and can be started again.
+    The ``STOP_RESOURCE`` postcondition already holds."""
+
+
+SWS_SUPPORTED_EC2_INSTANCE_STATES: Final[frozenset[str]] = frozenset(
+    state.value for state in Ec2InstanceState
+)
+"""The complete set of canonical EC2 instance lifecycle states."""
+
+EC2_STOP_ELIGIBLE_STATES: Final[frozenset[Ec2InstanceState]] = frozenset(
+    {Ec2InstanceState.PENDING, Ec2InstanceState.RUNNING}
+)
+"""States from which ``ec2:StopInstances`` is valid and the stop is reversible.
+
+``running`` is the ordinary case. ``pending`` is included because the instance
+is still converging toward running and AWS accepts a stop for it; refusing to
+stop a pending instance would leave the only state in which a stop is still
+cheap and side-effect-free to act upon.
+
+Deliberately excluded: ``stopping`` and ``stopped`` (the postcondition already
+holds or is arriving, so a stop would be a redundant call), and the terminal
+states (no stop is possible at all).
+"""
+
+EC2_STOP_INELIGIBLE_STATES: Final[frozenset[Ec2InstanceState]] = frozenset(
+    {
+        Ec2InstanceState.STOPPING,
+        Ec2InstanceState.STOPPED,
+        Ec2InstanceState.SHUTTING_DOWN,
+        Ec2InstanceState.TERMINATED,
+    }
+)
+"""States for which no stop may ever be recommended.
+
+``STOP_RESOURCE`` is defined as a *reversible* stop, and this set is exactly
+the states where nothing needs doing: the postcondition already holds, is
+already arriving, or is unreachable because the instance is gone.
+"""
+
+OWNER_TAG_COLLECTED_RESOURCE_TYPES: Final[frozenset[SWSResourceType]] = frozenset(
+    {SWSResourceType.S3_BUCKET, SWSResourceType.LAMBDA_FUNCTION}
+)
+"""Resource types whose collector actually reads the ``Owner`` tag.
+
+This set exists so the deterministic policy engine can tell an *absent* Owner
+tag (a fact about the resource) apart from a *never-collected* Owner tag (a
+fact about SWS's own AWS surface). The distinction matters because the
+owner-tag rules reason from absence: M13-A's EC2 collector is bound to the
+single read-only ``ec2:DescribeInstances`` seam, which does not return tags,
+so every EC2 instance necessarily arrives with ``owner_tag=None`` no matter
+what the instance is tagged with. Treating that as a missing-tag finding would
+report "unknown ownership" about every instance in the account while
+establishing nothing.
+
+A type appearing here is a statement that its collector performs a tag lookup
+and traced a failure when that lookup failed. A type absent from this set has
+no Owner-tag evidence, and no owner-tag rule may conclude anything from it.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Resource-specific limits.
 # Lesson from SMS day one: do not reuse SMS's document-size limits for AWS
@@ -321,8 +418,46 @@ POLICY_RULE_OWNER_UNVERIFIABLE: Final[str] = "owner_unverifiable"
 """Owner-tag absence cannot be treated as fact because the workspace
 inventory is partial or truncated; the resource is flagged for review."""
 
+POLICY_RULE_EC2_STOP_ELIGIBLE: Final[str] = "ec2_stop_eligible"
+"""An EC2 instance was observed in a state from which ``ec2:StopInstances`` is
+valid and reversible (``running`` / ``pending``), so ``STOP_RESOURCE`` is
+recommended.
+
+The rule consumes a *positive observed fact*: the state AWS reported for this
+instance. It is therefore evaluated even under a partial or truncated snapshot,
+because completeness undermines conclusions drawn from an absence, not from a
+value the API actually returned. The snapshot is still required to have
+reported the instance at all.
+"""
+
+POLICY_RULE_EC2_STOP_NOT_ELIGIBLE: Final[str] = "ec2_stop_not_eligible"
+"""An EC2 instance was observed in a state where no stop may ever be
+recommended (``stopping`` / ``stopped`` / ``shutting-down`` / ``terminated``):
+the postcondition already holds or is arriving, or the instance is gone.
+
+This is a positive determination, not an absence, so it is reported with full
+confidence. ``LEAVE`` here states that SWS recommends nothing, never that the
+resource needs nothing.
+"""
+
+POLICY_RULE_EC2_STATE_UNRECOGNIZED: Final[str] = "ec2_state_unrecognized"
+"""An EC2 instance's recorded state is blank, absent, or a value outside the
+documented EC2 state set, so SWS cannot establish what stopping it would mean.
+
+The resource is flagged for review instead of being recommended for or
+exempted from a stop. SWS never maps an unknown state onto a neighbouring
+member of the enum, because a stop recommendation is only safe when it is
+derived from a state AWS actually documented.
+"""
+
 SWS_SUPPORTED_POLICY_RULES: Final[frozenset[str]] = frozenset(
-    {POLICY_RULE_MISSING_OWNER_TAG, POLICY_RULE_OWNER_UNVERIFIABLE}
+    {
+        POLICY_RULE_MISSING_OWNER_TAG,
+        POLICY_RULE_OWNER_UNVERIFIABLE,
+        POLICY_RULE_EC2_STOP_ELIGIBLE,
+        POLICY_RULE_EC2_STOP_NOT_ELIGIBLE,
+        POLICY_RULE_EC2_STATE_UNRECOGNIZED,
+    }
 )
 """The complete set of canonical deterministic policy rule identifiers."""
 

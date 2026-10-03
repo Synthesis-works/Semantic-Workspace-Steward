@@ -45,6 +45,20 @@ class ResourceRecord(BaseModel):
     in M2C-A. Collectors do not populate them; the canonicalization layer
     (canonical.py) derives them deterministically after collection. Both
     default to ``None`` so existing M2B constructions remain valid.
+
+    ``state`` (M13-A) is the resource's lifecycle state as the reporting API
+    stated it, passed through byte-for-byte: ``"running"`` for an EC2
+    instance, and for a Lambda function the same ``State`` field its collector
+    already read into ``raw``. It is deliberately typed ``str | None`` rather
+    than as an enum, because the collector's job is to record what the API
+    returned and must never coerce a value it does not recognize into a
+    known state. Deciding what a state *means* belongs to the deterministic
+    policy engine (``constants.Ec2InstanceState``), which is the only place
+    that maps a recorded state onto an action.
+
+    ``None`` means no state was reported. It is never a stand-in for a
+    documented state and never implies the resource is healthy, idle, or safe
+    to act upon.
     """
 
     resource_id: str = Field(min_length=1)
@@ -53,6 +67,7 @@ class ResourceRecord(BaseModel):
     region: str | None = None
     owner_tag: str | None = None
     created_at: datetime | None = None
+    state: str | None = None
     metrics: dict[str, float] = Field(default_factory=dict)
     raw: dict[str, Any] = Field(default_factory=dict)
     arn: str | None = Field(default=None, min_length=1)

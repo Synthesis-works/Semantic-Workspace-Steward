@@ -27,6 +27,17 @@ Approved M2C-B decisions implemented here:
   non-fatal (an enrichment lookup failed or a returned item was skipped).
 - No LLM, AWS SDK, network, or destructive operations occur here.
 
+M13-A EC2 integration: when ``collect_ec2`` is True, the run additionally
+collects EC2 instances through ``Ec2InstanceCollector`` on the same injected
+client. EC2 is opt-in because ``ec2:DescribeInstances`` is the one permission
+SWS needs that is not scoped to a single resource, so a default-on read would
+make every workspace permanently ``partial`` in accounts that lack it. The
+opt-in is honoured in the snapshot's intent record as well as its data:
+``resource_types`` lists exactly the collectors this run invoked, so it never
+claims an EC2 read that did not happen. When enabled, EC2 failures flow through
+the same run-scoped INVENTORY_QUERY ``partial`` / ``failures`` contract as
+every other type.
+
 M2C-E cost integration: when ``collect_cost`` is True, the run additionally
 collects account-level cost estimates through ``CostExplorerCollector`` on
 the same injected client and records them on ``snapshot.cost``. Cost data is
@@ -52,9 +63,21 @@ from .constants import (
     TraceStatus,
 )
 from .cost_explorer import CostExplorerCollector
-from .inventory import INVENTORY_COLLECTORS, collect_all, normalize_limit
+from .inventory import collect_all, normalize_limit
 from .models import CollectionFailure, CostEstimate, ResourceRecord, WorkspaceSnapshot
 from .trace import TraceRecorder
+
+DEFAULT_RESOURCE_TYPES: tuple[SWSResourceType, ...] = (
+    SWSResourceType.S3_BUCKET,
+    SWSResourceType.LAMBDA_FUNCTION,
+)
+"""The resource types every ``collect_workspace`` run collects.
+
+Named explicitly rather than derived from ``INVENTORY_COLLECTORS`` so that
+registering a new collector does not silently add an AWS read to every existing
+caller. A type reaches this tuple only by a deliberate decision to make it part
+of the default run.
+"""
 
 
 def _parse_trace_timestamp(value: str) -> datetime | None:
@@ -139,6 +162,7 @@ def collect_workspace(
     cost_window_days: int | None = None,
     cost_group_by: list[str] | None = None,
     cost_end_date: date | None = None,
+    collect_ec2: bool = False,
 ) -> WorkspaceSnapshot:
     """Collect a deterministic snapshot of a workspace's inventory.
 
@@ -159,6 +183,15 @@ def collect_workspace(
     the exact run that produced them (M8). ``now`` must be timezone-aware
     when supplied; otherwise the current UTC time is used.
 
+    ``collect_ec2`` (M13-A) adds the read-only ``ec2:DescribeInstances`` pass.
+    It defaults to False and is recorded in the snapshot's ``resource_types``
+    only when requested, so the snapshot never claims an EC2 read it did not
+    perform. The injected ``client`` must expose ``describe_instances`` when it
+    is requested. It also requires exactly one entry in ``regions``, because
+    that client seam is bound to a single configured region; a multi-region
+    request raises ValueError before any collector runs rather than
+    misattributing instances to regions that were never read.
+
     Cost collection (M2C-E): passing ``collect_cost=True`` requires
     ``cost_end_date`` (a ``datetime.date``), otherwise ValueError. The
     collector validates ``cost_window_days`` and ``cost_group_by`` and raises
@@ -172,6 +205,14 @@ def collect_workspace(
     for region in regions:
         if not isinstance(region, str) or not region.strip():
             raise ValueError("workspace regions must be non-empty strings")
+
+    if collect_ec2 and len(regions) > 1:
+        raise ValueError(
+            "collect_ec2=True requires exactly one region: the injected "
+            "describe_instances() seam is bound to a single configured region, "
+            "so a multi-region run would repeat one region's instances under "
+            "fabricated region labels"
+        )
 
     if now is not None and now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -193,6 +234,7 @@ def collect_workspace(
         limit=effective_limit,
         trace=recorder,
         regions=list(regions),
+        collect_ec2=collect_ec2,
     )
 
     cost_estimates: list[CostEstimate] = []
@@ -239,7 +281,9 @@ def collect_workspace(
         else None
     )
 
-    resource_types = list(INVENTORY_COLLECTORS)
+    resource_types = list(DEFAULT_RESOURCE_TYPES)
+    if collect_ec2:
+        resource_types.append(SWSResourceType.EC2_INSTANCE)
     resources = canonicalize_resources(
         (
             record

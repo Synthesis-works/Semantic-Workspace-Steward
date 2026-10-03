@@ -38,6 +38,27 @@ def test_resource_record_rejects_empty_id():
         ResourceRecord(resource_id="", resource_type=SWSResourceType.S3_BUCKET)
 
 
+def test_resource_record_state_defaults_to_none():
+    record = ResourceRecord(resource_id="rn-1", resource_type=SWSResourceType.EC2_INSTANCE)
+    assert record.state is None
+
+
+@pytest.mark.parametrize(
+    "state", ["running", "RUNNING", "Running", "running ", "invented-state", ""]
+)
+def test_resource_record_state_is_stored_verbatim(state):
+    """``state`` records what the API said and never reinterprets it.
+
+    Unlike ``resource_type``, ``state`` is deliberately not normalized: a
+    collector that cased or trimmed a value here would hide exactly the input
+    the policy engine needs in order to refuse an unrecognized state.
+    """
+    record = ResourceRecord(
+        resource_id="rn-1", resource_type=SWSResourceType.EC2_INSTANCE, state=state
+    )
+    assert record.state == state
+
+
 def test_policy_decision_normalizes_action_and_risk():
     decision = PolicyDecision(
         resource_id="rn-1",

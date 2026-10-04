@@ -1,4 +1,4 @@
-# ADR 0001: The execution milestone sequence (M9 to M13)
+# ADR 0001: The execution milestone sequence (M9 to M14)
 
 - **Status**: Accepted
 - **Date**: 2026
@@ -43,13 +43,22 @@ separately authorized, and no milestone may be merged ahead of its predecessor.
 | **M10** | Harden the evidence the gate trusts | No handler registered |
 | **M11** | Add a **read-only** EC2 observation primitive | No |
 | **M12** | Durable approval reconstruction + reconciliation | No |
-| **M13** | Register the first real handler (EC2 stop) | Only after M9–M12 |
+| **M13** | Durable execution reservation; intent-level safety | No handler registered |
+| **M14** | Dry-run composition (M13 phase D), then the first real handler | Yes, first and only, at M14 |
 
-The ordering is not a convenience; it is the safety argument. The point at
-which SWS would first mutate AWS is M13, and by then every input the gate
-reasons over is already proven to be independently sourced, fresh, and durable.
+The ordering is not a convenience; it is the safety argument. Every input the
+gate reasons over is already proven to be independently sourced, fresh, and
+durable before the point at which SWS would first mutate AWS.
 
-### Rules that hold across all five milestones
+M13 was originally scoped as "register the first real handler". It was
+deliberately not compressed to that: the Phase 2 investigation found four
+processes crossing a boundary only one of them was approved for, and 169 of 720
+audit records lost, so the milestone was split and the mutation deferred. M13
+proved the ordering (ADR 0004) and M14's first half assembles it (ADR 0005). The
+ruling that no milestone may merge ahead of its predecessor is what forced that
+split rather than a smaller one.
+
+### Rules that hold across all milestones
 
 1. **The caller never supplies safety evidence.** A request may propose; the
    coordinator verifies. Any observation that drives a decision is obtained by
@@ -88,8 +97,8 @@ reasons over is already proven to be independently sourced, fresh, and durable.
 
 - The gate grows new refusal reasons, and every one of them is a genuine
   fail-closed path rather than a formality.
-- Nothing becomes executable sooner. M13 is the only milestone that can mutate,
-  and reaching it requires M9–M12 to have landed.
+- Nothing becomes executable sooner. M14 is the only milestone that can mutate,
+  and reaching it requires M9–M13 to have landed.
 - Two honest limitations are recorded rather than papered over: durable
   approval reconstruction is deferred to M12 (until then, approval state is
   process-local), and M10's A5 evidence is a provider interface with no

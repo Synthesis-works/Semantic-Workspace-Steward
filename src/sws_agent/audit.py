@@ -17,6 +17,17 @@ Guarantees and boundaries:
     skipped. There is no rotation and no deletion path in M8: audit history
     never silently disappears (the boundary is documented; a size guard would
     require operator decision and is explicitly out of scope here).
+  - Process-safe appends (M14-A). ``O_APPEND`` is **not** atomic on Windows:
+    every writer seeks to the same end-of-file and the later write displaces
+    the earlier one. The M13 Phase 2 investigation measured 169 of 720
+    records silently lost across four processes with every child exiting
+    ``0`` -- no malformed lines, no duplicates, no error anywhere. Appending
+    therefore happens under an exclusive byte-range lock, and both the
+    duplicate check and ``records()`` re-read through that lock so a process
+    sees records written by its siblings rather than answering from a
+    process-local cache. This makes the store safe as *evidence*; it does not
+    make it an execution authority (ADR 0003), and nothing here may be relied
+    on to decide "may I proceed?".
   - Sanitization. Envelopes and payloads never contain ``ResourceRecord.raw``,
     chain-of-thought/reasoning prose (the ``EXPLANATION`` record carries the
     provider, claim kind, and stable ``reason`` code only), credentials,
@@ -40,7 +51,9 @@ from __future__ import annotations
 
 import enum
 import os
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -68,6 +81,81 @@ AUDIT_SCHEMA_VERSION: int = 1
 
 LEDGER_FILENAME: str = "audit.jsonl"
 """Canonical file name for a JSONL audit ledger within its directory."""
+
+AUDIT_LOCK_TIMEOUT_SECONDS: float = 30.0
+"""How long a writer waits for the append lock before failing loudly."""
+
+AUDIT_LOCK_RETRY_SECONDS: float = 0.001
+"""Delay between non-blocking lock attempts while ``AUDIT_LOCK_TIMEOUT_SECONDS`` runs."""
+
+AUDIT_LOCK_REGION_BYTES: int = 1
+"""Size of the advisory lock region held at offset 0 of the ledger.
+
+One byte is enough: the region is never written to, it exists only so the
+locking primitive has a target. It sits at offset 0 rather than at end-of-file
+so the region is stable no matter how large the ledger grows.
+"""
+
+
+def _acquire_ledger_lock(fd: int) -> None:
+    """Take the ledger's exclusive append lock.
+
+    Windows uses ``msvcrt.locking`` and POSIX uses ``fcntl.flock``; both are
+    advisory, which is sufficient because every writer of an SWS ledger goes
+    through this module. Windows retries non-blockingly against an explicit
+    deadline so a contended or deadlocked writer produces a named, actionable
+    error instead of an opaque one from the platform's fixed retry policy.
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        deadline = time.monotonic() + AUDIT_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, AUDIT_LOCK_REGION_BYTES)
+                return
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise AuditStoreError(
+                        f"could not acquire the audit ledger lock on fd "
+                        f"{fd} within {AUDIT_LOCK_TIMEOUT_SECONDS}s: {exc}"
+                    ) from exc
+                time.sleep(AUDIT_LOCK_RETRY_SECONDS)
+
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+def _release_ledger_lock(fd: int) -> None:
+    """Release the lock taken by :func:`_acquire_ledger_lock`."""
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, AUDIT_LOCK_REGION_BYTES)
+        return
+
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _ledger_lock(fd: int) -> Iterator[None]:
+    """Serialize a read-modify-append against the ledger.
+
+    The whole sequence must happen inside one lock acquisition. Refreshing and
+    appending separately would reintroduce the exact interleaving that loses
+    records: a duplicate check performed outside the lock is a check against
+    the future, not against what is on disk.
+    """
+    _acquire_ledger_lock(fd)
+    try:
+        yield
+    finally:
+        _release_ledger_lock(fd)
 
 
 class AuditRecordKind(str, enum.Enum):
@@ -168,6 +256,12 @@ class JsonlAuditStore:
     collisions are detected from the very first write. ``now`` must return
     timezone-aware datetimes; ``id_source`` produces ``record_id`` values.
     Both are injectable for deterministic tests.
+
+    Every append and every read happens under the ledger's exclusive lock, and
+    the in-process view is rebuilt from disk inside that lock. A second process
+    (or a second handle in this process) therefore observes the first one's
+    records instead of silently losing them -- see the module docstring for the
+    measurement that forced this.
     """
 
     def __init__(
@@ -188,35 +282,46 @@ class JsonlAuditStore:
         self._records: dict[str, AuditEnvelope] = {}
         self._closed = False
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self._path.open("a", encoding="utf-8", newline="\n")
-        self._load_existing()
+        # Binary append: no text-encoding layer may re-buffer or re-seek this
+        # write. The append position is established by an explicit end-of-file
+        # seek inside the lock, not by whatever offset the handle last held.
+        self._file = self._path.open("a+b")
+        with _ledger_lock(self._file.fileno()):
+            self._refresh()
 
-    def _load_existing(self) -> None:
-        """Parse the current ledger so re-opens rebuild lineage + detect dupes."""
-        if self._path.exists():
+    def _refresh(self) -> None:
+        """Rebuild the in-process view from the ledger on disk.
+
+        Must be called while holding :func:`_ledger_lock`, which is what makes
+        the result a consistent snapshot rather than a torn read. Replaces the
+        cache wholesale so records deleted or corrupted by another process are
+        reflected here too, instead of lingering as a stale local belief.
+        """
+        try:
+            self._file.seek(0)
+            raw = self._file.read().decode("utf-8")
+        except OSError as exc:
+            raise AuditStoreError(
+                f"could not read existing audit ledger {self._path}: {exc}"
+            ) from exc
+        records: dict[str, AuditEnvelope] = {}
+        for line_number, line in enumerate(raw.splitlines(), start=1):
+            if not line.strip():
+                continue
             try:
-                raw = self._path.read_text(encoding="utf-8")
-            except OSError as exc:
-                raise AuditStoreError(
-                    f"could not read existing audit ledger {self._path}: {exc}"
+                envelope = AuditEnvelope.model_validate_json(line)
+            except Exception as exc:  # noqa: BLE001 - fail-fast boundary
+                raise CorruptLedgerError(
+                    f"audit ledger {self._path} line {line_number} is "
+                    f"not a valid envelope: {exc}"
                 ) from exc
-            if raw:
-                for line_number, line in enumerate(raw.splitlines(), start=1):
-                    if not line.strip():
-                        continue
-                    try:
-                        envelope = AuditEnvelope.model_validate_json(line)
-                    except Exception as exc:  # noqa: BLE001 - fail-fast boundary
-                        raise CorruptLedgerError(
-                            f"audit ledger {self._path} line {line_number} is "
-                            f"not a valid envelope: {exc}"
-                        ) from exc
-                    if envelope.record_id is None:
-                        raise CorruptLedgerError(
-                            f"audit ledger {self._path} line {line_number} "
-                            "has no record_id"
-                        )
-                    self._records[envelope.record_id] = envelope
+            if envelope.record_id is None:
+                raise CorruptLedgerError(
+                    f"audit ledger {self._path} line {line_number} "
+                    "has no record_id"
+                )
+            records[envelope.record_id] = envelope
+        self._records = records
 
     def write(
         self,
@@ -239,10 +344,6 @@ class JsonlAuditStore:
             raise AuditStoreError(
                 f"audit id source returned an empty id for {self._path}"
             )
-        if record_id in self._records:
-            raise DuplicateRecordError(
-                f"audit record id {record_id!r} already exists in {self._path}"
-            )
         envelope = AuditEnvelope(
             record_id=record_id,
             kind=kind,
@@ -255,26 +356,49 @@ class JsonlAuditStore:
             created_at=self._now(),
             payload=payload or {},
         )
-        line = envelope.model_dump_json() + "\n"
-        try:
-            self._file.write(line)
-            self._file.flush()
-            os.fsync(self._file.fileno())
-        except OSError as exc:
-            raise AuditStoreError(
-                f"could not append audit record to {self._path}: {exc}"
-            ) from exc
-        self._records[record_id] = envelope
+        line = (envelope.model_dump_json() + "\n").encode("utf-8")
+        with _ledger_lock(self._file.fileno()):
+            # Refreshed before the duplicate check so a colliding id written by
+            # a sibling process is caught. Checking the cached dict instead
+            # would accept an id that is already on disk.
+            self._refresh()
+            if record_id in self._records:
+                raise DuplicateRecordError(
+                    f"audit record id {record_id!r} already exists in {self._path}"
+                )
+            try:
+                self._file.seek(0, os.SEEK_END)
+                self._file.write(line)
+                self._file.flush()
+                os.fsync(self._file.fileno())
+            except OSError as exc:
+                raise AuditStoreError(
+                    f"could not append audit record to {self._path}: {exc}"
+                ) from exc
+            self._records[record_id] = envelope
         return envelope
 
     def records(self) -> list[AuditEnvelope]:
-        return [
-            self._records[record_id]
-            for record_id in sorted(self._records)
-        ]
+        """Every envelope currently on disk, ordered by ``record_id``.
+
+        Reads through the lock and rebuilds the cache, so this is a
+        cross-process view. Returning the cached list instead would report
+        only what *this* process wrote, which is the blind spot ADR 0003
+        measured.
+        """
+        with _ledger_lock(self._file.fileno()):
+            self._refresh()
+            return [
+                self._records[record_id]
+                for record_id in sorted(self._records)
+            ]
 
     def __len__(self) -> int:
-        return len(self._records)
+        if self._closed:
+            return len(self._records)
+        with _ledger_lock(self._file.fileno()):
+            self._refresh()
+            return len(self._records)
 
     def close(self) -> None:
         if self._closed:

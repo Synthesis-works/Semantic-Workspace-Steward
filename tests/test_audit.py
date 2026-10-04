@@ -165,6 +165,202 @@ def test_store_write_after_close_raises(tmp_path):
         store.write(AuditRecordKind.SNAPSHOT)
 
 
+# ---------------------------------------------------------------------------
+# M14-A: process-safe appends
+#
+# M13 Phase 2 measured 169 of 720 records silently lost across four processes
+# with every child exiting 0 -- no malformed lines, no duplicates, no error.
+# O_APPEND is not atomic on Windows: every writer seeks to the same EOF and the
+# later write displaces the earlier one. These tests pin the fix.
+# ---------------------------------------------------------------------------
+
+_CONCURRENT_CHILD = """
+import sys, time
+from pathlib import Path
+
+path, worker, gate, count = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+
+from sws_agent.audit import AuditRecordKind, JsonlAuditStore
+
+store = JsonlAuditStore(path)
+# Barrier: every child blocks here so the appends genuinely contend instead of
+# trickling in as each interpreter finishes importing.
+while not Path(gate).exists():
+    time.sleep(0.002)
+for i in range(count):
+    store.write(AuditRecordKind.EXECUTION, payload={"worker": worker, "i": i})
+store.close()
+"""
+
+
+def _run_concurrent_writers(path, *, workers: int, per_worker: int):
+    """Spawn independent interpreters, release them together, collect results.
+
+    ``subprocess`` rather than ``multiprocessing`` on purpose: these must be
+    genuinely separate OS processes with no inherited interpreter state, which
+    is the only way the bug reproduces. The parent shares nothing with the
+    children except the ledger path.
+    """
+    import subprocess
+    import sys
+    import time
+
+    gate = path.parent / "go"
+    procs = [
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+            [
+                sys.executable,
+                "-c",
+                _CONCURRENT_CHILD,
+                str(path),
+                str(worker),
+                str(gate),
+                str(per_worker),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for worker in range(workers)
+    ]
+    time.sleep(1.5)  # let every child reach the barrier
+    gate.write_text("go", encoding="utf-8")
+    failures = []
+    for proc in procs:
+        _, stderr = proc.communicate(timeout=180)
+        if proc.returncode != 0:
+            failures.append(stderr.decode("utf-8", "replace")[-400:])
+    return failures
+
+
+def test_concurrent_processes_lose_no_audit_records(tmp_path):
+    """The M13 Phase 2 measurement, as a regression.
+
+    Four processes writing 60 records each lost 35 records before the lock
+    existed, with every child still exiting 0. Anything other than all 240
+    surviving means the append is not atomic again.
+    """
+    path = tmp_path / "audit.jsonl"
+    workers, per_worker = 4, 60
+    failures = _run_concurrent_writers(path, workers=workers, per_worker=per_worker)
+    assert failures == []
+
+    lines = [
+        line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    expected = workers * per_worker
+    assert len(lines) == expected
+    assert len(set(lines)) == expected
+    # Every line must still be a well-formed envelope, not a spliced fragment.
+    for line in lines:
+        envelope = json.loads(line)
+        assert envelope["record_id"]
+        assert envelope["kind"] == AuditRecordKind.EXECUTION.value
+    assert len({json.loads(line)["record_id"] for line in lines}) == expected
+
+
+def test_audit_records_are_not_lost_when_a_writer_fails_mid_run(tmp_path):
+    """A crashed child must not corrupt or truncate a sibling's records."""
+    path = tmp_path / "audit.jsonl"
+    good = _store(path)
+    good.write(AuditRecordKind.RUN, payload={"seed": True})
+    good.close()
+
+    import subprocess
+    import sys
+
+    crashing = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [
+            sys.executable,
+            "-c",
+            "import os, sys\n"
+            "from sws_agent.audit import AuditRecordKind, JsonlAuditStore\n"
+            "store = JsonlAuditStore(sys.argv[1])\n"
+            "store.write(AuditRecordKind.EXECUTION, payload={'partial': True})\n"
+            "os._exit(9)\n",
+            str(path),
+        ],
+        capture_output=True,
+        timeout=120,
+    )
+    assert crashing.returncode == 9
+
+    reopened = _store(path)
+    try:
+        kinds = [record.kind for record in reopened.records()]
+    finally:
+        reopened.close()
+    assert AuditRecordKind.RUN in kinds
+    assert AuditRecordKind.EXECUTION in kinds
+
+
+def test_second_handle_sees_records_written_by_the_first(tmp_path):
+    """``records()`` reads through the lock, not from a process-local cache."""
+    path = tmp_path / "audit.jsonl"
+    first = _store(path, id_source=SeqIds("first"))
+    second = _store(path, id_source=SeqIds("second"))
+    try:
+        first.write(AuditRecordKind.RUN, payload={"n": 1})
+        first.write(AuditRecordKind.SNAPSHOT, payload={"n": 2})
+        # 'second' has written nothing; it must still report both records.
+        assert len(second.records()) == 2
+        assert len(second) == 2
+        second.write(AuditRecordKind.DECISION, payload={"n": 3})
+        assert len(first.records()) == 3
+        assert len(first) == 3
+    finally:
+        first.close()
+        second.close()
+
+
+def test_duplicate_record_id_written_by_another_process_is_detected(tmp_path):
+    """The duplicate check reads the ledger, not only this process's cache."""
+    path = tmp_path / "audit.jsonl"
+    other = _store(path)
+    try:
+        other.write(AuditRecordKind.RUN, payload={"from": "other-process"})
+    finally:
+        other.close()
+
+    # A fresh handle whose id_source collides with the record already on disk.
+    colliding = JsonlAuditStore(
+        path, now=_clock, id_source=lambda: "rec-0001"
+    )
+    try:
+        with pytest.raises(DuplicateRecordError):
+            colliding.write(AuditRecordKind.RUN, payload={"from": "this-process"})
+    finally:
+        colliding.close()
+
+
+def test_audit_store_defines_no_execution_authority_surface(tmp_path):
+    """Audit is evidence. Nothing here may answer "may I proceed?".
+
+    ADR 0003 keeps execution state in a separate ledger precisely so a
+    persistence bug in the evidentiary store cannot become a safety decision.
+    """
+    forbidden = (
+        "reserve",
+        "mark_attempted",
+        "record_outcome",
+        "consume",
+        "release",
+        "takeover",
+        "lock_execution",
+    )
+    public = {
+        name
+        for name in dir(JsonlAuditStore)
+        if not name.startswith("_")
+    }
+    assert public.isdisjoint(forbidden)
+    assert public == {
+        "write",
+        "records",
+        "close",
+        "path",
+    }
+
+
 def test_store_naive_clock_fails_fast(tmp_path):
     def naive() -> datetime:
         return datetime(2026, 3, 1, 12, 0)

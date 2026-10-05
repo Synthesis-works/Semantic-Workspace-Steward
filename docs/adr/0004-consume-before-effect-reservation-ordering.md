@@ -100,6 +100,14 @@ whether this intent is still executable. The first question is the one ADR 0003
 settled. The second is the one that keeps a second ticket from replaying an effect
 that already happened.
 
+> **Superseded on one point by [ADR 0007](0007-semantic-execution-re-execution-classification.md).**
+> The ruling and table below -- only a recorded `FAILED` permits a re-execution --
+> is replaced by a recorded `ReexecutionClass` basis. It is left here as the
+> decision that was in force and as the record of why it turned out to be wrong
+> in both directions at once. The ordering decision this ADR establishes --
+> consume authorization before the irreversible effect, reserve to prevent
+> double-claim -- is unchanged and remains in force.
+
 The ruling is that only a recorded `FAILED` permits a re-execution:
 
 | Prior same-intent execution | Fresh ticket |
@@ -305,8 +313,10 @@ acted on.
 
 A cost that is specifically *not* accepted: the guard cannot tell a re-execution that
 an operator intended from one that a retry loop started, because both arrive as a fresh
-ticket. The ledger permits only the second kind's precondition (a prior `FAILED`) and
-records the fact, but attributing intent is not something a durable row can do.
+ticket. The ledger permits only the second kind's precondition (a prior execution
+recorded under a basis that permits repeating it -- `FAILED` under the ruling
+superseded by ADR 0007) and records the fact, but attributing intent is not something a
+durable row can do.
 
 Two honest costs are recorded rather than papered over. First, the ledger
 accumulates permanently unresolved and stale rows, and something eventually has to

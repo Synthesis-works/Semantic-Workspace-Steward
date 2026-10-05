@@ -63,6 +63,11 @@ existing ``execution_intent_key`` over ``(snapshot_id, resource_id, action)``.
   section worried about is not permanently blocked, and a second ticket
   cannot replay an effect that already happened. See ADR 0004.
 
+  M15-B replaced "is not ``FAILED``" with "is not recorded under a
+  :class:`ReexecutionClass` that permits one", because a settled outcome word
+  could not distinguish a request that never left the process from one AWS
+  definitively refused for a target that cannot be acted on. See ADR 0007.
+
 State machine
 -------------
 
@@ -169,6 +174,8 @@ __all__ = (
     "DEFAULT_EXECUTION_STALE_AFTER",
     "EXECUTION_LEDGER_SCHEMA_VERSION",
     "LEGAL_EXECUTION_TRANSITIONS",
+    "LEGAL_REEXECUTION_CLASSES_FOR_OUTCOME",
+    "RETRYABLE_REEXECUTION_CLASSES",
     "TERMINAL_EXECUTION_STATES",
     "AlreadyAttemptedError",
     "AlreadyReservedError",
@@ -181,6 +188,7 @@ __all__ = (
     "ExecutionReservationState",
     "IntentAlreadyExecutedError",
     "InvalidExecutionTransitionError",
+    "ReexecutionClass",
     "ReservationConflictError",
     "ReservationOwnershipError",
     "ReservationRevisionConflictError",
@@ -189,14 +197,26 @@ __all__ = (
     "UnknownReservationError",
 )
 
-EXECUTION_LEDGER_SCHEMA_VERSION: Final[int] = 2
+EXECUTION_LEDGER_SCHEMA_VERSION: Final[int] = 3
 """Schema version of the durable execution ledger.
 
 Bumped only by an explicit migration. Opening a ledger whose recorded
 version differs is a hard failure: silently reading a layout this build
 does not understand is how a durable store starts lying about which
 executions were claimed.
+
+Version 3 adds the ``reexecution_class`` column (see :class:`ReexecutionClass`)
+and is reached from version 2 by :data:`_MIGRATIONS_V2_TO_V3`. That migration
+is behaviour-preserving except for one intended correction: a version 2 row
+recorded ``NOT_EXECUTED`` or ``REFUSED`` permanently blocked its intent, because
+only a literal ``failed`` outcome permitted a second execution. Under version 3
+those rows carry :attr:`ReexecutionClass.NO_EFFECT` and permit one, which is
+the correction the classification exists to make. Every other version 2 row
+keeps the retryability it already had.
 """
+
+_PREVIOUS_EXECUTION_LEDGER_SCHEMA_VERSION: Final[int] = 2
+"""The one schema version this build knows how to migrate forward from."""
 
 DEFAULT_EXECUTION_BUSY_TIMEOUT_SECONDS: Final[float] = 5.0
 """How long a writer waits for SQLite's write lock before failing loudly."""
@@ -295,6 +315,191 @@ _OPEN_STATES: Final[frozenset[ExecutionReservationState]] = frozenset(
 )
 
 
+# --- Re-execution semantics --------------------------------------------------
+
+
+class ReexecutionClass(str, enum.Enum):
+    """Why repeating an intent is, or is not, semantically safe.
+
+    ``ExecutionOutcome`` records *what was observed*. It cannot answer
+    *whether the same thing may be attempted again*, because ``FAILED`` covers
+    four situations that differ enormously in blast radius:
+
+    * a request that never left the process;
+    * a request AWS definitively rejected as invalid for that target;
+    * a request AWS accepted whose post-state can no longer be reached;
+    * a request AWS accepted whose post-state was simply not reached yet.
+
+    Treating the first and the second as equivalent is how a stopped instance
+    becomes an unbounded retry loop against an ARN that no longer exists, and
+    how a pre-dispatch credential failure permanently burns an intent that
+    never had an effect to protect.
+
+    So retryability is recorded as its own fact, derived from the evidence
+    rather than from the spelling of the outcome. Membership in
+    :data:`RETRYABLE_REEXECUTION_CLASSES` is the decision; the ledger applies it
+    in ``reserve`` and nowhere else.
+    """
+
+    NO_EFFECT = "no_effect"
+    """Nothing external happened, and that is a positive established fact.
+
+    Repeating the intent is permitted. The one word to keep out of this
+    definition is *probably*: this class is only for an established absence of
+    effect, which is why it may be recorded from
+    ``DispatchDisposition.NOT_DISPATCHED`` and from nothing else. A dispatch
+    that crossed the boundary without establishing what happened is
+    :attr:`OUTCOME_UNKNOWN`, not this.
+    """
+
+    TRANSIENT_REJECTION = "transient_rejection"
+    """The provider definitively refused the request, so no effect occurred.
+
+    Repeating the intent is permitted, and the reason is **the established
+    rejection** -- not a belief that this particular error is temporary. The
+    name says what the *code* may do, not what SWS knows about the error's
+    duration; nothing here has observed that the cause will pass.
+
+    This matters for codes SWS has never seen. An unrecognised rejection is
+    still a rejection: the provider answered instead of accepting, so nothing
+    was applied, and that is a positive fact rather than an absence of one.
+    ``transient`` therefore reads as "not terminal by declaration", which is the
+    honest description of a code no action has classified yet.
+
+    The distinction from :attr:`NO_EFFECT` is load-bearing and must not be
+    collapsed. ``NO_EFFECT`` means the request never left the process, and only
+    ``DispatchDisposition.NOT_DISPATCHED`` may claim it. ``TRANSIENT_REJECTION``
+    means a request was written and answered. Keeping them apart is what stops a
+    refused call from later being mistaken for one that was never sent.
+    """
+
+    POST_STATE_NOT_REACHED = "post_state_not_reached"
+    """The mutation was accepted, the desired post-state was not reached in
+    time, and the evidence says the target is still actionable. Repeating the
+    intent is safe."""
+
+    TARGET_INVALID = "target_invalid"
+    """AWS definitively rejected the request as invalid for this target -- the
+    resource does not exist, or its state forbids the operation. Repeating the
+    intent cannot succeed until a human re-observes the target and re-plans."""
+
+    POST_STATE_UNREACHABLE = "post_state_unreachable"
+    """The mutation was accepted and the observed post-state is one from which
+    the canonical postcondition can never be reached. Repeating the intent
+    cannot succeed and, for a terminating target, is not merely useless."""
+
+    OUTCOME_UNKNOWN = "outcome_unknown"
+    """Whether the mutation took effect was never established. Repeating the
+    intent risks a second effect on top of an unknown first."""
+
+    EFFECT_ACHIEVED = "effect_achieved"
+    """The intent was achieved. Repeating it would perform the effect twice."""
+
+
+RETRYABLE_REEXECUTION_CLASSES: Final[frozenset[ReexecutionClass]] = frozenset(
+    {
+        ReexecutionClass.NO_EFFECT,
+        ReexecutionClass.TRANSIENT_REJECTION,
+        ReexecutionClass.POST_STATE_NOT_REACHED,
+    }
+)
+"""Classes under which a fresh ticket for the same intent is permitted.
+
+Read as a set rather than derived from a flag on each member so that adding a
+class is a deliberate act with an obvious question attached -- what does this
+permit? -- instead of a default that silently widens re-execution.
+"""
+
+LEGAL_REEXECUTION_CLASSES_FOR_OUTCOME: Final[
+    dict[ExecutionOutcome, frozenset[ReexecutionClass]]
+] = {
+    ExecutionOutcome.REFUSED: frozenset({ReexecutionClass.NO_EFFECT}),
+    ExecutionOutcome.NOT_EXECUTED: frozenset({ReexecutionClass.NO_EFFECT}),
+    ExecutionOutcome.VERIFIED_SUCCESS: frozenset({ReexecutionClass.EFFECT_ACHIEVED}),
+    ExecutionOutcome.PARTIALLY_VERIFIED: frozenset(
+        {ReexecutionClass.EFFECT_ACHIEVED}
+    ),
+    ExecutionOutcome.FAILED: frozenset(
+        {
+            ReexecutionClass.NO_EFFECT,
+            ReexecutionClass.TRANSIENT_REJECTION,
+            ReexecutionClass.POST_STATE_NOT_REACHED,
+            ReexecutionClass.TARGET_INVALID,
+            ReexecutionClass.POST_STATE_UNREACHABLE,
+        }
+    ),
+    ExecutionOutcome.UNKNOWN: frozenset({ReexecutionClass.OUTCOME_UNKNOWN}),
+}
+"""The complete outcome-to-class compatibility table, enforced on every write.
+
+This is the answer to "could a future outcome quietly inherit the old
+``FAILED`` means retryable assumption?". A new :class:`ExecutionOutcome` cannot
+be added without being placed here, and being placed here means stating which
+classes it may carry. Two entries carry most of the safety:
+
+* ``UNKNOWN`` admits **only** ``OUTCOME_UNKNOWN``, so an ambiguous attempt can
+  never be recorded in a way that permits a second execution;
+* ``FAILED`` admits the three non-retryable classes as well as the retryable
+  ones, so the distinction the caller must actually make is visible in the type
+  of the call it has to write.
+
+Both directions matter. Refusing an incoherent pair at write time is what keeps
+a future caller from making a safe-looking recording that the re-execution
+query would then honour.
+"""
+
+
+def _retryable_sql() -> str:
+    """Render the retryable class values as a SQL ``IN`` list.
+
+    Derived from :data:`RETRYABLE_REEXECUTION_CLASSES` rather than written out,
+    so the SQL the re-execution decision runs on cannot drift from the set the
+    vocabulary declares. The values are enum members of a closed ``str`` enum,
+    so interpolation is safe here and keeps the predicate readable in a query
+    log; it is not a place where a caller-supplied string could reach.
+    """
+    return ", ".join(
+        f"'{c.value}'"
+        for c in sorted(RETRYABLE_REEXECUTION_CLASSES, key=lambda c: c.value)
+    )
+
+
+_MIGRATIONS_V2_TO_V3: Final[tuple[str, ...]] = (
+    "ALTER TABLE execution_reservation ADD COLUMN reexecution_class TEXT",
+    # A terminal version 2 row carried an outcome but no basis, so the basis is
+    # reconstructed from the retryability version 2 actually applied: only a
+    # literal 'failed' permitted a second execution. The one row whose
+    # retryability changes is a terminal 'not_executed' or 'refused' row, which
+    # becomes NO_EFFECT and therefore permits one -- the correction this
+    # migration exists alongside. Open rows keep a NULL class, which is what
+    # "no basis recorded yet" means and is exactly what reserve() treats as
+    # blocking.
+    "UPDATE execution_reservation SET reexecution_class = CASE "
+    "WHEN state = 'unresolved' THEN 'outcome_unknown' "
+    "WHEN state = 'resolved' AND outcome = 'failed' THEN 'transient_rejection' "
+    "WHEN state = 'resolved' AND outcome IN ('not_executed', 'refused') "
+    "THEN 'no_effect' "
+    "WHEN state = 'resolved' THEN 'effect_achieved' "
+    "ELSE NULL END",
+    "UPDATE meta SET value = '3' WHERE key = 'schema_version'",
+)
+"""Ordered statements taking a version 2 ledger to version 3.
+
+Applied inside one transaction, so a ledger is never left half-migrated. The
+backfill is a data transformation and is deliberately expressed as SQL rather
+than as row-by-row Python: it must apply to rows no caller is reading yet,
+because the transaction that runs it holds the write lock.
+
+Every version 2 row that ends up terminal is backfilled, and no open row is.
+The mapping is the retryability version 2 actually applied, read back out of
+its own rule rather than re-decided: only a literal ``'failed'`` permitted a
+second execution, so a ``'failed'`` row becomes ``TRANSIENT_REJECTION`` and a
+``'not_executed'`` or ``'refused'`` row becomes ``NO_EFFECT``. Those two are the
+rows whose retryability changes -- they now permit an execution, because there
+was never any external effect to protect.
+"""
+
+
 # --- Errors -----------------------------------------------------------------
 # The taxonomy is defined in `interfaces` and imported above; see the re-export
 # note there.
@@ -325,6 +530,7 @@ class ExecutionReservation:
     resource_id: str | None = None
     action: PotentialAction | None = None
     outcome: ExecutionOutcome | None = None
+    reexecution_class: ReexecutionClass | None = None
     stale_after: timedelta = DEFAULT_EXECUTION_STALE_AFTER
     supersedes_reservation_id: str | None = None
 
@@ -346,8 +552,30 @@ class ExecutionReservation:
         gate on: it is true for ``ATTEMPTED`` and stays true through the
         terminal states, so an ``UNRESOLVED`` execution can never be
         mistaken for one that provably never called AWS.
+
+        It is deliberately a *lower* bound derived from state alone, and it
+        can disagree with :attr:`permits_reexecution`: a ``NOT_EXECUTED`` row
+        is ``ATTEMPTED``, so this reads true, while the recorded basis says no
+        effect occurred. The disagreement is the honest one. State can only
+        say the boundary was recorded as crossed before the handler was
+        called; the class is later evidence about what the handler learned.
         """
         return self.state is not ExecutionReservationState.RESERVED
+
+    @property
+    def permits_reexecution(self) -> bool:
+        """True when a fresh ticket for this intent may be reserved.
+
+        False for every open row: an execution that has not settled has not
+        earned a second attempt regardless of what might have happened to it.
+        For a terminal row the answer is read from the recorded
+        :class:`ReexecutionClass` alone -- never from the outcome's spelling --
+        so the decision an operator reads out of the ledger is the same one
+        ``reserve`` applies.
+        """
+        if not self.is_terminal:
+            return False
+        return self.reexecution_class in RETRYABLE_REEXECUTION_CLASSES
 
     def is_stale(self, as_of: datetime | None = None) -> bool:
         """True when no state change has happened within ``stale_after``.
@@ -379,6 +607,7 @@ _RESERVATION_COLUMNS: Final[tuple[str, ...]] = (
     "worker_id",
     "state",
     "outcome",
+    "reexecution_class",
     "revision",
     "created_at",
     "updated_at",
@@ -407,6 +636,7 @@ _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         worker_id      TEXT NOT NULL,
         state          TEXT NOT NULL,
         outcome        TEXT,
+        reexecution_class TEXT,
         revision       INTEGER NOT NULL,
         created_at     TEXT NOT NULL,
         updated_at     TEXT NOT NULL,
@@ -427,6 +657,16 @@ transaction before it runs, which would silently end the ``BEGIN
 IMMEDIATE`` that makes schema creation race-free against a second process
 opening the same file for the first time.
 
+``reexecution_class`` is ``NULL`` on an open row and non-``NULL`` on every
+terminal row, and nothing in the schema enforces that: the invariant needs the
+meaning of the two columns together, which is application logic, and
+:meth:`DurableExecutionLedger.verify` proves it rather than trusting it. The
+alternative -- a ``CHECK`` constraint -- would be enforceable but would make an
+``UPDATE`` that sets ``state`` and ``outcome`` together fail unless it also
+repeated the class, spreading one invariant across three columns in every write
+statement. The column is therefore queryable evidence and the ledger is the
+authority that keeps it honest.
+
 ``UNIQUE (intent_key, ticket_id)`` is the database-level guarantee behind
 Part 12's invariant: once a reservation exists for a pair, no second
 reservation for that pair can exist, no matter how many processes race and
@@ -440,8 +680,8 @@ plain ``TEXT`` column with no foreign key: the ledger commits exactly one row
 per transaction and has no cascade story, and a self-referential constraint
 would only let a corrupted file constrain its own corruption. The reference
 is validated in ``reserve`` instead, and the invariant it protects -- a
-reattempt may only supersede a ``FAILED`` execution of the *same* intent -- is
-therefore enforced by the only operation able to create the reference.
+reattempt may only supersede an execution whose recorded basis permits one --
+is therefore enforced by the only operation able to create the reference.
 
 That rule is deliberately *not* expressible as a SQL constraint, and the
 reason is worth recording because it looks like something the database should
@@ -449,12 +689,12 @@ do. A partial ``UNIQUE`` index cannot express it, because an index constrains
 only the rows it contains and a fresh reservation carries ``outcome IS NULL``:
 it would never enter an outcome-scoped index, so the index could never stop a
 second execution from starting. A state-scoped index fails in the opposite
-direction -- the first permitted ``FAILED`` reattempt settles into ``resolved``
+direction -- the first permitted reattempt settles into ``resolved``
 and collides with the very index meant to allow it. The decision needs the
-outcome, and an outcome is only meaningful read against its own row's state.
-That is application logic, and it is safe inside ``reserve`` only because the
-``BEGIN IMMEDIATE`` transaction already holds the write lock across both the
-read and the insert.
+recorded basis, and a basis is only meaningful read against its own row's
+state. That is application logic, and it is safe inside ``reserve`` only
+because the ``BEGIN IMMEDIATE`` transaction already holds the write lock
+across both the read and the insert.
 
 There is deliberately no event table. The approval ledger needs one because
 it commits two related rows per transition and must prove they landed
@@ -560,9 +800,12 @@ class DurableExecutionLedger:
         :meth:`reserve` therefore also decides, atomically and in the same
         transaction, whether the intent itself is still executable, and raises
         :class:`IntentAlreadyExecutedError` unless the only prior same-intent
-        execution recorded ``FAILED``. A ``FAILED`` prior is permitted and its
-        reservation id is recorded in ``supersedes_reservation_id``, so the
-        permission is auditable rather than merely implied.
+        execution recorded a :class:`ReexecutionClass` that permits repeating
+        the intent. A permitted prior's reservation id is recorded in
+        ``supersedes_reservation_id``, so the permission is auditable rather
+        than merely implied -- and because the lineage query selects on the
+        same basis, a row that blocks permission can never be the row lineage
+        points at.
 
         This decision lives here and not in the caller deliberately. Exposing
         it as a separate read would restore exactly the read-then-act race the
@@ -601,14 +844,15 @@ class DurableExecutionLedger:
             if blocking is not None:
                 self._raise_intent_conflict_for(blocking)
             # No prior execution blocks this intent, so the only thing that
-            # can legitimately be superseded is a prior FAILED attempt. Its
-            # reference is recorded durably so a later reader can answer why
-            # this intent was permitted a second execution, rather than
-            # inferring it from two rows sharing an intent key.
-            prior_failed = self._select_reattemptable_prior(conn, intent_key)
+            # can legitimately be superseded is a prior attempt whose recorded
+            # basis permits one. Its reference is recorded durably so a later
+            # reader can answer why this intent was permitted a second
+            # execution, rather than inferring it from two rows sharing an
+            # intent key.
+            prior_reattemptable = self._select_reattemptable_prior(conn, intent_key)
             supersedes = (
-                str(prior_failed["reservation_id"])
-                if prior_failed is not None
+                str(prior_reattemptable["reservation_id"])
+                if prior_reattemptable is not None
                 else None
             )
             if supersedes is not None:
@@ -618,9 +862,9 @@ class DurableExecutionLedger:
                     "INSERT INTO execution_reservation ("
                     "reservation_id, intent_key, ticket_id, ticket_revision, "
                     "action_plan_id, resource_id, action, worker_id, state, "
-                    "outcome, revision, created_at, updated_at, "
-                    "supersedes_reservation_id"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "outcome, reexecution_class, revision, created_at, "
+                    "updated_at, supersedes_reservation_id"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         reservation_id,
                         intent_key,
@@ -631,6 +875,7 @@ class DurableExecutionLedger:
                         action.value if action is not None else None,
                         worker_id,
                         ExecutionReservationState.RESERVED.value,
+                        None,
                         None,
                         0,
                         _format_ts(moment),
@@ -693,6 +938,7 @@ class DurableExecutionLedger:
             ExecutionReservationState.ATTEMPTED,
             worker_id=worker_id,
             outcome=None,
+            reexecution_class=None,
             expected_revision=expected_revision,
         )
 
@@ -703,6 +949,7 @@ class DurableExecutionLedger:
         outcome: ExecutionOutcome,
         *,
         worker_id: str,
+        reexecution_class: ReexecutionClass,
         expected_revision: int | None = None,
     ) -> ExecutionReservation:
         """Record what happened, moving to ``RESOLVED`` or ``UNRESOLVED``.
@@ -720,12 +967,36 @@ class DurableExecutionLedger:
         ``UNKNOWN`` outcome recorded as a settled resolution. Deriving the
         state here makes that unrepresentable.
 
+        ``reexecution_class`` is the recorded *basis* for whether the intent
+        may be attempted again, and it is a required keyword argument rather
+        than an optional one for the reason the vocabulary exists: a default
+        would recreate exactly the implicit ``FAILED`` means retryable
+        assumption this replaces, and would let a new call site inherit it
+        without anyone deciding. It is validated against
+        :data:`LEGAL_REEXECUTION_CLASSES_FOR_OUTCOME`, so the combinations
+        that would weaken re-execution safety -- an ``UNKNOWN`` recorded as
+        retryable, a success recorded as retryable -- cannot be written at
+        all.
+
         ``worker_id`` must be the worker that holds the reservation.
         """
         if not isinstance(outcome, ExecutionOutcome):
             raise TypeError(
                 "record_outcome requires an ExecutionOutcome, got "
                 f"{type(outcome).__name__}"
+            )
+        if not isinstance(reexecution_class, ReexecutionClass):
+            raise TypeError(
+                "record_outcome requires a ReexecutionClass stating why "
+                "repeating this intent is or is not safe, got "
+                f"{type(reexecution_class).__name__}"
+            )
+        legal = LEGAL_REEXECUTION_CLASSES_FOR_OUTCOME[outcome]
+        if reexecution_class not in legal:
+            raise ValueError(
+                f"outcome {outcome.value!r} cannot be recorded with "
+                f"reexecution class {reexecution_class.value!r}; it admits "
+                f"{sorted(c.value for c in legal)}"
             )
         state = (
             ExecutionReservationState.UNRESOLVED
@@ -738,6 +1009,7 @@ class DurableExecutionLedger:
             state,
             worker_id=worker_id,
             outcome=outcome,
+            reexecution_class=reexecution_class,
             expected_revision=expected_revision,
         )
 
@@ -862,9 +1134,19 @@ class DurableExecutionLedger:
     def _verify_state_outcome(
         self, reservation: ExecutionReservation
     ) -> None:
-        """Reject a row whose state and outcome contradict each other."""
+        """Reject a row whose state, outcome, and basis contradict each other.
+
+        The state/outcome half predates :class:`ReexecutionClass`. The basis
+        half is checked with it rather than separately because the invariant
+        spans all three: a settled row must carry a basis, an open row must not,
+        and the basis must be one the outcome admits. Checking any two without
+        the third would leave exactly the row that matters -- a settled row
+        whose basis says repeating the intent is safe -- able to disagree with
+        the pair it was recorded with.
+        """
         state = reservation.state
         outcome = reservation.outcome
+        basis = reservation.reexecution_class
         if state is ExecutionReservationState.UNRESOLVED:
             if outcome is not ExecutionOutcome.UNKNOWN:
                 raise ExecutionLedgerCorruptionError(
@@ -873,20 +1155,48 @@ class DurableExecutionLedger:
                     f"outcome {outcome!r}; an unresolved execution must record "
                     "ExecutionOutcome.UNKNOWN"
                 )
-            return
-        if state is ExecutionReservationState.RESOLVED:
+        elif state is ExecutionReservationState.RESOLVED:
             if outcome is None:
                 raise ExecutionLedgerCorruptionError(
                     f"execution ledger {self._path} reservation "
                     f"{reservation.reservation_id!r} is RESOLVED but records no "
                     "outcome"
                 )
-            return
-        if outcome is not None:
+        elif outcome is not None:
             raise ExecutionLedgerCorruptionError(
                 f"execution ledger {self._path} reservation "
                 f"{reservation.reservation_id!r} is {state.value} yet records "
                 f"outcome {outcome!r}; only a terminal state may carry one"
+            )
+        if state in TERMINAL_EXECUTION_STATES:
+            if basis is None:
+                raise ExecutionLedgerCorruptionError(
+                    f"execution ledger {self._path} reservation "
+                    f"{reservation.reservation_id!r} is {state.value} but "
+                    "records no reexecution basis; a settled execution must "
+                    "state whether repeating its intent is safe"
+                )
+            # The branches above already establish that a terminal row has an
+            # outcome: RESOLVED without one and UNRESOLVED with anything other
+            # than UNKNOWN each raised. Stated rather than assumed, because the
+            # next line indexes a closed table by it and a settled row with a
+            # basis but no outcome would be a KeyError rather than a report.
+            assert outcome is not None  # noqa: S101 - established above
+            legal = LEGAL_REEXECUTION_CLASSES_FOR_OUTCOME[outcome]
+            if basis not in legal:
+                raise ExecutionLedgerCorruptionError(
+                    f"execution ledger {self._path} reservation "
+                    f"{reservation.reservation_id!r} records outcome "
+                    f"{outcome.value!r} with reexecution basis {basis.value!r}; "
+                    f"that outcome admits only "
+                    f"{sorted(c.value for c in legal)}"
+                )
+        elif basis is not None:
+            raise ExecutionLedgerCorruptionError(
+                f"execution ledger {self._path} reservation "
+                f"{reservation.reservation_id!r} is {state.value} yet records "
+                f"reexecution basis {basis.value!r}; only a settled execution "
+                "has a basis for repeating its intent"
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -976,12 +1286,19 @@ class DurableExecutionLedger:
                 ) from exc
 
     def _initialize(self) -> None:
-        """Create the schema on first use; validate it on every later open.
+        """Create the schema on first use; validate or migrate it on every
+        later open.
 
         A file that already existed must already be a ledger. Silently running
         ``CREATE TABLE IF NOT EXISTS`` against a foreign or damaged file
         would let the store "repair" it into an empty-but-valid execution
         database, quietly discarding whatever was there.
+
+        The one exception is a file this build has an explicit forward
+        migration for, which is run inside a single transaction and only when
+        the recorded version is exactly the version that migration accepts.
+        Any other version is still a hard failure: an unknown layout is not a
+        layout to guess at.
         """
         if self._preexisting:
             self._adopt_existing()
@@ -1033,6 +1350,48 @@ class DurableExecutionLedger:
                 self._verify_schema_version(conn)
                 return
 
+    def _migrate_if_supported(self, conn: sqlite3.Connection) -> None:
+        """Apply the forward migration this build knows, if one is needed.
+
+        Called only after the file has been established to be a ledger with
+        readable tables. A version that is current, or older than anything with
+        a migration, is left alone and the caller's own version check reports
+        it -- so this method never decides that an unknown version is
+        acceptable, only that a known one does not need changing.
+
+        The version is read twice on purpose: once outside, to avoid taking a
+        write lock on the overwhelmingly common already-current path, and once
+        again *inside* the write transaction, to decide. The outside read is
+        only a fast path and cannot be acted on directly, because two processes
+        opening the same version 2 ledger both observe ``"2"`` and both proceed
+        to ``ALTER TABLE ... ADD COLUMN``; the loser of that race would fail
+        with a bare ``duplicate column name`` from the driver. Re-reading under
+        the write lock means the second process waits for the first to commit,
+        then sees version 3 and does nothing. The migration is therefore
+        exactly-once per file across processes, not merely once per process.
+        """
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if row is None:
+            return
+        recorded = str(row[0])
+        if recorded == str(EXECUTION_LEDGER_SCHEMA_VERSION):
+            return
+        if recorded != str(_PREVIOUS_EXECUTION_LEDGER_SCHEMA_VERSION):
+            return
+        with self._transaction() as txn:
+            settled = txn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if settled is None or str(settled[0]) != recorded:
+                # Another process migrated this file while this one waited for
+                # the write lock. Its result is authoritative; leaving it alone
+                # is the whole point of arriving second.
+                return
+            for statement in _MIGRATIONS_V2_TO_V3:
+                txn.execute(statement)
+
     def _verify_schema_version(self, conn: sqlite3.Connection) -> None:
         # A damaged page surfaces here as a bare sqlite3.DatabaseError. It is
         # re-raised as corruption rather than allowed to escape: callers of this
@@ -1054,7 +1413,7 @@ class DurableExecutionLedger:
                     f"{', '.join(missing)}; refusing to treat a foreign file as an "
                     "execution authority"
                 )
-            row = conn.execute(
+            conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()
         except ExecutionLedgerCorruptionError:
@@ -1064,13 +1423,29 @@ class DurableExecutionLedger:
                 f"execution ledger {self._path} is unreadable while checking its "
                 f"schema: {exc}"
             ) from exc
-        if row is None:
+        # Establish the tables are a ledger before anything rewrites the file:
+        # the migration is only ever run against a file that has already proved
+        # it is one. Reading the version is left to _migrate_if_supported, which
+        # takes its own decision under the write lock; comparing the value read
+        # here would reject every file this build just migrated, because that
+        # value is the pre-migration one.
+        self._migrate_if_supported(conn)
+        try:
+            current = conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:  # pragma: no cover - migration wrote
+            raise ExecutionLedgerCorruptionError(
+                f"execution ledger {self._path} became unreadable while "
+                f"migrating its schema: {exc}"
+            ) from exc
+        if current is None:
             raise ExecutionLedgerCorruptionError(
                 f"execution ledger {self._path} has no recorded schema version"
             )
-        if str(row[0]) != str(EXECUTION_LEDGER_SCHEMA_VERSION):
+        if str(current[0]) != str(EXECUTION_LEDGER_SCHEMA_VERSION):
             raise ExecutionLedgerCorruptionError(
-                f"execution ledger {self._path} has schema version {row[0]}, "
+                f"execution ledger {self._path} has schema version {current[0]}, "
                 f"this build understands {EXECUTION_LEDGER_SCHEMA_VERSION}"
             )
 
@@ -1112,11 +1487,18 @@ class DurableExecutionLedger:
         """Return the prior same-intent execution that blocks a new ticket.
 
         Returns the row only when it must *block*: an in-flight claim, an
-        attempt that may have crossed the boundary, or a terminal outcome that
-        records a known or unknown effect. A prior ``FAILED`` is not returned,
-        because a known unsuccessful attempt is precisely the case a separately
-        authorized reattempt exists for -- but its row is still needed so the
-        caller can record lineage, so ``reserve`` re-reads it separately.
+        attempt that may have crossed the boundary, or a settled execution
+        whose recorded basis does not permit repeating the intent. A prior
+        attempt recorded under a retryable class is not returned, because
+        repeating the intent is precisely what that basis authorizes -- but
+        its row is still needed so the caller can record lineage, so
+        ``reserve`` re-reads it separately.
+
+        The terminal test reads ``reexecution_class``, never ``outcome``. A
+        settled row with a NULL class is treated as blocking rather than
+        skipped: an absent basis is an absence of evidence for permission,
+        and the only two ways to produce one are a pre-migration file or a
+        corrupted row, neither of which should authorize a second effect.
 
         Ordering is deterministic so a caller that wants the *reason* can
         report it: in-flight states before terminal ones, then oldest first.
@@ -1126,9 +1508,9 @@ class DurableExecutionLedger:
             "WHERE intent_key = ? "
             "AND ("
             "  state IN ('reserved', 'attempted')"
-            "  OR (state = 'resolved' AND outcome IN ("
-            "       'verified_success', 'partially_verified'))"
             "  OR state = 'unresolved'"
+            f"  OR (state = 'resolved' AND (reexecution_class IS NULL"
+            f"       OR reexecution_class NOT IN ({_retryable_sql()})))"
             ") "
             "ORDER BY CASE state WHEN 'attempted' THEN 0 WHEN 'reserved' THEN 1 "
             "ELSE 2 END, created_at, reservation_id "
@@ -1139,17 +1521,19 @@ class DurableExecutionLedger:
     def _select_reattemptable_prior(
         self, conn: sqlite3.Connection, intent_key: str
     ) -> sqlite3.Row | None:
-        """Return the newest prior same-intent row recorded ``FAILED``.
+        """Return the newest prior row whose basis permits repeating the intent.
 
-        A ``FAILED`` outcome is the only prior fact that permits a second
-        execution of the same intent, so it is the only one whose row becomes
-        durable lineage. If several ``FAILED`` attempts exist, the most recent
-        is the immediate predecessor, and naming it keeps the chain readable
-        rather than implying the new attempt follows the first failure only.
+        The recorded :class:`ReexecutionClass` is the whole test, so lineage
+        and permission cannot disagree: the row a reattempt points at is
+        selected by the same rule that allowed the reattempt. If several
+        permitted priors exist, the most recent is the immediate predecessor,
+        and naming it keeps the chain readable rather than implying the new
+        attempt follows the first failure only.
         """
         return conn.execute(
             "SELECT * FROM execution_reservation "
-            "WHERE intent_key = ? AND state = 'resolved' AND outcome = 'failed' "
+            "WHERE intent_key = ? AND state = 'resolved' "
+            f"AND reexecution_class IN ({_retryable_sql()}) "
             "ORDER BY updated_at DESC, reservation_id DESC "
             "LIMIT 1",
             (intent_key,),
@@ -1158,9 +1542,15 @@ class DurableExecutionLedger:
     def _raise_intent_conflict_for(self, row: sqlite3.Row) -> None:
         """Refuse a fresh ticket for an intent whose effect may already exist.
 
-        Called only for the states :meth:`_select_blocking_prior` classified
-        as blocking, so this never fires for a ``FAILED`` prior -- that case
-        is a permitted reattempt and must carry lineage instead.
+        Called only for rows :meth:`_select_blocking_prior` classified as
+        blocking, so this never fires for a prior whose recorded basis permits
+        a reattempt -- that case is permitted and must carry lineage instead.
+
+        The settled branch names the recorded basis rather than only the
+        outcome, because "the effect is known to have occurred" and "the effect
+        was definitively refused for this target" are different refusals with
+        different remedies, and an operator reading only the outcome word would
+        be told to do the wrong thing.
         """
         state = ExecutionReservationState(row["state"])
         intent = f"intent {row['intent_key']!r}"
@@ -1189,8 +1579,10 @@ class DurableExecutionLedger:
             )
         raise IntentAlreadyExecutedError(
             f"{intent} already has a RESOLVED execution "
-            f"{row['reservation_id']!r} with outcome {row['outcome']!r}; the "
-            "effect is known to have occurred and must not be repeated"
+            f"{row['reservation_id']!r} with outcome {row['outcome']!r} and "
+            f"reexecution basis {row['reexecution_class']!r}; repeating the "
+            "intent is recorded as unsafe. A new ticket is not a substitute "
+            "for a fresh observation and an explicit re-plan"
         )
 
     def verify_lineage(self) -> None:
@@ -1202,8 +1594,9 @@ class DurableExecutionLedger:
 
         * the referenced reservation exists;
         * it belongs to the same ``intent_key``;
-        * it is recorded ``FAILED`` -- a reattempt may never supersede an
-          attempt that did not fail;
+        * it is recorded under a basis that permits a reattempt -- a
+          reattempt may never supersede an execution whose own record says
+          repeating the intent is unsafe;
         * it does not supersede itself, and the chain does not form a cycle,
           so "which attempt came first" always terminates.
 
@@ -1255,15 +1648,20 @@ class DurableExecutionLedger:
                         f"{reservation_id!r} claims to supersede itself"
                     )
                 prior = self._select(conn, str(reference))
-                if prior is None or str(prior["outcome"]) != (
-                    ExecutionOutcome.FAILED.value
-                ):
+                prior_class = (
+                    None if prior is None else str(prior["reexecution_class"])
+                )
+                permitted = prior_class in {
+                    c.value for c in RETRYABLE_REEXECUTION_CLASSES
+                }
+                if prior is None or not permitted:
                     recorded = None if prior is None else str(prior["outcome"])
                     raise ExecutionLedgerCorruptionError(
                         f"execution ledger {self._path} reservation "
                         f"{reservation_id!r} claims to supersede {reference!r}, "
-                        f"whose recorded outcome is {recorded!r}; only a FAILED "
-                        "execution may be superseded by a reattempt"
+                        f"whose recorded outcome is {recorded!r} with basis "
+                        f"{prior_class!r}; only an execution whose recorded "
+                        "basis permits one may be superseded by a reattempt"
                     )
                 # Walk the chain to prove it terminates. Bounded by row count,
                 # so a corrupted cycle is reported rather than hanging.
@@ -1390,6 +1788,7 @@ class DurableExecutionLedger:
         *,
         worker_id: str,
         outcome: ExecutionOutcome | None,
+        reexecution_class: ReexecutionClass | None,
         expected_revision: int | None,
     ) -> ExecutionReservation:
         """Apply one state transition atomically, or not at all.
@@ -1452,6 +1851,7 @@ class DurableExecutionLedger:
                 reservation_id=str(row["reservation_id"]),
                 new_state=new_state,
                 outcome=outcome,
+                reexecution_class=reexecution_class,
                 expected=expected,
                 moment=moment,
             )
@@ -1467,6 +1867,7 @@ class DurableExecutionLedger:
         reservation_id: str,
         new_state: ExecutionReservationState,
         outcome: ExecutionOutcome | None,
+        reexecution_class: ReexecutionClass | None,
         expected: int,
         moment: datetime,
     ) -> None:
@@ -1477,17 +1878,25 @@ class DurableExecutionLedger:
         fields are fixed at reservation time, so leaving them out of the SET
         list makes their immutability here obvious rather than merely true.
 
+        ``outcome`` and ``reexecution_class`` are written by the same
+        statement, never separately. Recording the verdict and the basis for
+        repeating it as two writes would leave a window in which a row claims
+        the effect happened while claiming nothing about whether repeating it
+        is safe.
+
         The WHERE clause is the precondition. If another writer advanced the
         reservation past ``expected`` first, no row matches and the change
         is refused -- the store never overwrites newer execution state.
         """
         cursor = conn.execute(
             "UPDATE execution_reservation SET "
-            "state = ?, outcome = ?, revision = ?, updated_at = ? "
+            "state = ?, outcome = ?, reexecution_class = ?, revision = ?, "
+            "updated_at = ? "
             "WHERE reservation_id = ? AND revision = ?",
             (
                 new_state.value,
                 outcome.value if outcome is not None else None,
+                reexecution_class.value if reexecution_class is not None else None,
                 expected + 1,
                 _format_ts(moment),
                 reservation_id,
@@ -1530,6 +1939,17 @@ class DurableExecutionLedger:
                     f"execution ledger {self._path} holds unknown outcome "
                     f"{outcome_raw!r} for reservation {row['reservation_id']!r}"
                 ) from exc
+        class_raw = row["reexecution_class"]
+        reexecution_class: ReexecutionClass | None = None
+        if class_raw is not None:
+            try:
+                reexecution_class = ReexecutionClass(class_raw)
+            except ValueError as exc:
+                raise ExecutionLedgerCorruptionError(
+                    f"execution ledger {self._path} holds unknown reexecution "
+                    f"class {class_raw!r} for reservation "
+                    f"{row['reservation_id']!r}"
+                ) from exc
         return ExecutionReservation(
             reservation_id=str(row["reservation_id"]),
             intent_key=str(row["intent_key"]),
@@ -1543,6 +1963,7 @@ class DurableExecutionLedger:
             action_plan_id=row["action_plan_id"],
             resource_id=row["resource_id"],
             action=action,
+            reexecution_class=reexecution_class,
             outcome=outcome,
             stale_after=self._stale_after,
             supersedes_reservation_id=row["supersedes_reservation_id"],

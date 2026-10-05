@@ -181,3 +181,62 @@ vocabulary never drifts into SMS's file-lifecycle states.
 - **No schema change.** `AuditEnvelope` and `AUDIT_SCHEMA_VERSION` are
   untouched: the reserved `execution` stanza stays `None` and M9 uses the
   existing kind/payload structure with a new `AuditRecordKind.EXECUTION`.
+
+## Re-execution semantics (M15-B)
+
+- **New vocabulary, orthogonal to the existing one.** `ReexecutionClass`
+  (`execution_ledger.py`) is a fresh SWS definition and is the second member of
+  that canonical-label pair: `ExecutionOutcome` records *what was observed*,
+  `ReexecutionClass` records *whether repeating the same intent is safe*.
+  Nothing is inherited from SMS — a retention model has no external-effect
+  boundary to re-execute across, so the concept does not exist there.
+- **The distinction was not reused from SMS's idempotence or retry handling.**
+  SMS operates on files, where re-running a failed step is idempotent by
+  construction and `UNKNOWN` is recoverable by re-reading the filesystem.
+  SWS crosses an irreversible external boundary, so idempotence is a property to
+  be *established per action* rather than assumed. That is why the basis is a
+  recorded fact with a closed vocabulary instead of a retry flag.
+- **The migration reconstructs, it does not re-decide.** The v2→v3 backfill
+  derives each row's basis from the retryability version 2 actually applied. A
+  `failed` row becomes `TRANSIENT_REJECTION`, not the `TARGET_INVALID` the new
+  rules would assign to a fresh attempt, because re-deciding old rows would
+  rewrite a file's history in a direction nothing in it supports.
+- **No parallel state store.** The basis is a column on the existing
+  `execution_reservation` table and is written by the same statement as the
+  outcome, so there is no second source of truth about whether a row permits a
+  retry. See ADR 0007.
+
+## Dispatch evidence and classification (M15-C)
+
+- **New vocabulary, orthogonal to the existing one.** `DispatchDisposition`
+  (`constants.py`) and `DispatchEvidence` (`models.py`) are fresh SWS
+  definitions. `DispatchDisposition` records *what the boundary learned about the
+  crossing*; `ReexecutionClass` records *whether repeating the intent is safe*;
+  `ExecutionOutcome` records *what was observed*. Three orthogonal questions, none
+  of which can be derived from another.
+- **The disposition table is not reused from SMS.** SMS has no external-effect
+  boundary to characterise: its steps act on files, where "was this dispatched"
+  has no ambiguous middle, because a partially written file is re-read rather than
+  re-dispatched. SWS crosses an irreversible HTTP boundary where the request may
+  have been applied and the response lost, so the disposition must say *which*
+  of those happened rather than defaulting to success.
+- **`MutationAttempt` was extended, not wrapped.** Replacing its booleans in
+  place, rather than adding a parallel evidence object beside them, avoids two
+  ways to describe one crossing and makes the fail-closed direction structural:
+  there is no longer an object with no disposition, so there is nothing for the
+  coordinator to interpret as a claim of success.
+- **Retry policy is not reused from botocore's retry policy.** botocore retries
+  `RequestTimeout`, 5xx, and throttling codes — a read-side policy applied to a
+  mutation, where each retry is another dispatch. `classify_dispatch` has no
+  retry loop and no attempt counter; repeatability is a *recorded basis* produced
+  once from evidence, so "how many times did we dispatch" stays a fact about the
+  call rather than a property of an SDK default.
+- **The per-action tables are deliberately empty.** `DispatchContract` is a
+  carrier for an allowlist, not a default policy, and no action populates it.
+  Reusing botocore's modelled-error list as the rejection table was rejected: that
+  list describes what the API *can* return, not what each code means for re-running
+  *this* intent against *this* target.
+- **No parallel state store.** The classified basis is passed straight to
+  `record_outcome` as its required argument. `classify_dispatch` is the only
+  function in `src/` that produces a `ReexecutionClass`, so there is no second
+  derivation that could disagree with the ledger. See ADR 0007's amendment.

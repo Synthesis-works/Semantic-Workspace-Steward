@@ -355,13 +355,24 @@ class ExecutionLedger(Protocol):
     authority to act. ``reserve`` must additionally decide, atomically in the
     same operation, whether the intent is still executable, and refuse a fresh
     ticket whenever a prior same-intent execution is ``RESERVED``,
-    ``ATTEMPTED``, ``UNRESOLVED``, or resolved with an outcome other than
-    ``FAILED``. Only a recorded ``FAILED`` -- a known unsuccessful attempt --
-    permits a second execution, and that reservation must record which prior
-    execution it supersedes. Exposing this as a separate read is not
-    sufficient: it would restore a read-then-act race between processes, which
-    is the failure this seam exists to prevent.
-    * **Read current state.** Every operation reads durable state. An
+    ``ATTEMPTED``, ``UNRESOLVED``, or settled under a basis that records
+    repeating the intent as unsafe. The basis, not the outcome word, is the
+    test: a settled execution whose recorded basis permits one is permitted and
+    must record which prior execution it supersedes. Exposing this as a
+    separate read is not sufficient: it would restore a read-then-act race
+    between processes, which is the failure this seam exists to prevent.
+* **Re-executability is a recorded fact, not an inference.** Settling an
+    execution requires the caller to state *why* repeating the intent is or is
+    not semantically safe, and the store validates that statement against its
+    own compatibility table rather than storing whatever it is given. The
+    reason is that ``FAILED`` alone cannot carry the decision: a request that
+    never left the process, a request the provider definitively refused as
+    invalid for that target, and a request whose effect was never established
+    are all "unsuccessful" and only the first may be repeated freely. The
+    argument is required rather than defaulted, because a default is how the
+    previous ``FAILED``-implies-retryable rule would survive in every call
+    site that never thought about it.
+* **Read current state.** Every operation reads durable state. An
       implementation must not answer from a cache populated at open, because
       that is precisely the failure this seam exists to close.
     * **Monotonic revision.** Every committed transition advances
@@ -386,12 +397,16 @@ class ExecutionLedger(Protocol):
       whose effect is unknown requires an explicit reconciliation mechanism with
       its own authorization and audit semantics, which M13 deliberately does not
       provide. A new approval ticket is not such a mechanism -- it says nothing
-      about whether the earlier effect occurred.
+      about whether the earlier effect occurred. The same applies to a settled
+      execution whose basis records repeating the intent as unsafe: a fresh
+      ticket does not substitute for re-observing the target and re-planning.
     * **Lineage is derived, not supplied.** ``reserve`` takes no parameter
       naming the prior execution to supersede, so a caller cannot point a
       reservation at an arbitrary row. The reference is a consequence of what
       was already durably recorded, and ``verify_lineage`` proves afterwards
-      that the stored relations are self-consistent.
+      that the stored relations are self-consistent. The lineage query selects
+      on the same basis that permitted the reattempt, so a reservation cannot
+      point at a row that would have blocked it.
 
     Implementations raise ``execution_ledger.UnknownReservationError`` for an
     unclaimed pair and a ``ReservationConflictError`` subclass when the pair
@@ -429,6 +444,7 @@ class ExecutionLedger(Protocol):
         outcome: Any,
         *,
         worker_id: str,
+        reexecution_class: Any,
         expected_revision: int | None = None,
     ) -> Any: ...
 

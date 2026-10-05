@@ -33,6 +33,8 @@ from sws_agent.execution_ledger import (
     DEFAULT_EXECUTION_STALE_AFTER,
     EXECUTION_LEDGER_SCHEMA_VERSION,
     LEGAL_EXECUTION_TRANSITIONS,
+    LEGAL_REEXECUTION_CLASSES_FOR_OUTCOME,
+    RETRYABLE_REEXECUTION_CLASSES,
     TERMINAL_EXECUTION_STATES,
     AlreadyAttemptedError,
     AlreadyReservedError,
@@ -45,6 +47,7 @@ from sws_agent.execution_ledger import (
     ExecutionReservationState,
     IntentAlreadyExecutedError,
     InvalidExecutionTransitionError,
+    ReexecutionClass,
     ReservationConflictError,
     ReservationOwnershipError,
     ReservationRevisionConflictError,
@@ -58,6 +61,24 @@ HOUR = timedelta(hours=1)
 
 INTENT = "intent-aaa"
 OTHER_INTENT = "intent-bbb"
+
+
+def _legal_class_for(outcome: ExecutionOutcome) -> ReexecutionClass:
+    """A basis the ledger will accept for ``outcome``.
+
+    Used only where a test settles with an outcome it chose as a variable. The
+    point of the M15-B contract is that there is no single right answer for
+    ``FAILED``, so these tests state the one they mean rather than reaching for
+    a default; a test that wanted the non-retryable variants says so directly.
+    """
+    return {
+        ExecutionOutcome.REFUSED: ReexecutionClass.NO_EFFECT,
+        ExecutionOutcome.NOT_EXECUTED: ReexecutionClass.NO_EFFECT,
+        ExecutionOutcome.UNKNOWN: ReexecutionClass.OUTCOME_UNKNOWN,
+        ExecutionOutcome.VERIFIED_SUCCESS: ReexecutionClass.EFFECT_ACHIEVED,
+        ExecutionOutcome.PARTIALLY_VERIFIED: ReexecutionClass.EFFECT_ACHIEVED,
+        ExecutionOutcome.FAILED: ReexecutionClass.TRANSIENT_REJECTION,
+    }[outcome]
 
 
 class FakeClock:
@@ -232,7 +253,7 @@ def test_same_intent_different_ticket_is_permitted_after_a_failed_outcome(
     first = _reserve(ledger, ticket_id="t1")
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
     ledger.record_outcome(
-        INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1"
+        INTENT, "t1", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w1"
     )
 
     second = _reserve(ledger, ticket_id="t2", worker_id="w2")
@@ -312,7 +333,7 @@ def test_mark_attempted_crosses_the_boundary(
 def test_record_outcome_resolves(ledger: DurableExecutionLedger) -> None:
     _reserve(ledger)
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
-    resolved = ledger.record_outcome(INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w1")
+    resolved = ledger.record_outcome(INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w1")
     assert resolved.state is ExecutionReservationState.RESOLVED
     assert resolved.outcome is ExecutionOutcome.VERIFIED_SUCCESS
     assert resolved.revision == 2
@@ -325,7 +346,7 @@ def test_unknown_outcome_becomes_unresolved_and_is_terminal(
     """The outcome that must never be confused with success or failure."""
     _reserve(ledger)
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
-    unresolved = ledger.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, worker_id="w1")
+    unresolved = ledger.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN, worker_id="w1")
     assert unresolved.state is ExecutionReservationState.UNRESOLVED
     assert unresolved.outcome is ExecutionOutcome.UNKNOWN
     assert unresolved.is_terminal is True
@@ -337,7 +358,7 @@ def test_unknown_outcome_becomes_unresolved_and_is_terminal(
 def test_unknown_outcome_is_never_retried(ledger: DurableExecutionLedger) -> None:
     _reserve(ledger)
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
-    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, worker_id="w1")
+    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN, worker_id="w1")
     with pytest.raises(AlreadyResolvedError):
         _reserve(ledger, worker_id="w2")
     with pytest.raises(InvalidExecutionTransitionError):
@@ -359,7 +380,7 @@ def test_resolved_execution_is_never_reclaimed(
 ) -> None:
     _reserve(ledger)
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
-    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1")
+    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w1")
     with pytest.raises(AlreadyResolvedError):
         _reserve(ledger, worker_id="w2")
 
@@ -383,7 +404,13 @@ def test_a_reserved_execution_may_only_advance_to_attempted(
         ExecutionOutcome.UNKNOWN,
     ):
         with pytest.raises(InvalidExecutionTransitionError):
-            ledger.record_outcome(INTENT, "t1", outcome, worker_id="w1")
+            ledger.record_outcome(
+                INTENT,
+                "t1",
+                outcome,
+                reexecution_class=_legal_class_for(outcome),
+                worker_id="w1",
+            )
     # Still RESERVED, still not reclaimed.
     assert ledger.get(INTENT, "t1").state is ExecutionReservationState.RESERVED
     assert ledger.get(INTENT, "t1").may_have_crossed_boundary is False
@@ -396,10 +423,10 @@ def test_terminal_states_admit_no_transition(
 ) -> None:
     _reserve(ledger)
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
-    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.PARTIALLY_VERIFIED, worker_id="w1")
+    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.PARTIALLY_VERIFIED, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w1")
     for call in (
         lambda: ledger.mark_attempted(INTENT, "t1", worker_id="w1"),
-        lambda: ledger.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, worker_id="w1"),
+        lambda: ledger.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN, worker_id="w1"),
     ):
         with pytest.raises(InvalidExecutionTransitionError):
             call()
@@ -418,7 +445,13 @@ def test_record_outcome_rejects_a_non_outcome(
     _reserve(ledger)
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
     with pytest.raises(TypeError):
-        ledger.record_outcome(INTENT, "t1", "verified_success", worker_id="w1")  # type: ignore[arg-type]
+        ledger.record_outcome(
+        INTENT,
+        "t1",
+        "verified_success",
+        reexecution_class=ReexecutionClass.EFFECT_ACHIEVED,
+        worker_id="w1",
+    )  # type: ignore[arg-type]
 
 
 def test_conflicts_share_a_base_class(ledger: DurableExecutionLedger) -> None:
@@ -457,7 +490,7 @@ def test_another_worker_cannot_record_a_definite_outcome(
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
     with pytest.raises(ReservationOwnershipError):
         ledger.record_outcome(
-            INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w2"
+            INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w2"
         )
     survivor = ledger.get(INTENT, "t1")
     assert survivor.state is ExecutionReservationState.ATTEMPTED
@@ -470,7 +503,7 @@ def test_another_worker_cannot_record_unknown(
     _reserve(ledger, worker_id="w1")
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
     with pytest.raises(ReservationOwnershipError):
-        ledger.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, worker_id="w2")
+        ledger.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN, worker_id="w2")
     assert ledger.get(INTENT, "t1").state is ExecutionReservationState.ATTEMPTED
 
 
@@ -479,7 +512,7 @@ def test_the_owning_worker_may_transition(ledger: DurableExecutionLedger) -> Non
     assert ledger.mark_attempted(INTENT, "t1", worker_id="w1").revision == 1
     assert (
         ledger.record_outcome(
-            INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w1"
+            INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w1"
         ).state
         is ExecutionReservationState.RESOLVED
     )
@@ -522,7 +555,7 @@ def test_every_transition_increments_revision_by_one(
     assert ledger.mark_attempted(INTENT, "t1", worker_id="w1").revision == 1
     assert ledger.get(INTENT, "t1").revision == 1
     assert (
-        ledger.record_outcome(INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w1").revision
+        ledger.record_outcome(INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w1").revision
         == 2
     )
     assert ledger.get(INTENT, "t1").revision == 2
@@ -555,7 +588,7 @@ def test_cas_never_silently_overwrites(ledger: DurableExecutionLedger) -> None:
     # ATTEMPTED -> RESOLVED is legal, but this writer's view is stale.
     with pytest.raises(ReservationRevisionConflictError):
         ledger.record_outcome(
-            INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w1", expected_revision=0
+            INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w1", expected_revision=0
         )
     survivor = ledger.get(INTENT, "t1")
     assert survivor.revision == 1
@@ -606,7 +639,7 @@ def test_unresolved_executions_lists_everything_without_an_outcome(
     ledger.mark_attempted(OTHER_INTENT, "t2", worker_id="w2")
     _reserve(ledger, intent_key=third, ticket_id="t3", worker_id="w3")
     ledger.mark_attempted(third, "t3", worker_id="w3")
-    ledger.record_outcome(third, "t3", ExecutionOutcome.UNKNOWN, worker_id="w3")
+    ledger.record_outcome(third, "t3", ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN, worker_id="w3")
 
     unresolved = ledger.unresolved_executions()
     assert [r.ticket_id for r in unresolved] == ["t2", "t3"]
@@ -614,7 +647,7 @@ def test_unresolved_executions_lists_everything_without_an_outcome(
     assert all(r.may_have_crossed_boundary for r in unresolved)
 
     ledger.record_outcome(
-        OTHER_INTENT, "t2", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w2"
+        OTHER_INTENT, "t2", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w2"
     )
     assert [r.ticket_id for r in ledger.unresolved_executions()] == ["t3"]
 
@@ -846,7 +879,7 @@ def test_the_reference_is_the_newest_failure_not_merely_a_failure(
         first = _reserve(ledger, ticket_id=f"t{index}", worker_id=f"w{index}")
         ledger.mark_attempted(INTENT, f"t{index}", worker_id=f"w{index}")
         ledger.record_outcome(
-            INTENT, f"t{index}", ExecutionOutcome.FAILED, worker_id=f"w{index}"
+            INTENT, f"t{index}", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id=f"w{index}"
         )
         failures.append(first)
         clock.advance(timedelta(seconds=1))
@@ -879,7 +912,7 @@ def test_only_one_reattempt_can_win_the_race_after_a_failure(
     store = DurableExecutionLedger(ledger_path, now=clock)
     failed = _reserve(store, ticket_id="t1", worker_id="w1")
     store.mark_attempted(INTENT, "t1", worker_id="w1")
-    store.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1")
+    store.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w1")
     store.close()
 
     intent = f"{INTENT}-reattempt-race"
@@ -981,7 +1014,7 @@ def _transition_worker(
             result = store.record_outcome(
                 intent_key,
                 ticket_id,
-                ExecutionOutcome.UNKNOWN,
+                ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN,
                 worker_id=claim_worker,
                 expected_revision=1,
             )
@@ -1153,7 +1186,7 @@ def test_unknown_state_survives_restart(ledger_path: Path) -> None:
     store = DurableExecutionLedger(ledger_path, now=lambda: START)
     _reserve(store)
     store.mark_attempted(INTENT, "t1", worker_id="w1")
-    store.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, worker_id="w1")
+    store.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN, worker_id="w1")
     store.close()
 
     reopened = DurableExecutionLedger(ledger_path, now=lambda: START)
@@ -1172,7 +1205,7 @@ def test_resolved_state_survives_restart(ledger_path: Path) -> None:
     store = DurableExecutionLedger(ledger_path, now=lambda: START)
     _reserve(store)
     store.mark_attempted(INTENT, "t1", worker_id="w1")
-    store.record_outcome(INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w1")
+    store.record_outcome(INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w1")
     store.close()
 
     reopened = DurableExecutionLedger(ledger_path, now=lambda: START)
@@ -1309,7 +1342,7 @@ def test_unresolved_with_a_definite_outcome_fails_closed(
     store = DurableExecutionLedger(ledger_path, now=lambda: START)
     _reserve(store)
     store.mark_attempted(INTENT, "t1", worker_id="w1")
-    store.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, worker_id="w1")
+    store.record_outcome(INTENT, "t1", ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN, worker_id="w1")
     store.close()
     conn = sqlite3.connect(ledger_path)
     try:
@@ -1347,7 +1380,10 @@ def test_duplicate_rows_fail_closed(ledger_path: Path) -> None:
     conn = sqlite3.connect(ledger_path)
     try:
         # Rebuild the table without the UNIQUE constraint, then duplicate a pair
-        # under a different primary key.
+        # under a different primary key. The shape below must track the real
+        # schema minus that one constraint; a row written here has to be
+        # readable by the parser, or this test would pass by tripping over an
+        # unrelated corruption instead of the duplicate it is about.
         conn.execute("DROP TABLE execution_reservation")
         conn.execute(
             "CREATE TABLE execution_reservation ("
@@ -1355,19 +1391,36 @@ def test_duplicate_rows_fail_closed(ledger_path: Path) -> None:
             "ticket_id TEXT NOT NULL, ticket_revision INTEGER NOT NULL, "
             "action_plan_id TEXT, resource_id TEXT, action TEXT, "
             "worker_id TEXT NOT NULL, state TEXT NOT NULL, outcome TEXT, "
-            "revision INTEGER NOT NULL, created_at TEXT NOT NULL, "
-            "updated_at TEXT NOT NULL, supersedes_reservation_id TEXT)"
+            "reexecution_class TEXT, revision INTEGER NOT NULL, "
+            "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+            "supersedes_reservation_id TEXT)"
         )
-        row = (
-            "i1", INTENT, "t1", 1, "plan-1", "i-1", "stop_resource", "w1",
-            "reserved", None, 0, START.isoformat(), START.isoformat(), None,
-        )
-        clone = ("i2", *row[1:])
+        row = {
+            "reservation_id": "i1",
+            "intent_key": INTENT,
+            "ticket_id": "t1",
+            "ticket_revision": 1,
+            "action_plan_id": "plan-1",
+            "resource_id": "i-1",
+            "action": "stop_resource",
+            "worker_id": "w1",
+            "state": "reserved",
+            "outcome": None,
+            "reexecution_class": None,
+            "revision": 0,
+            "created_at": START.isoformat(),
+            "updated_at": START.isoformat(),
+            "supersedes_reservation_id": None,
+        }
+        clone = {**row, "reservation_id": "i2"}
         for values in (row, clone):
             conn.execute(
-                "INSERT INTO execution_reservation "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                values,
+                "INSERT INTO execution_reservation ("
+                + ",".join(values)
+                + ") VALUES ("
+                + ",".join("?" * len(values))
+                + ")",
+                tuple(values.values()),
             )
         conn.commit()
     finally:
@@ -1480,16 +1533,26 @@ def test_repr_mentions_the_path(ledger_path: Path) -> None:
 # --------------------------------------------------------------------------
 # M13 Phase 4: the intent-level decision and its durable lineage.
 #
-# The rule under test, from the Phase 4 ruling. A fresh ticket may execute an
-# intent again only when the prior same-intent execution recorded FAILED:
+# The rule under test, as M15-B restated it. A fresh ticket may execute an
+# intent again only when the prior same-intent execution recorded a basis
+# saying repeating it is safe:
 #
-#   RESERVED               -> block  (no automatic stale-reservation takeover)
-#   ATTEMPTED              -> block  (the boundary may already be crossed)
-#   VERIFIED_SUCCESS       -> block  (the effect demonstrably happened)
-#   PARTIALLY_VERIFIED     -> block  (part of it demonstrably happened)
-#   UNRESOLVED / UNKNOWN   -> block  (nothing established either way)
-#   FAILED                 -> allow, recording supersedes_reservation_id
-#   no prior execution     -> allow
+#   RESERVED                        -> block  (no automatic stale-reservation takeover)
+#   ATTEMPTED                       -> block  (the boundary may already be crossed)
+#   VERIFIED_SUCCESS / EFFECT_ACHIEVED -> block  (the effect demonstrably happened)
+#   PARTIALLY_VERIFIED              -> block  (part of it demonstrably happened)
+#   UNRESOLVED / UNKNOWN            -> block  (nothing established either way)
+#   FAILED + NO_EFFECT              -> allow, recording supersedes_reservation_id
+#   FAILED + TRANSIENT_REJECTION    -> allow, recording supersedes_reservation_id
+#   FAILED + POST_STATE_NOT_REACHED -> allow, recording supersedes_reservation_id
+#   FAILED + TARGET_INVALID         -> block  (M15-B; was allowed before)
+#   FAILED + POST_STATE_UNREACHABLE -> block  (M15-B; was allowed before)
+#   FAILED + OUTCOME_UNKNOWN        -> block  (refused as incoherent)
+#   no prior execution              -> allow
+#
+# The last three rows are the whole point of M15-B. `FAILED` on its own used to
+# mean "retryable", which conflated a request that never left the process with
+# one the provider refused for a target it cannot ever act on.
 # --------------------------------------------------------------------------
 
 _BLOCKING_STATES = (
@@ -1520,7 +1583,7 @@ def test_a_fresh_ticket_is_refused_for_every_non_failed_prior(
     settle_state: ExecutionReservationState | None,
     outcome: ExecutionOutcome | None,
 ) -> None:
-    """Only ``FAILED`` permits a second execution of the same intent.
+    """Only a recorded basis that permits one allows a second execution.
 
     Each case is a distinct safety reason rather than a repeated assertion, so
     the labels are kept in the test id: a future change that started allowing
@@ -1530,7 +1593,13 @@ def test_a_fresh_ticket_is_refused_for_every_non_failed_prior(
     if settle_state is not None:
         ledger.mark_attempted(INTENT, "t1", worker_id="w1")
     if outcome is not None:
-        ledger.record_outcome(INTENT, "t1", outcome, worker_id="w1")
+        ledger.record_outcome(
+            INTENT,
+            "t1",
+            outcome,
+            reexecution_class=_legal_class_for(outcome),
+            worker_id="w1",
+        )
 
     with pytest.raises(IntentAlreadyExecutedError):
         _reserve(ledger, ticket_id="t2", worker_id="w2")
@@ -1583,7 +1652,7 @@ def test_unknown_is_not_a_retry_path_even_with_a_fresh_ticket(
     _reserve(ledger, ticket_id="t1")
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
     unresolved = ledger.record_outcome(
-        INTENT, "t1", ExecutionOutcome.UNKNOWN, worker_id="w1"
+        INTENT, "t1", ExecutionOutcome.UNKNOWN, reexecution_class=ReexecutionClass.OUTCOME_UNKNOWN, worker_id="w1"
     )
     assert unresolved.state is ExecutionReservationState.UNRESOLVED
 
@@ -1609,7 +1678,7 @@ def test_a_failed_prior_records_durable_lineage(
     first = _reserve(ledger, ticket_id="t1")
     assert first.supersedes_reservation_id is None
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
-    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1")
+    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w1")
 
     second = _reserve(ledger, ticket_id="t2", worker_id="w2")
     assert second.supersedes_reservation_id == first.reservation_id
@@ -1642,12 +1711,12 @@ def test_a_chain_of_failed_reattempts_names_its_immediate_predecessor(
     """
     first = _reserve(ledger, ticket_id="t1")
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
-    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1")
+    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w1")
 
     clock.advance(timedelta(seconds=1))
     second = _reserve(ledger, ticket_id="t2", worker_id="w2")
     ledger.mark_attempted(INTENT, "t2", worker_id="w2")
-    ledger.record_outcome(INTENT, "t2", ExecutionOutcome.FAILED, worker_id="w2")
+    ledger.record_outcome(INTENT, "t2", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w2")
 
     clock.advance(timedelta(seconds=1))
     third = _reserve(ledger, ticket_id="t3", worker_id="w3")
@@ -1671,7 +1740,7 @@ def test_lineage_verification_rejects_a_reference_across_intents(
     failed = _reserve(store, intent_key=INTENT, ticket_id="t1")
     other = _reserve(store, intent_key=OTHER_INTENT, ticket_id="t2", worker_id="w2")
     store.mark_attempted(INTENT, "t1", worker_id="w1")
-    store.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1")
+    store.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w1")
     store.close()
 
     conn = sqlite3.connect(ledger_path)
@@ -1708,7 +1777,7 @@ def test_lineage_verification_rejects_superseding_a_non_failure(
     succeeded = _reserve(store, ticket_id="t1")
     store.mark_attempted(INTENT, "t1", worker_id="w1")
     store.record_outcome(
-        INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w1"
+        INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w1"
     )
     # A fresh reservation is legitimately refused, so this relation has to be
     # written directly -- which is exactly the corruption case under test.
@@ -1732,7 +1801,9 @@ def test_lineage_verification_rejects_superseding_a_non_failure(
     reopened = DurableExecutionLedger(ledger_path, now=lambda: START)
     try:
         with pytest.raises(
-            ExecutionLedgerCorruptionError, match="only a FAILED"
+            ExecutionLedgerCorruptionError,
+            match="whose recorded outcome is 'verified_success'.*only an execution "
+            "whose recorded basis permits one",
         ):
             reopened.verify_lineage()
     finally:
@@ -1752,7 +1823,7 @@ def test_lineage_verification_rejects_a_cycle(
     store = DurableExecutionLedger(ledger_path, now=lambda: START)
     only = _reserve(store, ticket_id="t1")
     store.mark_attempted(INTENT, "t1", worker_id="w1")
-    store.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1")
+    store.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w1")
     store.close()
 
     conn = sqlite3.connect(ledger_path)
@@ -1875,12 +1946,14 @@ def test_a_v1_ledger_is_refused_rather_than_guessed_at(
 def test_a_new_ledger_records_the_current_schema_version(
     ledger_path: Path,
 ) -> None:
-    """The v2 bump is asserted, so it cannot be forgotten silently.
+    """The v3 bump is asserted, so it cannot be forgotten silently.
 
-    Without this, the lineage column could be added while the version stayed at
-    1, and a v1 file would then open against a layout it does not match.
+    Without this, the reexecution-basis column could be added while the version
+    stayed at 2, and a v2 file would then open against a layout it does not
+    match -- or worse, open successfully and be read as if every settled
+    execution were retryable.
     """
-    assert EXECUTION_LEDGER_SCHEMA_VERSION == 2
+    assert EXECUTION_LEDGER_SCHEMA_VERSION == 3
     store = DurableExecutionLedger(ledger_path, now=lambda: START)
     store.close()
 
@@ -1896,8 +1969,9 @@ def test_a_new_ledger_records_the_current_schema_version(
         conn.close()
 
     assert row is not None
-    assert str(row[0]) == "2"
+    assert str(row[0]) == "3"
     assert "supersedes_reservation_id" in columns
+    assert "reexecution_class" in columns
 
 
 def test_the_intent_guard_does_not_confuse_different_intents(
@@ -1911,7 +1985,7 @@ def test_the_intent_guard_does_not_confuse_different_intents(
     first = _reserve(ledger, intent_key=INTENT, ticket_id="t1")
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
     ledger.record_outcome(
-        INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, worker_id="w1"
+        INTENT, "t1", ExecutionOutcome.VERIFIED_SUCCESS, reexecution_class=ReexecutionClass.EFFECT_ACHIEVED, worker_id="w1"
     )
 
     second = _reserve(ledger, intent_key=OTHER_INTENT, ticket_id="t2", worker_id="w2")
@@ -1932,10 +2006,757 @@ def test_a_reservation_never_supersedes_itself_by_construction(
     """
     _reserve(ledger, ticket_id="t1")
     ledger.mark_attempted(INTENT, "t1", worker_id="w1")
-    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1")
+    ledger.record_outcome(INTENT, "t1", ExecutionOutcome.FAILED, reexecution_class=ReexecutionClass.TRANSIENT_REJECTION, worker_id="w1")
     row = _reserve(ledger, ticket_id="t2", worker_id="w2")
 
     assert row.supersedes_reservation_id != row.reservation_id
     assert row.supersedes_reservation_id is not None
     assert row.ticket_id != "t1"
     ledger.verify_lineage()
+
+# --------------------------------------------------------------------------
+# M15-B: the recorded basis decides re-execution, not the outcome word.
+#
+# The claim under test is the M15-B ruling:
+#
+#   "Retryability must describe whether repeating the same intent is
+#    semantically safe, not merely whether the previous execution was
+#    technically unsuccessful."
+#
+# Before M15-B a settled execution permitted a second attempt if and only if
+# it spelled 'failed', so a NOT_EXECUTED row -- which by definition never
+# reached AWS -- permanently burned an intent that had no effect to protect,
+# while a target AWS has definitively rejected as invalid was retried forever.
+# Both were backwards. The cases below are grouped as: the correction, the
+# retryable half, the terminal half, the pairs that cannot be written at all,
+# and the schema version that carries the distinction.
+# --------------------------------------------------------------------------
+
+
+def _settle(
+    ledger: DurableExecutionLedger,
+    outcome: ExecutionOutcome,
+    basis: ReexecutionClass,
+    *,
+    intent_key: str = INTENT,
+    ticket_id: str = "t1",
+    worker_id: str = "w1",
+) -> ExecutionReservation:
+    """Reserve, cross the boundary, and settle under an explicit basis.
+
+    Written out rather than reused from the earlier phases because every call
+    here has to name its own basis: the whole contract is that the basis is not
+    derivable from the outcome.
+    """
+    _reserve(ledger, intent_key=intent_key, ticket_id=ticket_id, worker_id=worker_id)
+    ledger.mark_attempted(intent_key, ticket_id, worker_id=worker_id)
+    return ledger.record_outcome(
+        intent_key,
+        ticket_id,
+        outcome,
+        reexecution_class=basis,
+        worker_id=worker_id,
+    )
+
+
+def test_every_outcome_has_a_declared_basis_table() -> None:
+    """No outcome can exist without the caller stating its retryability.
+
+    A new :class:`ExecutionOutcome` has no default, so adding one forces a
+    decision here rather than silently inheriting a rule. This is the guard
+    against the ``FAILED``-implies-retryable assumption coming back through
+    the back door as a new member.
+    """
+    assert set(LEGAL_REEXECUTION_CLASSES_FOR_OUTCOME) == set(ExecutionOutcome)
+
+
+def test_every_basis_states_its_retryability_unambiguously() -> None:
+    """The vocabulary partitions cleanly into retryable and not.
+
+    Read as a partition rather than trusting the docstrings: a class that were
+    in both sets, or in neither, would make "is this retryable?" depend on
+    which question a caller happened to ask.
+    """
+    everything = set(ReexecutionClass)
+    assert RETRYABLE_REEXECUTION_CLASSES | (
+        everything - RETRYABLE_REEXECUTION_CLASSES
+    ) == everything
+    assert not RETRYABLE_REEXECUTION_CLASSES & (
+        everything - RETRYABLE_REEXECUTION_CLASSES
+    )
+    assert everything - RETRYABLE_REEXECUTION_CLASSES == {
+        ReexecutionClass.TARGET_INVALID,
+        ReexecutionClass.POST_STATE_UNREACHABLE,
+        ReexecutionClass.OUTCOME_UNKNOWN,
+        ReexecutionClass.EFFECT_ACHIEVED,
+    }
+
+
+# --- The correction ---------------------------------------------------------
+
+
+def test_a_not_executed_row_no_longer_burns_an_intent_with_no_effect(
+    ledger: DurableExecutionLedger,
+) -> None:
+    """The headline change: nothing happened, so repeating it is safe.
+
+    Version 2 blocked this. A NOT_EXECUTED row is ATTEMPTED -- the boundary was
+    recorded as crossed before the handler ran -- so refusing a second
+    execution meant one credential blip consumed the intent permanently,
+    while the resource it named sat there still running and still actionable.
+    """
+    first = _settle(
+        ledger, ExecutionOutcome.NOT_EXECUTED, ReexecutionClass.NO_EFFECT
+    )
+    assert first.state is ExecutionReservationState.RESOLVED
+    assert first.may_have_crossed_boundary is True
+    assert first.permits_reexecution is True
+
+    second = _reserve(ledger, ticket_id="t2", worker_id="w2")
+
+    assert second.intent_key == INTENT
+    assert second.supersedes_reservation_id == first.reservation_id
+    ledger.verify_lineage()
+
+
+# --- The retryable half -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "outcome", "basis"),
+    [
+        (
+            "a request that never left the process",
+            ExecutionOutcome.NOT_EXECUTED,
+            ReexecutionClass.NO_EFFECT,
+        ),
+        (
+            "a request the provider refused before any effect",
+            ExecutionOutcome.REFUSED,
+            ReexecutionClass.NO_EFFECT,
+        ),
+        (
+            "a transient rejection with nothing done",
+            ExecutionOutcome.FAILED,
+            ReexecutionClass.TRANSIENT_REJECTION,
+        ),
+        (
+            "an accepted mutation whose post-state was not reached yet",
+            ExecutionOutcome.FAILED,
+            ReexecutionClass.POST_STATE_NOT_REACHED,
+        ),
+    ],
+)
+def test_a_retryable_basis_permits_a_second_execution(
+    ledger: DurableExecutionLedger,
+    label: str,
+    outcome: ExecutionOutcome,
+    basis: ReexecutionClass,
+) -> None:
+    """Each permitted basis is a second execution *and* durable lineage.
+
+    Asserting both matters: permitting the reattempt without recording what it
+    supersedes would leave two rows sharing an intent key and no way to tell
+    why, which is the state this ledger exists to make answerable.
+    """
+    first = _settle(ledger, outcome, basis)
+    assert first.permits_reexecution is True
+
+    second = _reserve(ledger, ticket_id="t2", worker_id="w2")
+
+    assert second.supersedes_reservation_id == first.reservation_id
+    ledger.verify_lineage()
+
+
+# --- The terminal half ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "outcome", "basis"),
+    [
+        (
+            "the resource no longer exists",
+            ExecutionOutcome.FAILED,
+            ReexecutionClass.TARGET_INVALID,
+        ),
+        (
+            "the resource is in a state that forbids the operation",
+            ExecutionOutcome.FAILED,
+            ReexecutionClass.TARGET_INVALID,
+        ),
+        (
+            "the postcondition can never be reached from what was observed",
+            ExecutionOutcome.FAILED,
+            ReexecutionClass.POST_STATE_UNREACHABLE,
+        ),
+        (
+            "the effect demonstrably happened",
+            ExecutionOutcome.VERIFIED_SUCCESS,
+            ReexecutionClass.EFFECT_ACHIEVED,
+        ),
+(
+            "part of the effect demonstrably happened",
+            ExecutionOutcome.PARTIALLY_VERIFIED,
+            ReexecutionClass.EFFECT_ACHIEVED,
+        ),
+    ],
+)
+def test_no_terminal_decision_is_bypassed_by_a_fresh_ticket(
+    ledger: DurableExecutionLedger,
+    label: str,
+    outcome: ExecutionOutcome,
+    basis: ReexecutionClass,
+) -> None:
+    """Each non-retryable basis refuses a fresh ticket for the same intent.
+
+    A fresh ticket is not a re-plan and not an authorization: it is the same
+    effect under a new approval. Every one of these six was permitted by
+    version 2 whenever the row happened to spell 'failed', and each of them is
+    a case where repeating the intent is either impossible or does the thing
+    twice. The refusal names the basis, because "invalid target" and "already
+    stopped" call for opposite operator remedies.
+    """
+    settled = _settle(ledger, outcome, basis)
+    assert settled.permits_reexecution is False
+
+    # A different ticket id, a different worker, and a higher revision: the
+    # authority a caller would reach for. None of it is the point.
+    with pytest.raises(IntentAlreadyExecutedError) as refusal:
+        _reserve(ledger, ticket_id="t2", worker_id="w2", ticket_revision=2)
+
+    assert basis.value in str(refusal.value)
+    assert settled.reservation_id in str(refusal.value)
+
+
+def test_an_unresolved_row_refuses_a_fresh_ticket_on_its_own_reason(
+    ledger: DurableExecutionLedger,
+) -> None:
+    """UNKNOWN blocks without naming a basis, because there is only one.
+
+    An UNRESOLVED row can only ever spell ``unknown`` with
+    ``outcome_unknown``, so repeating it in the refusal would be noise. What the
+    message has to convey instead is *why* no new ticket helps: nothing was
+    established either way, so a retry is not authorized by the passage of
+    time or a fresh approval -- only an explicit reconciliation override is.
+    That is a different refusal from the settled ones above, and it is the one
+    an operator must not mistake for a bug.
+    """
+    settled = _settle(ledger, ExecutionOutcome.UNKNOWN, ReexecutionClass.OUTCOME_UNKNOWN)
+    assert settled.state is ExecutionReservationState.UNRESOLVED
+    assert settled.permits_reexecution is False
+    assert settled.may_have_crossed_boundary is True
+
+    with pytest.raises(IntentAlreadyExecutedError) as refusal:
+        _reserve(ledger, ticket_id="t2", worker_id="w2", ticket_revision=2)
+
+    message = str(refusal.value)
+    assert "UNRESOLVED" in message
+    assert "reconciliation override" in message
+    assert settled.reservation_id in message
+
+
+def test_the_same_outcome_word_decides_both_ways(
+    ledger: DurableExecutionLedger,
+) -> None:
+    """Two rows that differ only in basis, one permitted and one refused.
+
+    This is the sharpest statement of the ruling. FAILED carries five bases and
+    cannot be read as an answer on its own, so if the ledger ever collapsed
+    back to keying on the outcome word these two rows would have to agree --
+    and this test fails the moment they do.
+    """
+    refused = _settle(
+        ledger,
+        ExecutionOutcome.FAILED,
+        ReexecutionClass.POST_STATE_UNREACHABLE,
+        intent_key=INTENT,
+        ticket_id="t1",
+    )
+    with pytest.raises(IntentAlreadyExecutedError):
+        _reserve(ledger, intent_key=INTENT, ticket_id="t2", worker_id="w2")
+
+    allowed = _settle(
+        ledger,
+        ExecutionOutcome.FAILED,
+        ReexecutionClass.POST_STATE_NOT_REACHED,
+        intent_key=OTHER_INTENT,
+        ticket_id="t1",
+        worker_id="w1",
+    )
+    permitted = _reserve(ledger, intent_key=OTHER_INTENT, ticket_id="t2", worker_id="w2")
+
+    assert refused.outcome is allowed.outcome
+    assert refused.outcome == ExecutionOutcome.FAILED
+    assert refused.permits_reexecution is False
+    assert allowed.permits_reexecution is True
+    assert permitted.supersedes_reservation_id == allowed.reservation_id
+
+
+def test_an_open_row_never_permits_reexecution_whatever_its_state(
+    ledger: DurableExecutionLedger,
+) -> None:
+    """Unsettled work has not earned a second attempt.
+
+    RESERVED and ATTEMPTED both block. A row with no outcome and therefore no
+    basis must read as blocking rather than as "nothing to lose": the absence
+    of a recorded basis is the absence of evidence, and absence of evidence is
+    not permission.
+    """
+    reserved = _reserve(ledger, ticket_id="t1")
+    assert reserved.reexecution_class is None
+    assert reserved.permits_reexecution is False
+    with pytest.raises(IntentAlreadyExecutedError, match="RESERVED"):
+        _reserve(ledger, ticket_id="t2", worker_id="w2")
+
+    attempted = ledger.mark_attempted(INTENT, "t1", worker_id="w1")
+    assert attempted.reexecution_class is None
+    assert attempted.permits_reexecution is False
+    with pytest.raises(IntentAlreadyExecutedError, match="ATTEMPTED"):
+        _reserve(ledger, ticket_id="t2", worker_id="w2")
+
+
+# --- Pairs that cannot be written at all ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("outcome", "basis"),
+    [
+        (ExecutionOutcome.UNKNOWN, ReexecutionClass.NO_EFFECT),
+        (ExecutionOutcome.UNKNOWN, ReexecutionClass.TRANSIENT_REJECTION),
+        (ExecutionOutcome.UNKNOWN, ReexecutionClass.POST_STATE_NOT_REACHED),
+        (ExecutionOutcome.UNKNOWN, ReexecutionClass.TARGET_INVALID),
+        (ExecutionOutcome.UNKNOWN, ReexecutionClass.POST_STATE_UNREACHABLE),
+        (ExecutionOutcome.UNKNOWN, ReexecutionClass.EFFECT_ACHIEVED),
+        (ExecutionOutcome.VERIFIED_SUCCESS, ReexecutionClass.NO_EFFECT),
+        (ExecutionOutcome.VERIFIED_SUCCESS, ReexecutionClass.TRANSIENT_REJECTION),
+        (ExecutionOutcome.PARTIALLY_VERIFIED, ReexecutionClass.NO_EFFECT),
+        (ExecutionOutcome.REFUSED, ReexecutionClass.EFFECT_ACHIEVED),
+        (ExecutionOutcome.NOT_EXECUTED, ReexecutionClass.EFFECT_ACHIEVED),
+    ],
+)
+def test_a_weakening_outcome_and_basis_pair_cannot_be_recorded(
+    ledger: DurableExecutionLedger,
+    outcome: ExecutionOutcome,
+    basis: ReexecutionClass,
+) -> None:
+    """The dangerous pairings are refused at write time, not filtered later.
+
+    Each of these would make a re-execution query honour a row that claims an
+    effect happened, or claims one did not, when neither is established. If
+    they were only filtered at read time the caller would still have written a
+    false statement into the authority record.
+    """
+    _reserve(ledger, ticket_id="t1")
+    ledger.mark_attempted(INTENT, "t1", worker_id="w1")
+
+    with pytest.raises(ValueError, match="cannot be recorded with"):
+        ledger.record_outcome(
+            INTENT, "t1", outcome, reexecution_class=basis, worker_id="w1"
+        )
+
+    # The row is left exactly as it was: a refused recording writes nothing.
+    assert ledger.get(INTENT, "t1").state is ExecutionReservationState.ATTEMPTED
+    assert ledger.get(INTENT, "t1").reexecution_class is None
+
+
+def test_recording_an_outcome_requires_a_basis_with_no_default(
+    ledger: DurableExecutionLedger,
+) -> None:
+    """There is no default basis, because a default would be the old bug.
+
+    A default of TRANSIENT_REJECTION would keep every existing call site
+    working and every existing meaning wrong: a fresh caller, or a future
+    mutation handler, would inherit "FAILED means retryable" without deciding
+    anything. Forcing the argument makes the decision visible at the call.
+    """
+    _reserve(ledger, ticket_id="t1")
+    ledger.mark_attempted(INTENT, "t1", worker_id="w1")
+
+    with pytest.raises(TypeError, match="reexecution_class"):
+        ledger.record_outcome(  # type: ignore[call-arg]
+            INTENT, "t1", ExecutionOutcome.FAILED, worker_id="w1"
+        )
+
+
+def test_recording_an_outcome_rejects_a_bare_string_basis(
+    ledger: DurableExecutionLedger,
+) -> None:
+    """The basis must be a member of the closed vocabulary.
+
+    A ``str`` value would be accepted by an ``isinstance`` check against a
+    ``str``-valued enum, so the members are checked explicitly. Otherwise
+    ``"no_effect"`` typed by hand at a call site would pass validation and be
+    written to the column, and the value would only be discovered to be
+    unrecognised later, at read time, as corruption.
+    """
+    _reserve(ledger, ticket_id="t1")
+    ledger.mark_attempted(INTENT, "t1", worker_id="w1")
+
+    with pytest.raises(TypeError, match="ReexecutionClass"):
+        ledger.record_outcome(
+            INTENT,
+            "t1",
+            ExecutionOutcome.FAILED,
+            reexecution_class="no_effect",  # type: ignore[arg-type]
+            worker_id="w1",
+        )
+
+
+# --- Verification catches a row written around the contract -----------------
+
+
+def _corrupt_basis(
+    ledger_path: Path,
+    reservation_id: str,
+    value: str | None,
+) -> None:
+    """Write a basis straight into the column, as corruption or a bad migration would."""
+    conn = sqlite3.connect(ledger_path)
+    try:
+        conn.execute(
+            "UPDATE execution_reservation SET reexecution_class = ? "
+            "WHERE reservation_id = ?",
+            (value, reservation_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _reopen_expecting_corruption(
+    ledger_path: Path, expected: str
+) -> None:
+    """Reopen a ledger and require that it refuses to load at all.
+
+    ``verify_on_open`` is the default, so the corruption is reported while
+    opening rather than on a later explicit ``verify``. Asserting the refusal
+    happens at open is the stronger claim: a caller that never gets far enough
+    to call ``verify`` is protected by construction, and a ledger that loads and
+    is only then found to be suspect is a ledger something else may already have
+    trusted.
+    """
+    with pytest.raises(ExecutionLedgerCorruptionError, match=expected):
+        DurableExecutionLedger(ledger_path, now=lambda: START)
+
+
+def test_a_settled_row_with_no_basis_fails_verification(
+    ledger_path: Path,
+) -> None:
+    """A terminal row must say why, so verify refuses one that does not.
+
+    Reachable from a hand-edited file or a migration that backfilled
+    incompletely. It is treated as corruption rather than as
+    "not retryable" on purpose: those coincide today, but only one of them is
+    a statement about the world, and silently treating missing evidence as a
+    decision is how a row becomes indistinguishable from a deliberate one.
+    """
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    settled = _settle(store, ExecutionOutcome.FAILED, ReexecutionClass.TARGET_INVALID)
+    store.close()
+    _corrupt_basis(ledger_path, settled.reservation_id, None)
+
+    _reopen_expecting_corruption(ledger_path, "records no reexecution basis")
+
+
+def test_an_open_row_carrying_a_basis_fails_verification(
+    ledger_path: Path,
+) -> None:
+    """An unsettled row has nothing to have an opinion about yet."""
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    reserved = _reserve(store, ticket_id="t1")
+    store.close()
+    _corrupt_basis(
+        ledger_path, reserved.reservation_id, ReexecutionClass.NO_EFFECT.value
+    )
+
+    _reopen_expecting_corruption(ledger_path, "only a settled execution has a basis")
+
+
+def test_a_settled_row_with_an_incoherent_basis_fails_verification(
+    ledger_path: Path,
+) -> None:
+    """A basis that its own outcome does not admit is refused on read too.
+
+    ``record_outcome`` already refuses this pairing, so reaching it requires
+    writing around the store. verify is the backstop for that, and for a file
+    edited by a migration or a person: the guard that has to hold is that the
+    column is never trusted without being checked against the outcome.
+    """
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    settled = _settle(store, ExecutionOutcome.UNKNOWN, ReexecutionClass.OUTCOME_UNKNOWN)
+    store.close()
+    _corrupt_basis(
+        ledger_path, settled.reservation_id, ReexecutionClass.NO_EFFECT.value
+    )
+
+    _reopen_expecting_corruption(ledger_path, "admits only")
+
+
+# --- The schema version that carries it --------------------------------------
+
+
+_V2_TERMINAL_ROWS = (
+    ("resolved", "failed", "transient_rejection"),
+    ("resolved", "not_executed", "no_effect"),
+    ("resolved", "refused", "no_effect"),
+    ("resolved", "verified_success", "effect_achieved"),
+    ("resolved", "partially_verified", "effect_achieved"),
+    ("unresolved", "unknown", "outcome_unknown"),
+)
+
+
+def _write_version_2_ledger(ledger_path: Path) -> None:
+    """Produce a file that is exactly what version 2 would have written.
+
+    Built by downgrading a real ledger rather than by restating the version 2
+    DDL here, so the rows the migration has to handle are rows the current
+    code would recognise. Restating the old schema would be a second source of
+    truth that could drift from the first migration that used it.
+    """
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    store.close()
+
+    conn = sqlite3.connect(ledger_path)
+    try:
+        conn.execute("ALTER TABLE execution_reservation DROP COLUMN reexecution_class")
+        for index, (state, outcome, _expected) in enumerate(_V2_TERMINAL_ROWS):
+            conn.execute(
+                "INSERT INTO execution_reservation ("
+                "reservation_id, intent_key, ticket_id, ticket_revision, worker_id, "
+                "state, outcome, revision, created_at, updated_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    f"r{index}",
+                    f"intent-{index}",
+                    f"t{index}",
+                    1,
+                    f"w{index}",
+                    state,
+                    outcome,
+                    2,
+                    START.isoformat(),
+                    START.isoformat(),
+                ),
+            )
+        # Two open rows: a fresh claim and an attempt that never settled.
+        conn.execute(
+            "INSERT INTO execution_reservation ("
+            "reservation_id, intent_key, ticket_id, ticket_revision, worker_id, "
+            "state, outcome, revision, created_at, updated_at"
+            ") VALUES ('open-0','intent-open-0','t0',1,'w0','reserved',NULL,0,?,?)",
+            (START.isoformat(), START.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO execution_reservation ("
+            "reservation_id, intent_key, ticket_id, ticket_revision, worker_id, "
+            "state, outcome, revision, created_at, updated_at"
+            ") VALUES ('open-1','intent-open-1','t1',1,'w1','attempted',NULL,1,?,?)",
+            (START.isoformat(), START.isoformat()),
+        )
+        conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_version_2_ledger_migrates_to_the_current_version(
+    ledger_path: Path,
+) -> None:
+    """Opening a version 2 file brings it forward instead of refusing it.
+
+    The refusal path is still there for versions it cannot migrate, but a file
+    this build knows how to bring forward must not become unreadable simply
+    because it predates the basis column.
+    """
+    _write_version_2_ledger(ledger_path)
+
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    try:
+        store.verify()
+        store.verify_lineage()
+    finally:
+        store.close()
+
+    conn = sqlite3.connect(ledger_path)
+    try:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        columns = {
+            r[1] for r in conn.execute("PRAGMA table_info(execution_reservation)")
+        }
+    finally:
+        conn.close()
+    assert str(version) == "3"
+    assert "reexecution_class" in columns
+
+
+def test_the_migration_reconstructs_the_basis_every_version_2_row_actually_had(
+    ledger_path: Path,
+) -> None:
+    """Each backfilled basis is read out of the retryability v2 applied.
+
+    Not re-decided from the outcome as M15-B would decide it. Only a literal
+    'failed' permitted a second execution in version 2, so 'failed' becomes
+    TRANSIENT_REJECTION -- the retryable reading v2 gave it -- rather than the
+    TARGET_INVALID reading the new vocabulary would apply to a fresh attempt.
+    """
+    _write_version_2_ledger(ledger_path)
+
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    try:
+        for index, (state, outcome, expected) in enumerate(_V2_TERMINAL_ROWS):
+            row = store.get(f"intent-{index}", f"t{index}")
+            assert row.state is ExecutionReservationState(state)
+            assert row.outcome is ExecutionOutcome(outcome)
+            assert row.reexecution_class is ReexecutionClass(expected)
+            assert row.reexecution_class is not None
+    finally:
+        store.close()
+
+
+def test_the_migration_reproduces_v2s_rule_and_widens_only_where_there_was_no_effect(
+    ledger_path: Path,
+) -> None:
+    """The backfill is v2's own rule, applied to v2's own rows.
+
+    Version 2 permitted a second execution if and only if the outcome spelled
+    'failed'. Each migrated row is compared against that rule directly rather
+    than against a hand-written expectation, so the claim being tested is
+    "this is what the file used to do" and not "this is what someone decided
+    the answer should be".
+
+    The two rows where the answer differs are the two where it had to: a
+    'not_executed' or 'refused' row was refused a second execution by v2 while
+    having no external effect to protect. The others keep the answer they
+    already had, so the migration widens permission only where the evidence was
+    always absent -- never where it was always present.
+    """
+    _write_version_2_ledger(ledger_path)
+
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    try:
+        widened: list[str] = []
+        for index, (state, outcome, expected) in enumerate(_V2_TERMINAL_ROWS):
+            row = store.get(f"intent-{index}", f"t{index}")
+            assert row.reexecution_class is ReexecutionClass(expected)
+
+            permitted_before = outcome == ExecutionOutcome.FAILED
+            permits_now = (
+                row.reexecution_class in RETRYABLE_REEXECUTION_CLASSES
+            )
+            if permits_now and not permitted_before:
+                widened.append(row.outcome.value or "")
+
+        # Exactly the two outcomes that never reached AWS.
+        assert sorted(widened) == ["not_executed", "refused"]
+    finally:
+        store.close()
+
+
+def test_a_migrated_row_reserves_a_second_execution_or_refuses_as_its_basis_says(
+    ledger_path: Path,
+) -> None:
+    """The migrated file enforces its backfill on the very next reserve.
+
+    Asserted end to end rather than by reading the column, because a backfill
+    that is stored correctly but not honoured by the query would still be a
+    ledger that blocks a safe retry or permits an unsafe one.
+    """
+    _write_version_2_ledger(ledger_path)
+
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    try:
+        second = _reserve(store, intent_key="intent-1", ticket_id="fresh", worker_id="w9")
+        assert second.supersedes_reservation_id is not None
+        with pytest.raises(IntentAlreadyExecutedError):
+            _reserve(store, intent_key="intent-3", ticket_id="fresh", worker_id="w9")
+        with pytest.raises(IntentAlreadyExecutedError):
+            _reserve(store, intent_key="intent-5", ticket_id="fresh", worker_id="w9")
+    finally:
+        store.close()
+
+
+def test_a_migrated_open_row_still_blocks(
+    ledger_path: Path,
+) -> None:
+    """Migration must not hand an unsettled row a retryable basis.
+
+    The backfill leaves open rows NULL on purpose, and NULL must read as
+    blocking. A migration that defaulted every row to a retryable class would
+    be a quiet way to permit re-execution of work that may already have run.
+    """
+    _write_version_2_ledger(ledger_path)
+
+    store = DurableExecutionLedger(ledger_path, now=lambda: START)
+    try:
+        assert store.get("intent-open-0", "t0").reexecution_class is None
+        assert store.get("intent-open-1", "t1").reexecution_class is None
+        with pytest.raises(IntentAlreadyExecutedError, match="RESERVED"):
+            _reserve(store, intent_key="intent-open-0", ticket_id="fresh", worker_id="w9")
+        with pytest.raises(IntentAlreadyExecutedError, match="ATTEMPTED"):
+            _reserve(store, intent_key="intent-open-1", ticket_id="fresh", worker_id="w9")
+    finally:
+        store.close()
+
+
+def _migration_worker(path: str, queue: object) -> None:
+    """Open and verify a ledger, so a migration race would surface here.
+
+    Module level because ``spawn`` re-imports the target in a fresh
+    interpreter, and a closure is not importable. Construction is inside the
+    try because the whole point is whether *opening* the file succeeds, not
+    whether a later explicit verify does.
+    """
+    store = None
+    try:
+        store = DurableExecutionLedger(Path(path))
+        store.verify()
+        queue.put("ok")
+    except Exception as exc:  # noqa: BLE001 - the outcome is the assertion
+        queue.put(f"{type(exc).__name__}: {exc}")
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _spawn_migrations(path: Path, processes_count: int) -> list[str]:
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    processes = [
+        context.Process(target=_migration_worker, args=(str(path), queue))
+        for _ in range(processes_count)
+    ]
+    for process in processes:
+        process.start()
+    try:
+        return _drain(queue, processes, processes_count)
+    finally:
+        for process in processes:
+            if process.is_alive():  # pragma: no cover - only on a real hang
+                process.kill()
+
+
+def test_the_migration_is_exactly_once_across_processes(ledger_path: Path) -> None:
+    """Two processes opening a version 2 file must not both migrate it.
+
+    Both read version '2' before either writes, so both proceed to add the
+    column. The one that loses that race would otherwise fail with a bare
+    driver 'duplicate column name', which is not an error this module's
+    callers are written to handle -- and the file would be left correct while
+    the opening reported a fault. Re-reading the version under the write lock
+    makes the second arrival a no-op instead of an error.
+    """
+    _write_version_2_ledger(ledger_path)
+
+    outcomes = _spawn_migrations(ledger_path, 4)
+
+    assert outcomes == ["ok"] * 4, outcomes
+    conn = sqlite3.connect(ledger_path)
+    try:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert str(version) == "3"

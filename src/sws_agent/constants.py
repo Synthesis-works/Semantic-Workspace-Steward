@@ -520,6 +520,43 @@ class ExecutionOutcome(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
+class DispatchDisposition(str, enum.Enum):
+    """What the mutation boundary itself learned, before any verification.
+
+    A handler reports one of these and the evidence for it; it never reports an
+    outcome and never reports whether the intent may be attempted again. That
+    separation is the point: retryability is a judgement about the target and
+    the dispatch, and it belongs in the coordinator where it can be validated
+    against the action's declared contract.
+
+    The four members are the four things that can be true at a boundary, and
+    between them they leave no room for "it returned something":
+
+    NOT_DISPATCHED
+        Positive evidence that no request was ever written. A dry run, a
+        precondition that stopped the call, a transport failure before the
+        first byte. This is the *only* evidence that earns NO_EFFECT, because
+        it is the only one that proves nothing external happened.
+    DISPATCH_REJECTED
+        The provider definitively refused, carrying a structured code, HTTP
+        status, or exception class. Definitive means no effect occurred.
+    ACCEPTED
+        The provider took the request. Whether it took effect is then settled by
+        observation, not by the boundary.
+    DISPATCH_UNKNOWN
+        The boundary cannot establish which of the other three happened. This is
+        the honest report of a timeout, a dropped connection, or a response that
+        could not be parsed -- and it is deliberately a member rather than an
+        absence, so a handler that knows nothing has a way to say so instead of
+        returning something that reads as a decision.
+    """
+
+    NOT_DISPATCHED = "not_dispatched"
+    DISPATCH_REJECTED = "dispatch_rejected"
+    ACCEPTED = "accepted"
+    DISPATCH_UNKNOWN = "dispatch_unknown"
+
+
 class ObservationProvenance(str, enum.Enum):
     """Where a ``ResourceObservation`` came from (M10).
 
@@ -641,6 +678,16 @@ SWS_SUPPORTED_EXECUTION_OUTCOMES: Final[frozenset[str]] = frozenset(
     outcome.value for outcome in ExecutionOutcome
 )
 """The complete set of canonical execution outcomes."""
+
+SWS_SUPPORTED_DISPATCH_DISPOSITIONS: Final[frozenset[str]] = frozenset(
+    disposition.value for disposition in DispatchDisposition
+)
+"""The complete set of canonical dispatch dispositions.
+
+Guarded by tests so a new member cannot be added without deciding what it means
+at a boundary, which is the same canonical-label discipline the other enums
+here follow.
+"""
 
 SWS_SUPPORTED_VERIFICATION_STATUSES: Final[frozenset[str]] = frozenset(
     status.value for status in VerificationStatus

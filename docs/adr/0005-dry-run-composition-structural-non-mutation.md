@@ -46,7 +46,7 @@ The third is an allow-list rather than a deny-list on purpose. A deny-list has t
 
 This is deliberate and it is the honest terminal state for a run that stopped nothing. The alternative — reporting `PARTIALLY_VERIFIED` or succeeding on the grounds that the dry run was *supposed* to do nothing — would mean the system's success criterion had been quietly redefined to match the capability under test. What a dry run demonstrates is that the **coordination** is correct: the gate admitted a properly authorized, freshly observed, action-derived request; exactly one worker claimed it; the approval was spent; the boundary was recorded as crossed; the outcome was derived from evidence rather than assumed. A dry run that reported success would demonstrate less and claim more.
 
-`FAILED` is also the only prior state that ADR 0004 permits a re-execution to follow, so a dry run leaves the intent genuinely re-executable. That is the correct disposition for an attempt that provably had no effect.
+A dry run leaves the intent genuinely re-executable. Under ADR 0004 that fell out of `FAILED` being the only retryable state; since ADR 0007 it is stated directly, as the `NO_EFFECT` basis, which is the honest description of an attempt that provably had nothing to do. Either way the disposition is the same — and under ADR 0007 it is correct for the reason rather than by coincidence of vocabulary.
 
 ### The audit ledger is process-safe
 

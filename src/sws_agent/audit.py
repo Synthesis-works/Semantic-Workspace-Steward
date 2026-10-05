@@ -68,8 +68,8 @@ from .models import (
     CollectionFailure,
     CostCollectionReport,
     CostEstimate,
+    DispatchEvidence,
     ExecutionRequest,
-    MutationAttempt,
     PolicyDecision,
     ResourceRecord,
     VerificationResult,
@@ -533,7 +533,7 @@ def execution_payload(
     outcome: ExecutionOutcome | None = None,
     refusal: RefusalReason | None = None,
     refusal_detail: str = "",
-    attempt: MutationAttempt | None = None,
+    attempt: DispatchEvidence | None = None,
     verification: VerificationResult | None = None,
     consumed: bool = False,
     note: str = "",
@@ -545,9 +545,11 @@ def execution_payload(
     schema change in M9). The payload carries only identifiers, canonical
     enum values, and plain verification facts (``expected``/``observed``
     values are sanitized domain facts, never raw AWS wire payloads,
-    credentials, or secrets). A mutation-call error is recorded as
-    ``attempt.call_error`` / ``attempt.ambiguous`` flags plus a sanitized
-    note, never an exception traceback.
+    credentials, or secrets). What the mutation boundary learned is recorded
+    as ``attempt.disposition`` plus the provider's structured error code,
+    HTTP status, and exception class (M15-C), so the re-execution basis the
+    ledger committed to can be traced back to the evidence that produced it,
+    and never as an exception traceback.
     """
     payload: dict[str, Any] = {
         "stage": stage.value,

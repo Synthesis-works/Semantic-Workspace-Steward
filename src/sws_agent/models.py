@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .constants import (
     MAX_RESOURCES_PER_INVENTORY_REQUEST,
@@ -25,6 +25,7 @@ from .constants import (
     AuthorizationDecision,
     ClaimKind,
     CollectionFailureCategory,
+    DispatchDisposition,
     EvidenceBasis,
     ExecutionMode,
     ExecutionOutcome,
@@ -595,21 +596,88 @@ class ExecutionRequest(BaseModel):
         return value
 
 
-class MutationAttempt(BaseModel):
-    """Single, opaque result from crossing the mutation boundary (M9).
+class DispatchEvidence(BaseModel):
+    """What the mutation boundary itself learned, as evidence (M15-C).
 
-    Produced by an injected mutation handler. ``ambiguous`` means the
-    attempt's own outcome is unknown (for example the call timed out after
-    being dispatched); an ambiguous attempt is never reported as anything
-    other than UNKNOWN. ``call_error`` means the underlying call failed
-    deterministically. ``sanitized`` carries only safe, non-secret evidence. A
-    ``None`` resolution yields the attempt outcome whenever the boundary is a
-    dry-run or verification-only boundary.
+    Replaces ``MutationAttempt``'s ``ambiguous``/``call_error`` booleans. Those
+    two flags could say *that* something went wrong and never *what*, so the
+    coordinator had to guess, and guessing was safe only because nothing could
+    yet cross the boundary. A handler now states which of the four
+    :class:`DispatchDisposition` cases obtained and supplies the structured
+    evidence for that claim: the provider's error code, the HTTP status, and
+    the exception class.
+
+    Two properties are deliberate:
+
+    * ``disposition`` has **no default**. A handler cannot return evidence
+      without saying what happened, which is the structural form of "missing
+      evidence fails closed" -- there is no object that means "accepted,
+      probably".
+    * ``ReexecutionClass`` is **not** a field. Retryability is a judgement about
+      the target and the dispatch, not something a low-level boundary can
+      decide; putting it here would make the handler's word the last word. The
+      coordinator derives it from this evidence plus the action's declared
+      contract, and the ledger refuses any outcome/basis pair that is illegal.
+
+    Coherence is enforced rather than assumed. A disposition that claims nothing
+    was dispatched, or that the call was accepted, cannot also carry an HTTP
+    status or an error code: those are responses, and there was no response to
+    get. A contradiction like that means the handler misread its own boundary,
+    which is worth refusing at construction rather than classifying later.
     """
 
-    ambiguous: bool = False
-    call_error: bool = False
+    disposition: DispatchDisposition
+    aws_error_code: str | None = None
+    http_status: int | None = None
+    exception_class: str | None = None
     sanitized: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+    """Unknown fields are refused, never ignored.
+
+    The default Pydantic behaviour is to drop an unrecognised keyword, which
+    would quietly discard exactly the thing this type exists to prevent: a
+    handler passing ``reexecution_class=...`` or ``retryable=True`` and getting
+    back an object that looks accepted. Forbidding extras turns that silent
+    no-op into a loud ``ValidationError`` at the boundary, and also catches a
+    misspelled ``dispostion=`` rather than accepting it as a valueless claim.
+    """
+
+    @model_validator(mode="after")
+    def _no_response_without_a_response(self) -> "DispatchEvidence":
+        received_a_response = (
+            self.http_status is not None
+            or self.aws_error_code is not None
+            or self.exception_class is not None
+        )
+        if received_a_response and self.disposition in (
+            DispatchDisposition.NOT_DISPATCHED,
+            DispatchDisposition.ACCEPTED,
+        ):
+            raise ValueError(
+                f"dispatch disposition {self.disposition.value!r} cannot carry "
+                f"aws_error_code/http_status/exception_class: "
+                + {
+                    DispatchDisposition.NOT_DISPATCHED: "no request was written, so no response exists",
+                    DispatchDisposition.ACCEPTED: "an accepted call is not also an error response",
+                }[self.disposition]
+            )
+        return self
+
+    @property
+    def rejection_key(self) -> str | None:
+        """The stable identifier a dispatch contract is keyed by.
+
+        The provider's error code when there is one, since that is the only
+        part of an AWS error that is contractual. The exception class is the
+        fallback for boundaries that raise rather than return, and ``None``
+        when the handler asserted a rejection without saying why -- which the
+        classifier treats as missing evidence rather than as a rejection it may
+        safely repeat.
+        """
+        if self.aws_error_code:
+            return self.aws_error_code
+        return self.exception_class
 
 
 class VerificationResult(BaseModel):

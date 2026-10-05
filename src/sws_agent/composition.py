@@ -47,10 +47,11 @@ from typing import Any, Final
 
 from sws_agent.approval_ledger import DurableApprovalStore
 from sws_agent.audit import LEDGER_FILENAME, JsonlAuditStore
+from sws_agent.constants import DispatchDisposition
 from sws_agent.ec2_observation import DEFAULT_PARTITION, Ec2InstanceObservationProvider
 from sws_agent.execution import ExecutionCoordinator, MutationHandler
 from sws_agent.execution_ledger import DurableExecutionLedger
-from sws_agent.models import ExecutionRequest, MutationAttempt
+from sws_agent.models import DispatchEvidence, ExecutionRequest
 
 APPROVAL_LEDGER_FILENAME: Final[str] = "approvals.sqlite3"
 """Durable approval ledger file created inside the composition's ledger dir."""
@@ -90,23 +91,36 @@ class NonMutatingMutationHandler:
     deliberately empty.
     """
 
-    def handle(self, request: ExecutionRequest) -> MutationAttempt:  # pragma: no cover
+    def handle(self, request: ExecutionRequest) -> DispatchEvidence:  # pragma: no cover
         raise NotImplementedError
 
 
 class NullMutationHandler(NonMutatingMutationHandler):
-    """Crosses the boundary in name only and reports a definite no-op.
+    """Crosses the boundary in name only and reports the truth about it (M15-C).
 
-    The attempt is neither ambiguous nor an error: nothing was dispatched and
-    nothing failed. Recording it as a definite outcome is what lets the
-    coordinator proceed to verification instead of parking the execution in
-    ``UNRESOLVED``.
+    Reports ``NOT_DISPATCHED`` because that is exactly what happened: no client,
+    no session, no request. This is the honest reading, and M15-C makes honesty
+    load-bearing in a way the previous ``ambiguous=False, call_error=False``
+    attempt was not.
+
+    That older shape forced a choice between two untrue statements. Letting the
+    coordinator proceed to verification implied a mutation had been dispatched
+    and was awaiting confirmation; reporting ambiguity parked a correctly
+    skipped mutation in ``UNRESOLVED``. Verification of an undispatched mutation
+    observes an unchanged resource and calls it a postcondition contradiction --
+    a failure to explain why nothing happened when nothing was sent.
+
+    ``NOT_DISPATCHED`` removes the fiction. The coordinator records
+    ``NOT_EXECUTED`` with a ``NO_EFFECT`` basis -- positively "no external
+    effect occurred", which is exactly true and legitimately retryable -- and
+    skips verification, because there is no post-state to verify. The structural
+    non-mutation property is therefore now *demonstrated in the ledger* rather
+    than inferred from a failed postcondition.
     """
 
-    def handle(self, request: ExecutionRequest) -> MutationAttempt:
-        return MutationAttempt(
-            ambiguous=False,
-            call_error=False,
+    def handle(self, request: ExecutionRequest) -> DispatchEvidence:
+        return DispatchEvidence(
+            disposition=DispatchDisposition.NOT_DISPATCHED,
             sanitized={
                 "handler": type(self).__name__,
                 "mutating": False,
@@ -127,7 +141,7 @@ class RecordingMutationHandler(NullMutationHandler):
     def __init__(self) -> None:
         self._crossings: list[ExecutionRequest] = []
 
-    def handle(self, request: ExecutionRequest) -> MutationAttempt:
+    def handle(self, request: ExecutionRequest) -> DispatchEvidence:
         self._crossings.append(request)
         return super().handle(request)
 

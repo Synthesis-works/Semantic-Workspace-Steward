@@ -37,6 +37,7 @@ from sws_agent.audit import AuditRecordKind, JsonlAuditStore
 from sws_agent.constants import (
     SWS_MAX_OBSERVATION_AGE_SECONDS,
     ApprovalStatus,
+    DispatchDisposition,
     ExecutionMode,
     ExecutionOutcome,
     ExecutionStage,
@@ -55,6 +56,7 @@ from sws_agent.constants import (
 from sws_agent.execution import (
     ACTION_EXECUTION_REGISTRY,
     ActionSpec,
+    DispatchContract,
     ExecutionCoordinator,
     canonical_postconditions,
     execution_intent_key,
@@ -63,14 +65,16 @@ from sws_agent.execution import (
 from sws_agent.execution_ledger import (
     DurableExecutionLedger,
     ExecutionReservationState,
+    ReexecutionClass,
     ReservationOwnershipError,
 )
 from sws_agent.verification import ObservationError
+from sws_agent import execution as execution_module
 from sws_agent.models import (
     ActionPlan,
     ApprovalTicket,
+    DispatchEvidence,
     ExecutionRequest,
-    MutationAttempt,
     PolicyDecision,
     ResourceObservation,
     ResourceRecord,
@@ -109,6 +113,29 @@ class _Clock:
 
     def advance(self, seconds: int) -> None:
         self._value = self._value + timedelta(seconds=seconds)
+
+
+class _Sleeper:
+    """Records requested pauses instead of taking them (M15-D).
+
+    ``ExecutionCoordinator``'s settle loop sleeps between observations. These
+    tests drive it with :class:`_Clock`, which is frozen unless a test advances
+    it, so the loop is bounded by ``max_polls`` rather than by the clock -- and
+    with a real ``time.sleep`` that bound costs 39 x 15s = 585 real seconds per
+    test. Injecting this makes the loop instant while keeping the *number* of
+    pauses assertable, which is how a test can prove the coordinator really did
+    wait 15 seconds' worth of intervals rather than spinning.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+    @property
+    def total(self) -> float:
+        return sum(self.calls)
 
 
 class _SpyAuditStore:
@@ -331,17 +358,27 @@ class _World:
         self.state = "running"
         self.handler_calls: list[ExecutionRequest] = []
         self.timeout = False
-        self.call_error = False
+        self.rejected = False
         self.observed: list[str] = []
 
-    def handle(self, request: ExecutionRequest) -> MutationAttempt:
+    def handle(self, request: ExecutionRequest) -> DispatchEvidence:
         self.handler_calls.append(request)
         if self.timeout:
-            return MutationAttempt(ambiguous=True, sanitized={"note": "timeout"})
-        if self.call_error:
-            return MutationAttempt(call_error=True, sanitized={"note": "api error"})
+            return DispatchEvidence(
+                disposition=DispatchDisposition.DISPATCH_UNKNOWN,
+                sanitized={"note": "no response was received"},
+            )
+        if self.rejected:
+            return DispatchEvidence(
+                disposition=DispatchDisposition.DISPATCH_REJECTED,
+                aws_error_code="RequestLimitExceeded",
+                sanitized={"note": "api error"},
+            )
         self.state = "stopped"
-        return MutationAttempt(sanitized={"dispatched": True})
+        return DispatchEvidence(
+            disposition=DispatchDisposition.ACCEPTED,
+            sanitized={"dispatched": True},
+        )
 
     def observe(self, resource_id: str) -> ResourceObservation:
         self.observed.append(resource_id)
@@ -396,6 +433,42 @@ def _ledger(tmp_path: Path | None = None) -> DurableExecutionLedger:
 # ---------------------------------------------------------------------------
 # Registry: metadata only, immutable, nothing implemented.
 # ---------------------------------------------------------------------------
+
+
+def _install_dispatch_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    contract: DispatchContract,
+    action: PotentialAction = STOP,
+) -> None:
+    """Give one action a dispatch contract for the duration of a test.
+
+    This is the designed extension point, used exactly as a future mutation
+    handler would use it: the coordinator reads ``ActionSpec.dispatch_contract``
+    and nothing else, so declaring a contract is the only way to make a
+    rejection or a contradiction classifiable. ``STOP_RESOURCE`` ships with no
+    contract, which is the fail-closed default, so a test must opt in
+    explicitly to exercise the classifying paths.
+    """
+    spec = ACTION_EXECUTION_REGISTRY[action]
+    monkeypatch.setattr(
+        execution_module,
+        "ACTION_EXECUTION_REGISTRY",
+        MappingProxyType(
+            {
+                **ACTION_EXECUTION_REGISTRY,
+                action: ActionSpec(
+                    action=spec.action,
+                    eligible_resource_types=spec.eligible_resource_types,
+                    requires_human_approval=spec.requires_human_approval,
+                    mutation=spec.mutation,
+                    postconditions=spec.postconditions,
+                    implemented=spec.implemented,
+                    description=spec.description,
+                    dispatch_contract=contract,
+                ),
+            }
+        ),
+    )
 
 
 def test_registry_covers_every_potential_action():
@@ -476,6 +549,7 @@ def _refused_request_gate(
         audit_store=audit,  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is REFUSED
@@ -513,6 +587,7 @@ def _a5_refused(
         audit_store=audit,  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is REFUSED
@@ -887,7 +962,12 @@ def test_caller_supplied_observation_is_refused_even_when_valid():
 def test_coordinator_requests_its_own_observation():
     store = InMemoryApprovalStore(now=_Clock())
     request, _plan, _snapshot = _gated_request_with_ticket(store)
-    provider = _Provider(observation=_provider_observation())
+    provider = _Provider(
+        # Settled, so the M15-D settle loop converges on its first poll. This
+        # test is about *who* asks the provider, not about how long it waits;
+        # the multi-poll path is covered by the M15-D settlement tests.
+        observation=_provider_observation(facts={"state": "stopped"})
+    )
     world = _World()
     coordinator = ExecutionCoordinator(
         approval_store=store,
@@ -897,6 +977,7 @@ def test_coordinator_requests_its_own_observation():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     coordinator.execute(request)
     # Once for the A5 preflight, once for post-attempt verification.
@@ -915,6 +996,7 @@ def test_provider_issued_observation_satisfies_a5():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
 
@@ -932,6 +1014,7 @@ def test_missing_observation_provider_is_fail_closed():
         audit_store=audit,  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is REFUSED
     assert result.refusal is RefusalReason.OBSERVATION_PROVIDER_UNAVAILABLE
@@ -1059,6 +1142,7 @@ def test_maximum_observation_age_is_configurable():
         id_source=lambda: "exec-1",
         now=_Clock(),
         max_observation_age_seconds=1,
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is REFUSED
     assert result.refusal is RefusalReason.OBSERVATION_TOO_OLD
@@ -1182,6 +1266,7 @@ def test_gate_pass_with_no_handler_reports_not_executed():
         approval_store=store,
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.NOT_EXECUTED
@@ -1198,6 +1283,7 @@ def test_not_executed_does_not_consume_ticket():
         approval_store=store,
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     coordinator.execute(request)
     assert store.get(request.ticket.ticket_id).consumed is False
@@ -1212,6 +1298,7 @@ def test_not_executed_writes_pre_only():
         audit_store=audit,  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     coordinator.execute(request)
     assert len(audit) == 1
@@ -1239,6 +1326,7 @@ def test_verified_success_when_observation_matches():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
@@ -1263,6 +1351,7 @@ def test_partially_verified_when_canonical_fact_is_unobserved():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.PARTIALLY_VERIFIED
@@ -1292,6 +1381,7 @@ def test_conflicting_expected_poststate_is_refused():
         audit_store=audit,  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is REFUSED
     assert result.refusal is RefusalReason.POSTCONDITION_MISMATCH
@@ -1327,6 +1417,7 @@ def test_superset_caller_facts_are_refused():
         audit_store=audit,  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is REFUSED
     assert result.refusal is RefusalReason.POSTCONDITION_MISMATCH
@@ -1334,24 +1425,94 @@ def test_superset_caller_facts_are_refused():
     assert len(audit) == 0
 
 
-def test_call_error_reports_failed():
+def test_a_declared_rejection_is_retryable_because_it_was_classified():
+    """A throttling rejection is retryable because a *declared* mapping says so.
+
+    M15-C wrote this test when ``STOP_RESOURCE`` declared no contract, and the
+    assertion was ``UNKNOWN``/``OUTCOME_UNKNOWN``: the point then was that a
+    failure must not acquire retryability merely because the system could not
+    classify it.
+
+    M15-D populates the contract, and ``RequestLimitExceeded`` is now a declared
+    ``TRANSIENT_REJECTION``. So the permission is now *earned* rather than
+    accidental -- which is the distinction worth pinning. The refusal is still
+    established (AWS answered 4xx, so nothing was applied), the code is known to
+    be a throttle, and the mapping to a retryable class is a decision somebody
+    made rather than a default.
+
+    What did not change, and what the neighbouring tests still hold, is that an
+    *unestablished* boundary stays terminal: see
+    ``test_timeout_is_unknown_never_failed``.
+    """
     store = InMemoryApprovalStore(now=_Clock())
     request, _plan, _snapshot = _gated_request_with_ticket(store)
     world = _World()
-    world.call_error = True
+    world.rejected = True
+    ledger = _ledger()
     coordinator = ExecutionCoordinator(
         approval_store=store,
-        execution_ledger=_ledger(),
+        execution_ledger=ledger,
         handler=world,
         observer=world,
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.FAILED
-    assert result.verification is VerificationStatus.FAILED
+    reservation = ledger.all_executions()[0]
+    assert reservation.reexecution_class is ReexecutionClass.TRANSIENT_REJECTION
+    assert reservation.permits_reexecution is True
+    # Retryable, but only for a *new* authorisation: the ticket that authorised
+    # this crossing is still spent, because "may try again" is not a refund.
     assert store.get(request.ticket.ticket_id).consumed is True
+
+
+def test_an_unlisted_rejection_code_is_retryable_because_rejection_is_established():
+    """The M15-C ruling, reached from the other direction.
+
+    A rejection code nobody has classified is *not* an unknown outcome. AWS
+    answered with a 4xx, so the absence of effect is established; only the
+    system's understanding of *why* is missing. Classifying that as
+    ``TRANSIENT_REJECTION`` is what keeps a fresh authorisation available for a
+    plain throttle while still refusing to retry a boundary whose response was
+    never seen.
+    """
+    store = InMemoryApprovalStore(now=_Clock())
+    request, _plan, _snapshot = _gated_request_with_ticket(store)
+    ledger = _ledger()
+    coordinator = ExecutionCoordinator(
+        approval_store=store,
+        execution_ledger=ledger,
+        handler=_UnlistedRejection(),
+        observer=_World(),
+        audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
+        id_source=lambda: "exec-1",
+        now=_Clock(),
+        sleep=_Sleeper(),
+    )
+    result = coordinator.execute(request)
+    assert result.outcome is ExecutionOutcome.FAILED
+    reservation = ledger.all_executions()[0]
+    assert reservation.reexecution_class is ReexecutionClass.TRANSIENT_REJECTION
+    assert reservation.permits_reexecution is True
+    # Never NO_EFFECT: this was a refusal, not an absence of effect.
+    assert reservation.reexecution_class is not ReexecutionClass.NO_EFFECT
+
+
+class _UnlistedRejection:
+    """A definitive refusal carrying a code no contract mentions."""
+
+    def __init__(self) -> None:
+        self.handler_calls: list[ExecutionRequest] = []
+
+    def handle(self, request: ExecutionRequest) -> DispatchEvidence:
+        self.handler_calls.append(request)
+        return DispatchEvidence(
+            disposition=DispatchDisposition.DISPATCH_REJECTED,
+            aws_error_code="SomeCodeNobodyHasClassifiedYet",
+        )
 
 
 def test_timeout_is_unknown_never_failed():
@@ -1367,6 +1528,7 @@ def test_timeout_is_unknown_never_failed():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.UNKNOWN
@@ -1391,6 +1553,7 @@ def test_observer_raising_after_attempt_is_unknown():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.UNKNOWN
@@ -1411,6 +1574,7 @@ def test_missing_observer_with_handler_is_refused_not_executed():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is REFUSED
     assert result.refusal is RefusalReason.OBSERVATION_PROVIDER_UNAVAILABLE
@@ -1438,6 +1602,7 @@ def test_post_attempt_observer_raising_unexpected_error_still_closes_transaction
         audit_store=audit,
         id_source=lambda: "exec-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.UNKNOWN
@@ -1461,6 +1626,7 @@ def test_no_blind_retry_after_ambiguous_attempt():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     first = coordinator.execute(request)
     assert first.outcome is ExecutionOutcome.UNKNOWN
@@ -1485,6 +1651,7 @@ def test_handler_without_durable_audit_store_is_refused():
         observer=world,
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is REFUSED
     assert result.refusal is RefusalReason.DURABLE_LEDGER_REQUIRED
@@ -1535,6 +1702,7 @@ def test_reservation_conflict_spends_nothing(tmp_path: Path):
         id_source=lambda: "exec-1",
         worker_id="worker-mine",
         now=clock,
+        sleep=_Sleeper(),
     )
     refused = coordinator.execute(request)
     assert refused.outcome is REFUSED
@@ -1568,6 +1736,7 @@ def test_same_ticket_replay_is_refused_before_reserving(tmp_path: Path):
         id_source=lambda: "exec-1",
         worker_id="worker-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     result = first.execute(request)
     assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
@@ -1584,6 +1753,7 @@ def test_same_ticket_replay_is_refused_before_reserving(tmp_path: Path):
         id_source=lambda: "exec-2",
         worker_id="worker-2",
         now=clock,
+        sleep=_Sleeper(),
     )
     refused = second.execute(request)
     assert refused.outcome is REFUSED
@@ -1624,6 +1794,7 @@ def test_ledger_correlates_the_execution_transaction(tmp_path: Path):
         audit_store=audit,
         id_source=lambda: "exec-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.VERIFIED_SUCCESS
@@ -1666,6 +1837,7 @@ def test_ledger_records_no_secrets(tmp_path: Path):
         audit_store=audit,
         id_source=lambda: "exec-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     coordinator.execute(request)
     raw = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
@@ -1835,6 +2007,7 @@ def test_replanned_same_intent_after_success_is_refused(tmp_path: Path):
         id_source=lambda: "exec-1",
         worker_id="worker-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     assert first.execute(request).outcome is ExecutionOutcome.VERIFIED_SUCCESS
 
@@ -1861,6 +2034,7 @@ def test_replanned_same_intent_after_success_is_refused(tmp_path: Path):
         id_source=lambda: "exec-2",
         worker_id="worker-2",
         now=clock,
+        sleep=_Sleeper(),
     )
     result = second.execute(replanned)
 
@@ -1874,38 +2048,73 @@ def test_replanned_same_intent_after_success_is_refused(tmp_path: Path):
     assert len(ledger.all_executions()) == 1
 
 
+class _AcceptedButUnchangedWorld(_World):
+    """Accepts the dispatch but leaves the resource running.
+
+    Overriding ``handle`` rather than ``verify`` keeps the evidence path
+    intact: the observation still comes from ``observe``, exactly as in
+    production, and the coordinator genuinely compares an expected
+    postcondition against what the world reports.
+    """
+
+    def handle(self, request: ExecutionRequest) -> DispatchEvidence:
+        self.handler_calls.append(request)
+        # Dispatch succeeds, but the resource never reaches "stopped".
+        return DispatchEvidence(
+            disposition=DispatchDisposition.ACCEPTED,
+            sanitized={"dispatched": True},
+        )
+
+
+class _AcceptedThenTerminatedWorld(_AcceptedButUnchangedWorld):
+    """Accepts the dispatch and the target then becomes unstoppable.
+
+    Distinct from :class:`_AcceptedButUnchangedWorld` in the one way that matters
+    to re-execution: ``terminated`` can never satisfy a stop intent, so repeating
+    the intent is meaningless rather than merely premature.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = "terminated"
+
+    def handle(self, request: ExecutionRequest) -> DispatchEvidence:
+        evidence = super().handle(request)
+        self.state = "terminated"
+        return evidence
+
+
 def test_replanned_same_intent_after_a_failed_outcome_is_permitted(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """A known unsuccessful attempt is what makes a second execution meaningful.
 
     This is the case ADR0003's rejection of intent-only keying was actually
-    protecting, and it still works. ``FAILED`` is the single prior outcome that
-    justifies a reattempt: the system holds evidence the operation did not
-    achieve its postcondition, so a separately authorized try is a real
-    correction rather than a duplicate. The new execution records which failure
-    it supersedes, so the permission is auditable.
+    protecting, and it still works. A *classified* failure justifies a
+    reattempt: the system holds evidence the operation did not achieve its
+    postcondition **and** that the target is still in a state where repeating
+    is safe. The new execution records which failure it supersedes, so the
+    permission is auditable.
+
+    M15-C makes the classification explicit. The contract below declares that a
+    resource still observed ``running`` after an accepted dispatch means
+    ``POST_STATE_NOT_REACHED`` -- not yet stopped, so retrying is safe. That is the
+    whole reason the declaration is load-bearing rather than documentation: without
+    it the same evidence fails closed to ``OUTCOME_UNKNOWN`` and the reattempt
+    below would be refused. The declared counterpart is
+    ``test_replanned_after_an_unreachable_post_state_is_refused``, where the
+    target is ``terminated`` and the retry is correctly refused.
     """
+    _install_dispatch_contract(
+        monkeypatch,
+        DispatchContract(post_state_classes={"running": ReexecutionClass.POST_STATE_NOT_REACHED}),
+    )
     clock = _Clock()
     store = InMemoryApprovalStore(now=clock)
     ledger = _ledger(tmp_path)
     request, _plan, snapshot = _gated_request_with_ticket(store)
 
-    class _FailingWorld(_World):
-        """Leaves the resource running so verification records ``FAILED``.
-
-        Overriding ``handle`` rather than ``verify`` keeps the evidence path
-        intact: the observation still comes from ``observe``, exactly as in
-        production, and the coordinator genuinely compares an expected
-        postcondition against what the world reports.
-        """
-
-        def handle(self, request: ExecutionRequest) -> MutationAttempt:
-            self.handler_calls.append(request)
-            # Dispatch succeeds, but the resource never reaches "stopped".
-            return MutationAttempt(sanitized={"dispatched": True})
-
-    world = _FailingWorld()
+    world = _AcceptedButUnchangedWorld()
     first = ExecutionCoordinator(
         approval_store=store,
         execution_ledger=ledger,
@@ -1915,10 +2124,13 @@ def test_replanned_same_intent_after_a_failed_outcome_is_permitted(
         id_source=lambda: "exec-1",
         worker_id="worker-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     assert first.execute(request).outcome is ExecutionOutcome.FAILED
     failed_row = ledger.all_executions()[0]
     assert failed_row.outcome is ExecutionOutcome.FAILED
+    assert failed_row.reexecution_class is ReexecutionClass.POST_STATE_NOT_REACHED
+    assert failed_row.permits_reexecution is True
 
     replan = _make_plan(
         store, snapshot=snapshot, decision=_make_decision(snapshot), plan_id="plan-2"
@@ -1941,6 +2153,7 @@ def test_replanned_same_intent_after_a_failed_outcome_is_permitted(
         id_source=lambda: "exec-2",
         worker_id="worker-2",
         now=clock,
+        sleep=_Sleeper(),
     )
     result = second.execute(replanned)
 
@@ -1957,6 +2170,87 @@ def test_replanned_same_intent_after_a_failed_outcome_is_permitted(
     assert reattempt.supersedes_reservation_id == failed_row.reservation_id
     assert failed_row.supersedes_reservation_id is None
     ledger.verify_lineage()
+
+
+def test_replanned_after_an_unreachable_post_state_is_refused(tmp_path: Path):
+    """A separately approved retry is still refused after an unreachable state.
+
+    An accepted dispatch followed by an unchanged post-state is ambiguous in a
+    way that matters. ``running`` after an accepted stop may mean the stop is
+    still in flight and a retry is harmless, or it may mean the stop was silently
+    dropped. A resource that had become ``terminated`` could never be stopped
+    again. Both arrive as ``VerificationStatus.FAILED``, and only a declared
+    per-state mapping can tell them apart.
+
+    This test pins the ``terminated`` half, which is the half that must refuse.
+    M15-C reached that refusal through the *absence* of a contract; M15-D reaches
+    it through a declared ``POST_STATE_UNREACHABLE`` mapping. The property under
+    test is unchanged and is the direct counterpart of
+    ``test_replanned_same_intent_after_a_failed_outcome_is_permitted``.
+
+    The ``running`` half is deliberately the opposite: it is retryable, because
+    stopping an instance is idempotent and a second attempt on a still-running
+    instance is safe. ``test_stop_that_never_converges_permits_a_retry`` pins that
+    asymmetry -- it is a decision about this action, not a general rule.
+    """
+    clock = _Clock()
+    store = InMemoryApprovalStore(now=clock)
+    ledger = _ledger(tmp_path)
+    request, _plan, snapshot = _gated_request_with_ticket(store)
+
+    world = _AcceptedThenTerminatedWorld()
+    first = ExecutionCoordinator(
+        approval_store=store,
+        execution_ledger=ledger,
+        handler=world,
+        observer=world,
+        audit_store=_jsonl_audit(tmp_path / "first.jsonl", clock),
+        id_source=lambda: "exec-1",
+        worker_id="worker-1",
+        now=clock,
+        sleep=_Sleeper(),
+    )
+    result = first.execute(request)
+
+    # FAILED with a *declared* non-retryable basis -- not the NO_EFFECT the old
+    # outcome-keyed default produced, and not OUTCOME_UNKNOWN either.
+    assert result.outcome is ExecutionOutcome.FAILED
+    row = ledger.all_executions()[0]
+    assert row.outcome is ExecutionOutcome.FAILED
+    assert row.reexecution_class is ReexecutionClass.POST_STATE_UNREACHABLE
+    assert row.permits_reexecution is False
+
+    replan = _make_plan(
+        store, snapshot=snapshot, decision=_make_decision(snapshot), plan_id="plan-2"
+    )
+    replanned = request.model_copy(
+        update={
+            "action_plan_id": "plan-2",
+            "plan": replan,
+            "ticket": _grant(store, replan),
+        }
+    )
+
+    succeeding = _World()
+    second = ExecutionCoordinator(
+        approval_store=store,
+        execution_ledger=ledger,
+        handler=succeeding,
+        observer=succeeding,
+        audit_store=_jsonl_audit(tmp_path / "second.jsonl", clock),
+        id_source=lambda: "exec-2",
+        worker_id="worker-2",
+        now=clock,
+        sleep=_Sleeper(),
+    )
+    retry = second.execute(replanned)
+
+    # A separately approved retry is still refused: the refusal comes from the
+    # settled basis, not from the approval. The boundary was never crossed a
+    # second time, so no duplicate mutation was issued.
+    assert retry.outcome is ExecutionOutcome.REFUSED
+    assert len(ledger.all_executions()) == 1
+    assert succeeding.handler_calls == []
 
 
 def test_claim_survives_a_process_restart(tmp_path: Path):
@@ -1981,6 +2275,7 @@ def test_claim_survives_a_process_restart(tmp_path: Path):
         id_source=lambda: "exec-1",
         worker_id="worker-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     assert first.execute(request).outcome is ExecutionOutcome.VERIFIED_SUCCESS
 
@@ -1997,6 +2292,7 @@ def test_claim_survives_a_process_restart(tmp_path: Path):
         id_source=lambda: "exec-2",
         worker_id="worker-2",
         now=clock,
+        sleep=_Sleeper(),
     )
     refused = reopened.execute(request)
     assert refused.outcome is REFUSED
@@ -2020,6 +2316,7 @@ def test_new_snapshot_reopens_the_intent(tmp_path: Path):
         audit_store=audit,
         id_source=lambda: "exec-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     assert first.execute(request).outcome is ExecutionOutcome.VERIFIED_SUCCESS
 
@@ -2046,6 +2343,7 @@ def test_new_snapshot_reopens_the_intent(tmp_path: Path):
         audit_store=audit,
         id_source=lambda: "exec-2",
         now=clock,
+        sleep=_Sleeper(),
     )
     assert second.execute(later_request).outcome is ExecutionOutcome.VERIFIED_SUCCESS
     assert len(world.handler_calls) == 2
@@ -2100,6 +2398,7 @@ def test_action_without_postcondition_is_refused(monkeypatch):
         audit_store=audit,  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is REFUSED
     assert result.refusal is RefusalReason.POSTCONDITION_UNDEFINED
@@ -2143,6 +2442,7 @@ def test_action_without_eligible_resource_types_is_refused():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     ).execute(request)
     assert result.outcome is REFUSED
     assert result.refusal is RefusalReason.ACTION_NOT_EXECUTABLE
@@ -2183,6 +2483,7 @@ def test_reconciliation_is_empty_for_a_clean_ledger(tmp_path: Path):
         audit_store=audit,
         id_source=lambda: "exec-1",
         now=clock,
+        sleep=_Sleeper(),
     ).execute(request)
     assert reconcile_open_transactions(audit) == ()
 
@@ -2198,6 +2499,7 @@ def test_not_executed_pre_only_is_not_an_open_transaction(tmp_path: Path):
         audit_store=audit,
         id_source=lambda: "exec-1",
         now=clock,
+        sleep=_Sleeper(),
     ).execute(request)
     assert reconcile_open_transactions(audit) == ()
 
@@ -2221,6 +2523,7 @@ def test_reconciliation_finds_a_transaction_truncated_after_the_attempt(
         audit_store=audit,
         id_source=lambda: "exec-1",
         now=clock,
+        sleep=_Sleeper(),
     ).execute(request)
 
     # Simulate the crash: drop everything from RESULT onwards.
@@ -2285,6 +2588,7 @@ def test_reconciliation_is_read_only_and_deterministic(tmp_path: Path):
             audit_store=audit,
             id_source=lambda index=index: f"exec-{index}",
             now=clock,
+            sleep=_Sleeper(),
         ).execute(request)
 
     lines_before = path.read_text(encoding="utf-8")
@@ -2376,7 +2680,7 @@ def test_durable_rehydrated_ticket_passes_plan_binding_by_value(tmp_path: Path):
     assert equal_value == stored.plan_id
     assert equal_value is not stored.plan_id
 
-    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock())
+    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock(), sleep=_Sleeper())
     request = ExecutionRequest(
         action_plan_id=equal_value,
         resource_id="inst-1",
@@ -2413,7 +2717,7 @@ def test_durable_ticket_with_different_plan_id_still_refused(tmp_path: Path):
     decision = _make_decision(snapshot)
     plan = _make_plan(InMemoryApprovalStore(now=_Clock()), snapshot=snapshot, decision=decision)
 
-    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock())
+    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock(), sleep=_Sleeper())
     request = ExecutionRequest(
         action_plan_id="a-different-plan",
         resource_id="inst-1",
@@ -2443,6 +2747,7 @@ def _ordering_coordinator(
     world: _World,
     audit: object | None = None,
     worker_id: str = "worker-1",
+    sleeper: _Sleeper | None = None,
 ) -> ExecutionCoordinator:
     return ExecutionCoordinator(
         approval_store=store,
@@ -2453,6 +2758,7 @@ def _ordering_coordinator(
         id_source=lambda: "exec-1",
         worker_id=worker_id,
         now=_Clock(),
+        sleep=sleeper if sleeper is not None else _Sleeper(),
     )
 
 
@@ -2712,6 +3018,7 @@ def test_default_worker_id_is_generated_once_and_not_per_request(tmp_path: Path)
         approval_store=store,
         id_source=lambda: "exec-1",
         now=clock,
+        sleep=_Sleeper(),
     )
     captured = coordinator._worker_id  # noqa: SLF001
     assert captured
@@ -2730,6 +3037,7 @@ def test_handler_without_an_execution_ledger_is_refused():
         audit_store=_SpyAuditStore(),  # type: ignore[arg-type]
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is REFUSED
@@ -2747,6 +3055,7 @@ def test_not_executed_writes_no_reservation(tmp_path: Path):
         execution_ledger=ledger,
         id_source=lambda: "exec-1",
         now=_Clock(),
+        sleep=_Sleeper(),
     )
     result = coordinator.execute(request)
     assert result.outcome is ExecutionOutcome.NOT_EXECUTED
@@ -2786,7 +3095,7 @@ def test_in_memory_plan_binding_behavior_is_unchanged(tmp_path: Path):
     plan = _make_plan(store, snapshot=snapshot, decision=decision)
     granted = _grant(store, plan)
 
-    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock())
+    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock(), sleep=_Sleeper())
 
     matching = _request(
         plan=plan, snapshot=snapshot, decision=decision, ticket=granted
@@ -2816,7 +3125,7 @@ def test_plan_binding_still_refuses_when_ticket_has_no_plan():
     )
     assert unbound.plan_id is None
 
-    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock())
+    coordinator = ExecutionCoordinator(approval_store=store, now=_Clock(), sleep=_Sleeper())
     request = _request(
         plan=plan, snapshot=snapshot, decision=decision, ticket=unbound
     )

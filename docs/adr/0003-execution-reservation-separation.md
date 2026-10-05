@@ -70,6 +70,14 @@ because it names a different authorization instance.
 > `FAILED`. The re-approved attempt this paragraph worried about is not permanently
 > blocked — it is permitted once the prior execution records `FAILED`, and that
 > supersession is recorded. The intent key became a guard rather than a key.
+>
+> **Amended again by ADR 0007 ("Retryability is a recorded basis").** The
+> `REFUSED`, `NOT_EXECUTED`, and `TERMINAL_*` branches of that amendment were
+> themselves wrong, because the rule keyed on the outcome word rather than on
+> evidence about the target. A settled row now permits a second execution when it
+> records a `ReexecutionClass` basis that says repeating it is safe — which
+> includes `NOT_EXECUTED`, and excludes a definitive target rejection that was
+> previously spelled `FAILED` and therefore retried.
 
 Claiming is exactly-once and atomic: the read, the absence check, and the
 insert share one `BEGIN IMMEDIATE` transaction, so contending processes

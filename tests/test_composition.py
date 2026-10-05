@@ -40,6 +40,7 @@ from sws_agent.composition import (
     cast_mutation_handler,
 )
 from sws_agent.constants import (
+    DispatchDisposition,
     ExecutionMode,
     ExecutionOutcome,
     PotentialAction,
@@ -56,12 +57,13 @@ from sws_agent.execution import (
 from sws_agent.execution_ledger import (
     DurableExecutionLedger,
     ExecutionReservationState,
+    ReexecutionClass,
 )
 from sws_agent.mcp.server import SwsMcpServer
 from sws_agent.models import (
     ActionPlan,
+    DispatchEvidence,
     ExecutionRequest,
-    MutationAttempt,
     PolicyDecision,
     ResourceRecord,
     WorkspaceSnapshot,
@@ -250,7 +252,7 @@ def test_composition_survives_reopening_the_same_directory(tmp_path):
         assert executions[0].intent_key == execution_intent_key(
             snapshot_id="snap-1", resource_id=INSTANCE_ID, action=STOP
         )
-        assert first_result.outcome is ExecutionOutcome.FAILED
+        assert first_result.outcome is ExecutionOutcome.NOT_EXECUTED
     finally:
         second.close()
 
@@ -279,7 +281,7 @@ def test_dry_run_crosses_the_real_coordinator_path_end_to_end(tmp_path):
         result = composition.coordinator.execute(request)
 
         # The gate passed and the boundary was crossed exactly once.
-        assert result.outcome is ExecutionOutcome.FAILED
+        assert result.outcome is ExecutionOutcome.NOT_EXECUTED
         assert result.refusal is None
         assert len(composition.handler) == 1
         assert composition.handler.crossings()[0].resource_id == INSTANCE_ID
@@ -291,10 +293,15 @@ def test_dry_run_crosses_the_real_coordinator_path_end_to_end(tmp_path):
         assert reservation.intent_key == intent
         assert reservation.state is ExecutionReservationState.RESOLVED
         assert reservation.revision == 2
-        assert reservation.outcome is ExecutionOutcome.FAILED
+        assert reservation.outcome is ExecutionOutcome.NOT_EXECUTED
         assert reservation.may_have_crossed_boundary is True
         assert reservation.is_terminal is True
         assert reservation.action is STOP
+        # M15-C: the basis is NO_EFFECT because the boundary positively
+        # reported NOT_DISPATCHED. The structural non-mutation property is now
+        # recorded as a fact rather than inferred from a failed postcondition.
+        assert reservation.reexecution_class is ReexecutionClass.NO_EFFECT
+        assert reservation.permits_reexecution is True
 
         # Approval was consumed before the effect, not after.
         ticket_id = request.ticket.ticket_id
@@ -314,22 +321,31 @@ def test_dry_run_crosses_the_real_coordinator_path_end_to_end(tmp_path):
 
 
 def test_dry_run_never_reports_success_because_it_changes_nothing(tmp_path):
-    """A run that stopped nothing must not claim the instance was stopped.
+    """A run that dispatched nothing must not claim the instance was stopped.
 
-    The canonical postcondition is ``state == "stopped"``. The dry run's
-    handler performs no mutation, the instance is still running, and
-    verification is therefore contradicted. Reporting ``VERIFIED_SUCCESS``
-    here would be the exact fabrication this milestone exists to prevent.
+    The canonical postcondition is ``state == "stopped"``. The dry run's handler
+    performs no mutation and reports ``NOT_DISPATCHED``, so the coordinator
+    never verifies at all. Reporting ``VERIFIED_SUCCESS`` here would be the
+    exact fabrication this milestone exists to prevent.
+
+    M15-C makes this assertion stronger rather than merely changing it. The
+    previous behaviour ran verification, observed the still-running instance,
+    and inferred ``FAILED`` -- a correct verdict reached by verifying a
+    mutation that was never sent. The outcome is now ``NOT_EXECUTED``, which
+    asserts the stronger and more specific truth that no mutation happened,
+    and the recorded basis is ``NO_EFFECT`` so the retry is authorized on a
+    positive statement rather than on an unverified inference.
     """
     composition = _composition(tmp_path)
     try:
         _plan, request = _prepare(composition)
         result = composition.coordinator.execute(request)
         assert result.outcome is not ExecutionOutcome.VERIFIED_SUCCESS
-        assert result.outcome is ExecutionOutcome.FAILED
+        assert result.outcome is ExecutionOutcome.NOT_EXECUTED
         reservation = composition.execution_ledger.all_executions()[0]
         assert reservation.outcome is not ExecutionOutcome.UNKNOWN
         assert reservation.state is ExecutionReservationState.RESOLVED
+        assert reservation.reexecution_class is ReexecutionClass.NO_EFFECT
     finally:
         composition.close()
 
@@ -524,10 +540,12 @@ def test_two_independent_processes_on_one_intent_cross_once(tmp_path):
 
     # Exactly one process crossed the boundary.
     assert sorted(r["crossings"] for r in reports) == [0, 1]
-    # Exactly one executed; the loser was refused, never silently ignored.
+    # Exactly one executed; the loser was refused, never silently ignored. The
+    # winner reports NOT_EXECUTED (M15-C): the null handler positively reported
+    # NOT_DISPATCHED, so no mutation happened and none was claimed.
     outcomes = sorted(r["outcome"] for r in reports)
     assert outcomes.count("refused") == 1
-    assert outcomes.count("failed") == 1
+    assert outcomes.count("not_executed") == 1
     loser = next(r for r in reports if r["crossings"] == 0)
     assert loser["refusal"] is not None
 
@@ -590,7 +608,7 @@ def test_shipped_handlers_hold_no_way_to_reach_aws():
         assert not hasattr(handler, "client")
         assert not hasattr(handler, "session")
         assert not hasattr(handler, "credentials")
-        attempt = handler.handle(
+        evidence = handler.handle(
             ExecutionRequest(
                 action_plan_id="plan-1",
                 resource_id=INSTANCE_ID,
@@ -598,9 +616,15 @@ def test_shipped_handlers_hold_no_way_to_reach_aws():
                 execution_mode=ExecutionMode.SAFE,
             )
         )
-        assert attempt.ambiguous is False
-        assert attempt.call_error is False
-        assert attempt.sanitized["mutating"] is False
+        # M15-C: the shipped handlers report the truthful disposition, which is
+        # that nothing was dispatched. They carry no AWS response fields, so
+        # there is no error code, HTTP status, or exception class to carry.
+        assert isinstance(evidence, DispatchEvidence)
+        assert evidence.disposition is DispatchDisposition.NOT_DISPATCHED
+        assert evidence.aws_error_code is None
+        assert evidence.http_status is None
+        assert evidence.exception_class is None
+        assert evidence.sanitized["mutating"] is False
 
 
 def test_composition_module_cannot_reach_aws():
@@ -674,9 +698,16 @@ def test_null_handler_returns_a_definite_non_mutating_attempt():
 
     An ambiguous attempt would park the execution in ``UNRESOLVED``, which is
     the wrong terminal state for a boundary that was never really dispatched.
+
+    M15-C replaces the ``ambiguous=False, call_error=False`` shape with the
+    disposition ``NOT_DISPATCHED``. The previous shape could only express "no
+    error and no ambiguity", which forced the coordinator to either run
+    verification on a mutation that was never sent or call the execution
+    unresolved. Naming the truth is strictly better: the coordinator skips
+    verification and records a positive ``NO_EFFECT``.
     """
     handler = NullMutationHandler()
-    attempt = handler.handle(
+    evidence = handler.handle(
         ExecutionRequest(
             action_plan_id="plan-1",
             resource_id=INSTANCE_ID,
@@ -684,7 +715,7 @@ def test_null_handler_returns_a_definite_non_mutating_attempt():
             execution_mode=ExecutionMode.SAFE,
         )
     )
-    assert isinstance(attempt, MutationAttempt)
-    assert attempt.ambiguous is False
-    assert attempt.call_error is False
-    assert attempt.sanitized["action"] == STOP.value
+    assert isinstance(evidence, DispatchEvidence)
+    assert evidence.disposition is DispatchDisposition.NOT_DISPATCHED
+    assert evidence.rejection_key is None
+    assert evidence.sanitized["action"] == STOP.value

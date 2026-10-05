@@ -102,7 +102,41 @@ Also record `aws configure get region`. A region set in the environment but not 
 
 ## 3. Credential and role verification
 
+> **Amended.** This section originally instructed a single `sts:AssumeRole` path with an
+> `--external-id`. Decision record 0012 ("Q1 — Identity and credential architecture")
+> selected **direct instance-profile attachment** instead, because a dedicated executor
+> attached to its own instance profile needs no second trust hop, and ADR 0010's own
+> decision rule prefers direct attachment "unless no direct attachment is available".
+> The original `AssumeRole` command is preserved below as the **fallback** path, to be
+> used only if direct attachment proves impossible and the reason is recorded here.
+>
+> The amendment does **not** relax any check below. The expiry and session-name checks
+> still apply to whichever path is used, and the closing constraint is *stricter* under
+> direct attachment: with no assume step at all, there is no principal that can assume
+> the mutation role, which satisfies "assumable only by the private CLI's principal"
+> more completely than `AssumeRole` ever could.
+>
+> **What is separate from what.** Obtaining a credential is not the same as being
+> authorized to act. The credential below establishes *which AWS principal runs the
+> mutation*; the approval in section 6 establishes *whether a human authorized it*.
+> Nothing in this section substitutes for that approval, and no credential in this
+> section authorizes the stop on its own.
+
 The mutating client takes its credential explicitly. There is no fallback to an environment variable, a shared profile, or an instance-profile role.
+
+**Preferred path — direct instance-profile attachment.** The executor's instance profile
+carries the dedicated mutation role. The CLI resolves the profile's credentials, and those
+are passed explicitly to the client:
+
+```powershell
+aws sts get-caller-identity --output json     # must return the mutation role's own Arn, not root and not an assumed session
+```
+
+Record the `Arn` and `Account`. A root identity here is a stop, not a correction: the
+mutation role is scoped to one instance ARN and root cannot be.
+
+**Fallback path — `sts:AssumeRole`.** Use only if direct attachment is unavailable, and
+record why before proceeding:
 
 ```powershell
 aws sts assume-role --role-arn <mutating-role-arn> --role-session-name sws-stop-<runid> --external-id <external-id> --output json

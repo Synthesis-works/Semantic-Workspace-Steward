@@ -38,7 +38,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Final
+from typing import Any, Final
 
 from .constants import ApprovalStatus, PotentialAction
 from .models import ApprovalTicket
@@ -163,6 +163,124 @@ class ApprovalStoreCorruptionError(ApprovalError):
     """
 
 
+class ApprovalArtifactError(ApprovalError):
+    """Raised when a supplied approval artifact does not fit its ticket.
+
+    Distinct from :class:`ApprovalStoreCorruptionError` on purpose. Corruption
+    means the stored data is damaged; this means the *caller* handed the store
+    something that does not belong to the ticket it names -- a signature over
+    a different resource, a deadline outside the store's own ceiling, or a
+    nonce that has already been recorded. The store refuses the write and
+    leaves the ticket untouched; it never partially applies an artifact.
+
+    This store records artifacts and checks that they bind. It performs no
+    cryptography: verifying the signature itself is the execution gate's job,
+    so the durable authority stays free of the optional ``signature`` extra
+    and keeps its failure vocabulary to durable/atomic/consistent.
+    """
+
+
+def signed_grant_changes(
+    ticket: ApprovalTicket,
+    signed: Any,
+    *,
+    now: datetime,
+    execution_ttl: timedelta,
+) -> dict[str, object]:
+    """Validate a detached approval artifact and return what a grant records.
+
+    Shared by both stores so they stay behaviourally identical, which is the
+    property that lets :class:`approval_ledger.DurableApprovalStore` replace
+    this module's in-memory double with no caller noticing.
+
+    Two groups of checks, both refusing before anything is written:
+
+    * **Binding.** The artifact's ticket id, resource, action, plan, and
+      intent key must equal the ticket's. An artifact that names a different
+      resource is refused rather than recorded against whichever ticket was
+      asked for; otherwise a signature over one approval could be attached to
+      another.
+    * **Window.** The artifact's deadline must be in the future and no later
+      than ``now + execution_ttl``. The lower bound keeps a signed but stale
+      artifact from granting a window that has already closed. The upper bound
+      preserves the intent of the store's execution ceiling: a human (or a
+      signing key) must not be able to authorize a mutation window longer
+      than the store itself permits, so signing cannot widen the blast radius
+      of an approval.
+
+    The returned mapping is applied to the ticket as ordinary state. The
+    signature itself is stored, never checked: :mod:`approval_signature`
+    owns verification, and this function's job is to guarantee that what gets
+    stored is bound to what it claims to approve.
+    """
+    fields = getattr(signed, "fields", None)
+    signature = getattr(signed, "signature", None)
+    if fields is None or not isinstance(signature, str) or not signature.strip():
+        raise ApprovalArtifactError(
+            "a signed approval artifact must carry both fields and a "
+            "non-blank signature"
+        )
+
+    mismatches: list[str] = []
+    if fields.ticket_id != ticket.ticket_id:
+        mismatches.append(
+            f"ticket_id {fields.ticket_id!r} != {ticket.ticket_id!r}"
+        )
+    if fields.resource_id != ticket.resource_id:
+        mismatches.append(
+            f"resource_id {fields.resource_id!r} != {ticket.resource_id!r}"
+        )
+    if fields.action != ticket.action.value:
+        mismatches.append(f"action {fields.action!r} != {ticket.action.value!r}")
+    if fields.plan_id != ticket.plan_id:
+        mismatches.append(f"plan_id {fields.plan_id!r} != {ticket.plan_id!r}")
+    if fields.execution_intent_key != ticket.execution_intent_key:
+        mismatches.append(
+            f"execution_intent_key {fields.execution_intent_key!r} != "
+            f"{ticket.execution_intent_key!r}"
+        )
+    if mismatches:
+        raise ApprovalArtifactError(
+            "the signed approval artifact does not bind to this ticket: "
+            + "; ".join(mismatches)
+        )
+
+    deadline = fields.execution_deadline
+    if deadline is None:
+        raise ApprovalArtifactError(
+            "the signed approval artifact carries no execution_deadline"
+        )
+    if deadline.tzinfo is None:
+        raise ApprovalArtifactError(
+            "the signed approval artifact's execution_deadline is naive; "
+            "refusing to guess an offset for a window that authorizes a mutation"
+        )
+    if deadline <= now:
+        raise ApprovalArtifactError(
+            f"the signed approval artifact's execution_deadline {deadline.isoformat()} "
+            f"is not after now ({now.isoformat()}); the authorized window has "
+            "already closed"
+        )
+    if deadline > now + execution_ttl:
+        raise ApprovalArtifactError(
+            f"the signed approval artifact's execution_deadline {deadline.isoformat()} "
+            f"is later than the store's {execution_ttl} execution ceiling at "
+            f"{(now + execution_ttl).isoformat()}; signing may not widen the "
+            "window this store is willing to honor"
+        )
+
+    return {
+        "execution_deadline": deadline,
+        "signer_key_id": fields.signer_key_id,
+        "executor_instance_id": fields.executor_instance_id,
+        "account_id": fields.account_id,
+        "region": fields.region,
+        "nonce": fields.nonce,
+        "issued_at": fields.issued_at,
+        "signature": signature,
+    }
+
+
 class InMemoryApprovalStore:
     """Deterministic, in-memory approval ticket state machine (M12).
 
@@ -250,15 +368,30 @@ class InMemoryApprovalStore:
         *,
         decided_by: str = "",
         reason: str = "",
+        signed: Any = None,
+        expected_revision: int | None = None,
     ) -> ApprovalTicket:
         """PENDING -> GRANTED, stamping the execution deadline.
 
         M12: the deadline is set at grant time, not at issue time, because
         the window a human authorizes is the window that begins when they say
         yes. ``decided_at`` and the deadline share the same injected instant.
+
+        ``signed`` attaches a detached cryptographic approval artifact
+        (Candidate 1, Option B). When supplied it must bind to this ticket,
+        and the ticket's execution deadline comes from the artifact rather
+        than from the store's TTL -- still capped by that TTL, so signing
+        cannot widen the window. ``expected_revision`` matches
+        ``DurableApprovalStore.grant`` so both stores honor the same
+        precondition.
         """
         return self._resolve(
-            ticket_id, ApprovalStatus.GRANTED, decided_by, reason
+            ticket_id,
+            ApprovalStatus.GRANTED,
+            decided_by,
+            reason,
+            signed=signed,
+            expected_revision=expected_revision,
         )
 
     def deny(
@@ -356,10 +489,20 @@ class InMemoryApprovalStore:
         new_status: ApprovalStatus,
         decided_by: str,
         reason: str,
+        *,
+        signed: Any = None,
+        expected_revision: int | None = None,
     ) -> ApprovalTicket:
         self._require_known(ticket_id)
         self._expire_if_stale(ticket_id)
-        return self._commit(ticket_id, new_status, decided_by, reason)
+        return self._commit(
+            ticket_id,
+            new_status,
+            decided_by,
+            reason,
+            signed=signed,
+            expected_revision=expected_revision,
+        )
 
     def _commit(
         self,
@@ -369,6 +512,7 @@ class InMemoryApprovalStore:
         reason: str,
         *,
         expected_revision: int | None = None,
+        signed: Any = None,
     ) -> ApprovalTicket:
         """Validate a transition against the M12 table and commit it.
 
@@ -397,6 +541,11 @@ class InMemoryApprovalStore:
         reason, which keeps the human's stated reason intact on a spent
         approval; the full history remains in the append-only audit ledger,
         which already records a TICKET payload per transition.
+
+        ``signed`` is validated by :func:`signed_grant_changes` after the
+        transition table and before any state is written, so a mis-bound or
+        over-long artifact raises before the ticket moves and leaves no
+        partial record behind.
         """
         ticket = self._tickets[ticket_id]
         permitted = LEGAL_APPROVAL_TRANSITIONS[ticket.status]
@@ -415,6 +564,19 @@ class InMemoryApprovalStore:
                 "newer approval state"
             )
         moment = self._now()
+        artifact: dict[str, object] = {}
+        if signed is not None:
+            if new_status is not ApprovalStatus.GRANTED:
+                raise ApprovalArtifactError(
+                    "a signed approval artifact may only be attached to a "
+                    f"GRANTED transition, not to {new_status.value}"
+                )
+            artifact = signed_grant_changes(
+                ticket,
+                signed,
+                now=moment,
+                execution_ttl=self._execution_ttl,
+            )
         changes: dict[str, object] = {
             "status": new_status,
             "consumed": new_status is ApprovalStatus.CONSUMED,
@@ -423,7 +585,11 @@ class InMemoryApprovalStore:
         if ticket.decided_at is None:
             changes["decided_at"] = moment
         if new_status is ApprovalStatus.GRANTED:
-            changes["execution_deadline"] = moment + self._execution_ttl
+            changes["execution_deadline"] = artifact.get(
+                "execution_deadline", moment + self._execution_ttl
+            )
+        if artifact:
+            changes.update(artifact)
         if decided_by:
             changes["decided_by"] = decided_by
         if reason:

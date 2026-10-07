@@ -662,6 +662,17 @@ class RefusalReason(str, enum.Enum):
     POSTCONDITION_UNDEFINED = "postcondition_undefined"
     POSTCONDITION_MISMATCH = "postcondition_mismatch"
     DURABLE_LEDGER_REQUIRED = "durable_ledger_required"
+    # Candidate 1, Option B (detached approval signatures). These reasons are
+    # emitted by the approval-signature gate that runs *after* the plan and
+    # ticket checks but only when the executor is configured with pinned
+    # signer keys. Each maps to exactly one failure of the verification
+    # policy, so a caller can distinguish "no artifact was brought" from "the
+    # artifact was signed by the wrong key" without parsing message text.
+    APPROVAL_SIGNATURE_MISSING = "approval_signature_missing"
+    APPROVAL_SIGNATURE_INVALID = "approval_signature_invalid"
+    APPROVAL_SIGNER_FORBIDDEN = "approval_signer_forbidden"
+    APPROVAL_ENVIRONMENT_MISMATCH = "approval_environment_mismatch"
+    APPROVAL_SIGNATURE_EXPIRED = "approval_signature_expired"
 
 
 SWS_SUPPORTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(

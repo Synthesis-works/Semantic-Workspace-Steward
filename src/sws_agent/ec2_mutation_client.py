@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final
 
 from sws_agent.ec2_mutation import MutationClientConfigurationError
 
@@ -73,7 +73,69 @@ _INSTANCE_ARN = re.compile(
 )
 
 #: The only two actions the mutation identity may hold.
-_ALLOWED_ACTIONS = frozenset({"ec2:StopInstances", "ec2:DescribeInstances"})
+#:
+#: This list is the mutation side of Candidate 1 and must not be widened. An
+#: exact-content regression test pins it, because a silent addition here is
+#: indistinguishable from a new capability: the executor's instance profile is
+#: what AWS evaluates, not a comment.
+_ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
+    {"ec2:StopInstances", "ec2:DescribeInstances"}
+)
+
+#: The only actions the SSM Agent *transport* identity may hold.
+#:
+#: Exactly ``AmazonSSMManagedInstanceCore`` v1
+#: (``arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore``), transcribed
+#: action by action. These keep the agent on the disposable executor alive and
+#: talking to the SSM endpoint; they carry no authority to open a session, to
+#: run a document, or to mutate anything.
+#:
+#: Deliberately **not** folded into ``_ALLOWED_ACTIONS``. Two disjoint lists are
+#: what lets the validator refuse any statement that mixes mutation and
+#: transport actions: if the two sets were one, adding a transport action would
+#: have been indistinguishable from widening the mutation identity.
+#:
+#: All 24 are emitted on ``Resource: ["*"]`` rather than split into a scoped
+#: subset. ``ssmmessages:*`` and ``ec2messages:*`` carry no resource-level
+#: scoping at all, so a scoped statement could not hold them without inventing
+#: a second, more permissive grouping; mirroring the AWS managed policy keeps
+#: the artifact reviewable against its own source.
+_ALLOWED_AGENT_ACTIONS: Final[frozenset[str]] = frozenset(
+    {
+        # -- SSM (14) ----------------------------------------------------
+        "ssm:DescribeAssociation",
+        "ssm:DescribeDocument",
+        "ssm:GetDeployablePatchSnapshotForInstance",
+        "ssm:GetDocument",
+        "ssm:GetManifest",
+        "ssm:GetParameters",
+        "ssm:ListAssociations",
+        "ssm:ListInstanceAssociations",
+        "ssm:PutComplianceItems",
+        "ssm:PutConfigurePackageResult",
+        "ssm:PutInventory",
+        "ssm:UpdateAssociationStatus",
+        "ssm:UpdateInstanceAssociationStatus",
+        "ssm:UpdateInstanceInformation",
+        # -- SSM Messages (4) -------------------------------------------
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+        # -- EC2 Messages (6) -------------------------------------------
+        "ec2messages:AcknowledgeMessage",
+        "ec2messages:DeleteMessage",
+        "ec2messages:FailMessage",
+        "ec2messages:GetEndpoint",
+        "ec2messages:GetMessages",
+        "ec2messages:SendReply",
+    }
+)
+
+#: Every action either identity may ever hold. A union, never a replacement:
+#: :func:`validate_iam_policy` accepts an action only if it is in here, so a
+#: name outside both sets is refused regardless of which statement it sits in.
+_ALL_ALLOWED_ACTIONS: Final[frozenset[str]] = _ALLOWED_ACTIONS | _ALLOWED_AGENT_ACTIONS
 
 
 @dataclass(frozen=True)
@@ -286,6 +348,9 @@ def mutation_iam_policy(settings: MutationClientSettings) -> dict[str, Any]:
     DescribeInstances:
       Resource = *
 
+    SSM Agent transport:
+      Resource = *
+
     Reason:
       required for post-dispatch observation; EC2 does not provide
       an equivalent single-instance resource constraint for this API.
@@ -304,6 +369,13 @@ def mutation_iam_policy(settings: MutationClientSettings) -> dict[str, Any]:
     worst case is metadata disclosure rather than a change to infrastructure, and
     it cannot be removed without making every outcome unclassifiable.
 
+    Statement C is the Candidate 1 transport grant (ADR 0010): the agent on the
+    disposable executor needs it to keep its SSM channel open and to report
+    state back. It is **read-only and inert with respect to EC2**. It contains
+    no session start, no document execution, no automation, no maintenance
+    window, no STS, no IAM, and no CloudTrail, and :func:`validate_iam_policy`
+    refuses any statement that adds one.
+
     The result is an artifact for review. Nothing attaches it.
     """
     return {
@@ -320,11 +392,41 @@ def mutation_iam_policy(settings: MutationClientSettings) -> dict[str, Any]:
                 "Effect": "Allow",
                 "Action": ["ec2:DescribeInstances"],
                 # Unavoidable; see the docstring. The one place a wildcard is
-                # permitted, and validate_iam_policy enforces that it is here.
+                # permitted for an EC2 action, and validate_iam_policy enforces
+                # that it is here.
                 "Resource": "*",
+            },
+            {
+                "Sid": "SsmAgentTransport",
+                "Effect": "Allow",
+                # Sorted so the generated artifact is byte-stable across runs
+                # and diffs stay readable. The validator is order-independent.
+                "Action": sorted(_ALLOWED_AGENT_ACTIONS),
+                "Resource": ["*"],
             },
         ],
     }
+
+
+def _is_agent_grouping(actions: list[str]) -> bool:
+    """True iff ``actions`` is a legal SSM Agent transport grouping.
+
+    An agent statement is accepted only when all three hold:
+
+    * every action is in :data:`_ALLOWED_AGENT_ACTIONS`;
+    * the set is a subset, so no arbitrary SSM action can ride along;
+    * the set does not intersect :data:`_ALLOWED_ACTIONS`, so no mutation
+      action can be smuggled into the transport statement.
+
+    The third condition is checked here rather than assumed from the two
+    allow-lists being disjoint. If :data:`_ALLOWED_AGENT_ACTIONS` were ever
+    edited to overlap the mutation set, this guard fails closed instead of
+    quietly re-admitting ``ec2:StopInstances`` under a transport Sid.
+    """
+    action_set = set(actions)
+    if not action_set <= _ALLOWED_AGENT_ACTIONS:
+        return False
+    return not (action_set & _ALLOWED_ACTIONS)
 
 
 def validate_iam_policy(policy: dict[str, Any], settings: MutationClientSettings) -> None:
@@ -333,6 +435,28 @@ def validate_iam_policy(policy: dict[str, Any], settings: MutationClientSettings
     The generator is not trusted to be the only way this dict gets produced; an
     artifact edited by hand must not deploy silently. Every invariant the design
     relies on is asserted again here, against the dict.
+
+    Accepted statement shapes, exhaustively:
+
+    ``["ec2:StopInstances"]``
+        Required. ``Resource`` must be exactly ``[settings.target_instance_arn]``.
+    ``["ec2:DescribeInstances"]``
+        Required. ``Resource`` must be exactly ``["*"]``.
+    any non-empty subset of :data:`_ALLOWED_AGENT_ACTIONS` (Candidate 1)
+        Optional. ``Resource`` must be exactly ``["*"]``. No wildcard action,
+        and no action from :data:`_ALLOWED_ACTIONS`.
+
+    Anything else -- a widened action, a wildcard, a ``Deny``, a non-string
+    entry, an empty ``Action`` or ``Resource``, an unknown statement shape --
+    raises :class:`MutationClientConfigurationError`. Fail-closed: the policy
+    is refused rather than narrowed on the caller's behalf.
+
+    The agent statement is **optional** on purpose. A narrower policy is a
+    stricter policy, so a two-statement mutation-only artifact remains valid;
+    the Candidate 1 generator emits three, and a policy that claims to be
+    Candidate 1 but has dropped its transport statement is still safe to
+    deploy -- it simply has no transport. Requiring it would make the validator
+    refuse a *safer* artifact, which is the wrong direction to fail.
     """
     if not isinstance(policy, dict):
         raise MutationClientConfigurationError("an IAM policy must be a dict")
@@ -360,14 +484,19 @@ def validate_iam_policy(policy: dict[str, Any], settings: MutationClientSettings
                 raise MutationClientConfigurationError(f"non-string action {action!r}")
             if "*" in action or "?" in action:
                 raise MutationClientConfigurationError(
-                    f"wildcard action {action!r} is refused; the mutation identity "
-                    f"holds {sorted(_ALLOWED_ACTIONS)} and nothing else"
+                    f"wildcard action {action!r} is refused; the mutation "
+                    f"identity holds {sorted(_ALLOWED_ACTIONS)} and the SSM "
+                    f"agent transport holds {len(_ALLOWED_AGENT_ACTIONS)} "
+                    f"named actions, and nothing else"
                 )
-            if action not in _ALLOWED_ACTIONS:
+            if action not in _ALL_ALLOWED_ACTIONS:
                 raise MutationClientConfigurationError(
                     f"action {action!r} is outside the mutation identity's scope "
-                    f"({sorted(_ALLOWED_ACTIONS)}); in particular no terminate, "
-                    f"reboot, or modify permission is acceptable"
+                    f"({sorted(_ALLOWED_ACTIONS)}) and outside the SSM agent "
+                    f"transport's scope ({len(_ALLOWED_AGENT_ACTIONS)} actions); "
+                    f"in particular no terminate, reboot, modify, session, "
+                    f"document, automation, STS, IAM, or CloudTrail permission "
+                    f"is acceptable"
                 )
 
         resource = statement.get("Resource")
@@ -391,6 +520,12 @@ def validate_iam_policy(policy: dict[str, Any], settings: MutationClientSettings
                 raise MutationClientConfigurationError(
                     "ec2:DescribeInstances is the one unavoidable wildcard, but "
                     f"it must be the only resource in its statement, got {resources!r}"
+                )
+        elif _is_agent_grouping(actions):
+            if resources != ["*"]:
+                raise MutationClientConfigurationError(
+                    "SSM agent transport statements must be Resource "
+                    f'["*"], got {resources!r}'
                 )
         else:
             raise MutationClientConfigurationError(

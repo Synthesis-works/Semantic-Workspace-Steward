@@ -380,6 +380,27 @@ class ApprovalTicket(BaseModel):
     evidence_digest: str | None = Field(default=None, min_length=1)
     execution_deadline: datetime | None = None
 
+    # -- Detached cryptographic approval (Candidate 1, Option B) ----------
+    #
+    # All optional and additive. A ticket with none of these set is an
+    # ordinary unsigned approval, which remains fully valid when no
+    # verification key is pinned. When a key *is* pinned, the execution gate
+    # refuses a ticket that has not been signed, so these fields are what
+    # lets a grant carry its own proof instead of relying on the caller's
+    # word.
+    #
+    # ``signature`` is standard base64 text so it survives a TEXT column
+    # unchanged. It is never checked here: verification is the execution
+    # gate's job, and this model must not require the optional ``signature``
+    # extra merely to describe a ticket.
+    signer_key_id: str | None = Field(default=None, min_length=1)
+    executor_instance_id: str | None = Field(default=None, min_length=1)
+    account_id: str | None = Field(default=None, min_length=1)
+    region: str | None = Field(default=None, min_length=1)
+    nonce: str | None = Field(default=None, min_length=1)
+    issued_at: datetime | None = None
+    signature: str | None = Field(default=None, min_length=1)
+
     @field_validator("action", "status", mode="before")
     @classmethod
     def _normalize(cls, value: Any) -> Any:

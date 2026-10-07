@@ -28,6 +28,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "cryptography>=42",
+]
+# Optional detached-approval signing (Candidate 1, Option B): the Ed25519
+# signature layer. Importing sws_agent and the approval gate never requires it
+# (cryptography is imported lazily inside the signing/verification functions),
+# but CI installs it via the dev extra so the signature tests actually run.
+signature = [
+    "cryptography>=42",
 ]
 # Optional AWS SDK for the real client factory only. boto3 is NOT a runtime
 # dependency of the collector core: the hermetic unit suite never imports it,

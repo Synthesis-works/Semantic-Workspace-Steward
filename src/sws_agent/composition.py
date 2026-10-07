@@ -39,19 +39,30 @@ correct, not that the mutation works.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
 
 from sws_agent.approval_ledger import DurableApprovalStore
+from sws_agent.approval_signature import (
+    ApprovalEnvironmentMismatchError,
+    ApprovalSignerForbiddenError,
+    ApprovalSignatureExpiredError,
+    ApprovalSignatureMissingError,
+    ApprovalSignatureVerificationError,
+    ApprovalVerificationPolicy,
+    parse_public_key_raw,
+    stored_approval_from_ticket,
+    verify_approval_for_execution,
+)
 from sws_agent.audit import LEDGER_FILENAME, JsonlAuditStore
-from sws_agent.constants import DispatchDisposition
+from sws_agent.constants import DispatchDisposition, RefusalReason
 from sws_agent.ec2_observation import DEFAULT_PARTITION, Ec2InstanceObservationProvider
 from sws_agent.execution import ExecutionCoordinator, MutationHandler
 from sws_agent.execution_ledger import DurableExecutionLedger
-from sws_agent.models import DispatchEvidence, ExecutionRequest
+from sws_agent.models import ApprovalTicket, DispatchEvidence, ExecutionRequest
 
 APPROVAL_LEDGER_FILENAME: Final[str] = "approvals.sqlite3"
 """Durable approval ledger file created inside the composition's ledger dir."""
@@ -251,6 +262,10 @@ def build_dry_run_composition(
     audit_id_source: Callable[[], str] | None = None,
     worker_id: str | None = None,
     max_observation_age_seconds: int | None = None,
+    approval_signer_public_keys: Mapping[str, bytes] | None = None,
+    executor_instance_id: str | None = None,
+    account_id: str | None = None,
+    approval_operator_identities: frozenset[str] = frozenset(),
 ) -> DryRunComposition:
     """Assemble the real coordinator over real durable stores.
 
@@ -266,6 +281,18 @@ def build_dry_run_composition(
     that check is deliberately independent of the execution ledger's. The
     parameter exists so that refusal path is constructible and assertable,
     not as a way to execute without evidence.
+
+    Candidate 1, Option B (detached approval signatures): passing
+    ``approval_signer_public_keys`` (signer key id -> 32 raw Ed25519 bytes)
+    arms the approval-signature gate. The executor identity is then
+    mandatory -- ``executor_instance_id`` and ``account_id`` -- because the
+    whole point of the artifact is to prove it was issued for *this* host;
+    and ``region`` (the executor's region) is bound into the verification
+    against the same value signed into the artifact. The nonce lookup is
+    wired to the durable approval ledger's ``approval_nonce`` table, so a
+    replayed or never-ingested artifact is refused at the gate. When the
+    mapping is omitted or empty the coordinator is assembled exactly as it
+    was before the signature feature existed.
     """
     _assert_read_only_seam(ec2_client)
     resolved_handler = handler if handler is not None else RecordingMutationHandler()
@@ -276,6 +303,20 @@ def build_dry_run_composition(
             "this composition root must not be given a handler that can "
             "reach an environment"
         )
+
+    if approval_signer_public_keys:
+        if not executor_instance_id:
+            raise CompositionError(
+                "approval_signer_public_keys was supplied but "
+                "executor_instance_id was not; an approval can only be bound "
+                "to the executor it is being verified for"
+            )
+        if not account_id:
+            raise CompositionError(
+                "approval_signer_public_keys was supplied but account_id was "
+                "not; the approval binds an account that this executor must "
+                "be able to state"
+            )
 
     root = Path(ledger_dir)
     approval_store = DurableApprovalStore(
@@ -306,6 +347,19 @@ def build_dry_run_composition(
                 if max_observation_age_seconds is not None:
                     extra["max_observation_age_seconds"] = (
                         max_observation_age_seconds
+                    )
+                if approval_signer_public_keys:
+                    nonce_lookup: Callable[[str], str | None] | None = (
+                        approval_store.lookup_nonce
+                    )
+                    extra["approval_verifier"] = build_approval_verifier(
+                        public_keys=approval_signer_public_keys,
+                        executor_instance_id=executor_instance_id or "",
+                        account_id=account_id or "",
+                        region=region,
+                        operator_identities=approval_operator_identities,
+                        now=now,
+                        nonce_lookup=nonce_lookup,
                     )
                 coordinator = ExecutionCoordinator(
                     approval_store=approval_store,
@@ -347,6 +401,63 @@ def cast_mutation_handler(handler: NonMutatingMutationHandler) -> MutationHandle
     """
     assert isinstance(handler, MutationHandler)  # noqa: S101 - invariant check
     return handler
+
+
+def build_approval_verifier(
+    *,
+    public_keys: Mapping[str, bytes],
+    executor_instance_id: str,
+    account_id: str,
+    region: str,
+    operator_identities: frozenset[str] = frozenset(),
+    now: Callable[[], datetime] | None = None,
+    nonce_lookup: Callable[[str], str | None] | None = None,
+) -> Callable[[ApprovalTicket], tuple[RefusalReason, str] | None]:
+    """Build the detached-approval verifier the coordinator gate will inject.
+
+    Candidate 1, Option B. ``public_keys`` maps a signer key id to its raw
+    32-byte Ed25519 public key; only public material is required, so this can
+    be assembled from a configuration file or a parameter store without ever
+    holding an approver's private key.
+
+    The resulting callable returns ``(reason, detail)`` when it refuses and
+    ``None`` when it accepts. Message text is *not* parsed to pick a reason:
+    the verification layer raises one exception per failure class and each maps
+    to exactly one :class:`RefusalReason`, so a refused attempt is actionable
+    without string matching.
+    """
+    parsed: dict[str, Any] = {}
+    for key_id, raw in public_keys.items():
+        parsed[key_id] = parse_public_key_raw(raw)
+    policy = ApprovalVerificationPolicy(
+        public_keys=parsed,
+        executor_instance_id=executor_instance_id,
+        account_id=account_id,
+        region=region,
+        operator_identities=operator_identities,
+        now=now,
+    )
+    if nonce_lookup is not None:
+        object.__setattr__(policy, "nonce_lookup", nonce_lookup)
+
+    def verify(ticket: ApprovalTicket) -> tuple[RefusalReason, str] | None:
+        try:
+            verify_approval_for_execution(
+                stored_approval_from_ticket(ticket), policy
+            )
+        except ApprovalSignatureMissingError as exc:
+            return (RefusalReason.APPROVAL_SIGNATURE_MISSING, str(exc))
+        except ApprovalSignerForbiddenError as exc:
+            return (RefusalReason.APPROVAL_SIGNER_FORBIDDEN, str(exc))
+        except ApprovalEnvironmentMismatchError as exc:
+            return (RefusalReason.APPROVAL_ENVIRONMENT_MISMATCH, str(exc))
+        except ApprovalSignatureExpiredError as exc:
+            return (RefusalReason.APPROVAL_SIGNATURE_EXPIRED, str(exc))
+        except ApprovalSignatureVerificationError as exc:
+            return (RefusalReason.APPROVAL_SIGNATURE_INVALID, str(exc))
+        return None
+
+    return verify
 
 
 def iter_dry_run_ledger_paths(ledger_dir: str | Path) -> Iterator[Path]:

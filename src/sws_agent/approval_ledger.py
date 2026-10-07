@@ -88,29 +88,36 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import sleep
-from typing import Final
+from typing import Any, Final
 from uuid import uuid4
 
 from .approval import (
     DEFAULT_APPROVAL_EXECUTION_TTL,
     DEFAULT_APPROVAL_TICKET_TTL,
     LEGAL_APPROVAL_TRANSITIONS,
+    ApprovalArtifactError,
     ApprovalStoreCorruptionError,
     ApprovalStoreUnavailableError,
     DuplicateTicketError,
     InvalidTransitionError,
     RevisionConflictError,
     UnknownTicketError,
+    signed_grant_changes,
 )
 from .constants import ApprovalStatus, PotentialAction
 from .models import ApprovalTicket
 
-APPROVAL_LEDGER_SCHEMA_VERSION: Final[int] = 1
+APPROVAL_LEDGER_SCHEMA_VERSION: Final[int] = 2
 """Schema version of the durable approval ledger.
 
 Bumped only by an explicit migration. Opening a ledger whose recorded version
 differs is a hard failure: silently reading a layout it does not understand
 is exactly how a durable store starts lying.
+
+Version 2 adds the detached-cryptographic-approval columns (Candidate 1,
+Option B): the signed artifact's signer, the execution environment it is bound
+to, its nonce, and its signature, plus the durable ``approval_nonce`` table
+that makes nonce replay a durable refusal rather than an in-memory guess.
 """
 
 DEFAULT_APPROVAL_BUSY_TIMEOUT_SECONDS: Final[float] = 5.0
@@ -132,9 +139,41 @@ _TICKET_COLUMNS: Final[tuple[str, ...]] = (
     "execution_intent_key",
     "evidence_digest",
     "execution_deadline",
+    # Candidate 1, Option B. Nullable: an unsigned approval is still a valid
+    # approval when no verification key is pinned, so existing rows and
+    # tickets created without an artifact keep NULL here rather than being
+    # forced to invent a placeholder.
+    "signer_key_id",
+    "executor_instance_id",
+    "account_id",
+    "region",
+    "nonce",
+    "issued_at",
+    "signature",
 )
 
-_REQUIRED_TABLES: Final[tuple[str, ...]] = ("meta", "ticket", "ticket_event")
+_SIGNATURE_TICKET_COLUMNS: Final[tuple[str, ...]] = (
+    "signer_key_id",
+    "executor_instance_id",
+    "account_id",
+    "region",
+    "nonce",
+    "issued_at",
+    "signature",
+)
+"""Subset of ``_TICKET_COLUMNS`` introduced by schema version 2.
+
+Named separately so the migration and the commit list can be written against
+a declared set rather than against a slice that silently goes stale when
+another column is added.
+"""
+
+_REQUIRED_TABLES: Final[tuple[str, ...]] = (
+    "meta",
+    "ticket",
+    "ticket_event",
+    "approval_nonce",
+)
 _EMPTY_SCHEMA_RETRIES: Final[int] = 50
 _EMPTY_SCHEMA_RETRY_SECONDS: Final[float] = 0.02
 
@@ -161,7 +200,14 @@ _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         revision             INTEGER NOT NULL,
         execution_intent_key TEXT,
         evidence_digest      TEXT,
-        execution_deadline   TEXT
+        execution_deadline   TEXT,
+        signer_key_id        TEXT,
+        executor_instance_id TEXT,
+        account_id           TEXT,
+        region               TEXT,
+        nonce                TEXT,
+        issued_at            TEXT,
+        signature            TEXT
     )
     """,
     """
@@ -175,17 +221,36 @@ _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         resource_id     TEXT NOT NULL,
         action          TEXT NOT NULL,
         plan_id         TEXT,
-decided_by           TEXT NOT NULL,
+        decided_by           TEXT NOT NULL,
         decision_reason      TEXT NOT NULL,
         execution_intent_key TEXT,
         evidence_digest      TEXT,
         execution_deadline   TEXT,
+        signer_key_id        TEXT,
+        executor_instance_id TEXT,
+        account_id           TEXT,
+        region               TEXT,
+        nonce                TEXT,
+        issued_at            TEXT,
+        signature            TEXT,
         UNIQUE (ticket_id, revision)
     )
     """,
     """
     CREATE INDEX IF NOT EXISTS ticket_event_by_ticket
         ON ticket_event (ticket_id, revision)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS approval_nonce (
+        nonce         TEXT PRIMARY KEY,
+        ticket_id     TEXT NOT NULL REFERENCES ticket(ticket_id),
+        signer_key_id TEXT NOT NULL,
+        recorded_at   TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS approval_nonce_by_ticket
+        ON approval_nonce (ticket_id)
     """,
 )
 """Schema DDL, applied one statement at a time.
@@ -195,6 +260,34 @@ commits any open transaction before it runs, which would silently end the
 ``BEGIN IMMEDIATE`` that makes schema creation race-free against a second
 process opening the same file for the first time.
 """
+
+_MIGRATION_1_TO_2_STATEMENTS: Final[tuple[str, ...]] = tuple(
+    f"ALTER TABLE ticket ADD COLUMN {name} TEXT"
+    for name in _SIGNATURE_TICKET_COLUMNS
+) + tuple(
+    f"ALTER TABLE ticket_event ADD COLUMN {name} TEXT"
+    for name in _SIGNATURE_TICKET_COLUMNS
+) + (
+    """
+    CREATE TABLE IF NOT EXISTS approval_nonce (
+        nonce         TEXT PRIMARY KEY,
+        ticket_id     TEXT NOT NULL REFERENCES ticket(ticket_id),
+        signer_key_id TEXT NOT NULL,
+        recorded_at   TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS approval_nonce_by_ticket
+        ON approval_nonce (ticket_id)
+    """,
+)
+"""Explicit v1 -> v2 migration.
+
+Every added column is nullable, so no existing row is rewritten and nothing
+is destroyed: a pre-existing ticket simply has ``NULL`` for the signature
+fields, which is the honest representation of "this approval was not signed".
+"""
+
 
 
 class TicketEventType(str, enum.Enum):
@@ -249,6 +342,7 @@ class TicketEvent:
     """
 
     __slots__ = (
+        "account_id",
         "action",
         "decided_by",
         "decision_reason",
@@ -257,10 +351,16 @@ class TicketEvent:
         "evidence_digest",
         "execution_deadline",
         "execution_intent_key",
+        "executor_instance_id",
+        "issued_at",
+        "nonce",
         "occurred_at",
         "plan_id",
+        "region",
         "resource_id",
         "revision",
+        "signature",
+        "signer_key_id",
         "status",
         "ticket_id",
     )
@@ -282,6 +382,13 @@ class TicketEvent:
         execution_intent_key: str | None = None,
         evidence_digest: str | None = None,
         execution_deadline: datetime | None = None,
+        signer_key_id: str | None = None,
+        executor_instance_id: str | None = None,
+        account_id: str | None = None,
+        region: str | None = None,
+        nonce: str | None = None,
+        issued_at: datetime | None = None,
+        signature: str | None = None,
     ) -> None:
         self.event_id = event_id
         self.ticket_id = ticket_id
@@ -297,6 +404,13 @@ class TicketEvent:
         self.execution_intent_key = execution_intent_key
         self.evidence_digest = evidence_digest
         self.execution_deadline = execution_deadline
+        self.signer_key_id = signer_key_id
+        self.executor_instance_id = executor_instance_id
+        self.account_id = account_id
+        self.region = region
+        self.nonce = nonce
+        self.issued_at = issued_at
+        self.signature = signature
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
@@ -436,14 +550,29 @@ class DurableApprovalStore:
         decided_by: str = "",
         reason: str = "",
         expected_revision: int | None = None,
+        signed: Any = None,
     ) -> ApprovalTicket:
-        """PENDING -> GRANTED, stamping the ticket's own execution deadline."""
+        """PENDING -> GRANTED, stamping the ticket's own execution deadline.
+
+        ``signed`` attaches a detached cryptographic approval artifact
+        (Candidate 1, Option B). When supplied, :func:`signed_grant_changes`
+        must accept it -- it has to bind to this ticket, and its deadline must
+        fall inside this store's execution ceiling -- and the nonce is
+        recorded durably in the same transaction, so a second grant attempt
+        with the same artifact is refused rather than silently accepted.
+
+        The signature itself is **not** verified here. Recording an artifact
+        and proving it is what the execution gate does; this store's job is to
+        guarantee that whatever it records is bound to the ticket it is
+        recorded against, and to do so atomically.
+        """
         return self._transition(
             ticket_id,
             ApprovalStatus.GRANTED,
             decided_by=decided_by,
             reason=reason,
             expected_revision=expected_revision,
+            signed=signed,
         )
 
     def deny(
@@ -642,6 +771,22 @@ class DurableApprovalStore:
         """
         self._closed = True
 
+    def lookup_nonce(self, nonce: str) -> str | None:
+        """Return the ticket id an approval nonce is durably bound to.
+
+        This is the read side of the single-use guarantee: the execution gate
+        consults it to prove an artifact was actually ingested by the
+        authority rather than invented, and that the nonce it carries was
+        recorded against the exact ticket being executed. ``None`` means the
+        nonce is unknown -- for example an artifact that was never granted
+        here -- and the gate treats that as a replay/never-ingested refusal.
+        """
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT ticket_id FROM approval_nonce WHERE nonce = ?", (nonce,)
+            ).fetchone()
+        return str(row["ticket_id"]) if row is not None else None
+
     @property
     def path(self) -> Path:
         return self._path
@@ -799,8 +944,66 @@ class DurableApprovalStore:
                         f"approval ledger {self._path} has no tables; refusing "
                         "to treat a non-ledger file as an approval authority"
                     )
+                self._migrate(conn)
                 self._verify_schema_version(conn)
                 return
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Bring a known older ledger up to this build's schema, once.
+
+        Only the recorded schema version decides whether to run, and only the
+        recorded versions this build knows how to step through are accepted. A
+        version *above* ours means the file is newer than the code reading it,
+        not that a migration is needed, and is refused rather than guessed at;
+        a version below ours that this build cannot step is refused for the
+        same reason. Both are the store failing closed on a layout it does not
+        understand, which is what the schema-version rule exists for.
+
+        A file with no ``meta`` table at all is a foreign SQLite file, not a
+        stale ledger, and is reported as such here rather than being allowed
+        to surface as a raw ``OperationalError`` from the first SELECT: the
+        caller asked for an approval authority and must get the same
+        fail-closed refusal either way.
+
+        Every step runs inside the caller's transaction, so a migration that
+        fails partway leaves the file at its previous version instead of at a
+        half-upgraded one the next open would refuse to read. The version
+        update is the last statement of the step, so it can only be recorded
+        once the new layout is actually in place.
+        """
+        present = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "meta" not in present:
+            raise ApprovalStoreCorruptionError(
+                f"approval ledger {self._path} has no meta table; refusing "
+                "to treat a foreign file as an approval authority"
+            )
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if row is None:
+            raise ApprovalStoreCorruptionError(
+                f"approval ledger {self._path} has no recorded schema version"
+            )
+        recorded = str(row[0])
+        if recorded == str(APPROVAL_LEDGER_SCHEMA_VERSION):
+            return
+        if recorded != "1":
+            raise ApprovalStoreCorruptionError(
+                f"approval ledger {self._path} has schema version "
+                f"{recorded}, which this build cannot migrate to "
+                f"{APPROVAL_LEDGER_SCHEMA_VERSION}"
+            )
+        for statement in _MIGRATION_1_TO_2_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(APPROVAL_LEDGER_SCHEMA_VERSION),),
+        )
 
     def _verify_schema_version(self, conn: sqlite3.Connection) -> None:
         present = {
@@ -845,6 +1048,7 @@ class DurableApprovalStore:
         decided_by: str,
         reason: str,
         expected_revision: int | None,
+        signed: Any = None,
     ) -> ApprovalTicket:
         """Apply one state transition atomically, or not at all.
 
@@ -855,11 +1059,17 @@ class DurableApprovalStore:
            set of moves as the in-memory reference implementation;
         3. the caller's ``expected_revision`` precondition.
 
+        When ``signed`` is supplied, :func:`signed_grant_changes` runs fourth,
+        still before any write: an artifact that does not bind to this ticket,
+        or whose window exceeds the store's ceiling, raises and leaves the
+        ticket at its current revision with no nonce recorded.
+
         Only then does the compare-and-swap run, inside the same transaction
-        that writes the event. ``expected`` is the revision observed before
-        this transaction began, so the CAS is what catches a writer that won
-        the race between that read and this write -- precisely the window the
-        single-process in-memory store could not have.
+        that writes the event and -- for a signed grant -- the nonce row.
+        ``expected`` is the revision observed before this transaction began, so
+        the CAS is what catches a writer that won the race between that read and
+        this write -- precisely the window the single-process in-memory store
+        could not have.
         """
         with self._connection() as conn:
             row = self._select(conn, ticket_id)
@@ -883,17 +1093,73 @@ class DurableApprovalStore:
                 f"revision {expected} was expected; refusing to overwrite "
                 "newer approval state"
             )
+        moment = self._now()
+        artifact: dict[str, object] = {}
+        if signed is not None:
+            if new_status is not ApprovalStatus.GRANTED:
+                raise ApprovalArtifactError(
+                    "a signed approval artifact may only be attached to a "
+                    f"GRANTED transition, not to {new_status.value}"
+                )
+            artifact = signed_grant_changes(
+                ticket,
+                signed,
+                now=moment,
+                execution_ttl=self._execution_ttl,
+            )
         updated = self._apply(
             ticket,
             new_status,
             decided_by=decided_by,
             reason=reason,
-            moment=self._now(),
+            moment=moment,
+            artifact=artifact,
         )
         with self._transaction() as conn:
             self._commit_update(conn, updated, expected)
             self._append_event(conn, updated, _MISSING_EVENT[new_status])
+            if artifact:
+                self._record_nonce(conn, updated, artifact)
         return updated
+
+    def _record_nonce(
+        self,
+        conn: sqlite3.Connection,
+        ticket: ApprovalTicket,
+        artifact: dict[str, object],
+    ) -> None:
+        """Record the artifact's nonce durably, refusing a duplicate.
+
+        The UNIQUE constraint on ``approval_nonce.nonce`` is what makes nonce
+        replay a durable refusal rather than an in-memory guess. A second
+        grant carrying an already-recorded nonce fails here, inside the same
+        transaction as the state change, so the two cannot disagree.
+        """
+        nonce = artifact.get("nonce")
+        signer = artifact.get("signer_key_id")
+        if not isinstance(nonce, str) or not nonce.strip():
+            raise ApprovalArtifactError(
+                f"ticket {ticket.ticket_id!r} was granted from an artifact "
+                "with no nonce; an approval that cannot be shown to be "
+                "single-use is refused rather than recorded"
+            )
+        try:
+            conn.execute(
+                "INSERT INTO approval_nonce "
+                "(nonce, ticket_id, signer_key_id, recorded_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    nonce,
+                    ticket.ticket_id,
+                    str(signer or ""),
+                    _format_ts(self._now()),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ApprovalArtifactError(
+                f"approval nonce {nonce!r} has already been recorded; this "
+                "artifact has been used and may not authorize a second grant"
+            ) from exc
 
     def _commit_update(
         self, conn: sqlite3.Connection, updated: ApprovalTicket, expected: int
@@ -906,6 +1172,13 @@ class DurableApprovalStore:
         the SET list makes their immutability in the durable store obvious
         rather than merely true.
 
+        The signature columns are in the SET list even though a signed grant
+        sets them exactly once. Writing them on every transition keeps a
+        later ``consume`` or ``expire`` from having to know that those columns
+        exist, and re-writing an unchanged value is idempotent -- the values
+        come from the ticket that was read inside this store's own gate, never
+        from a caller.
+
         The WHERE clause is the precondition. If another writer advanced the
         ticket past ``expected`` first, no row matches and the change is
         refused -- the store never overwrites newer approval state.
@@ -914,7 +1187,9 @@ class DurableApprovalStore:
             "UPDATE ticket SET "
             "status = ?, decided_at = ?, decided_by = ?, "
             "decision_reason = ?, consumed = ?, execution_deadline = ?, "
-            "revision = ? "
+            "revision = ?, "
+            "signer_key_id = ?, executor_instance_id = ?, account_id = ?, "
+            "region = ?, nonce = ?, issued_at = ?, signature = ? "
             "WHERE ticket_id = ? AND revision = ?",
             (
                 updated.status.value,
@@ -924,6 +1199,13 @@ class DurableApprovalStore:
                 1 if updated.consumed else 0,
                 _format_ts(updated.execution_deadline),
                 expected + 1,
+                updated.signer_key_id,
+                updated.executor_instance_id,
+                updated.account_id,
+                updated.region,
+                updated.nonce,
+                _format_ts(updated.issued_at),
+                updated.signature,
                 updated.ticket_id,
                 expected,
             ),
@@ -1024,6 +1306,7 @@ class DurableApprovalStore:
         decided_by: str,
         reason: str,
         moment: datetime,
+        artifact: dict[str, object] | None = None,
     ) -> ApprovalTicket:
         """Build the successor ticket.
 
@@ -1031,7 +1314,16 @@ class DurableApprovalStore:
         ``decided_at`` is written once and ``decision_reason`` describes the
         current state. Redeem passes no reason, so a spent approval keeps the
         reason the human gave.
+
+        ``artifact`` is the validated output of
+        :func:`signed_grant_changes`. When present it supplies the execution
+        deadline as well as the signature fields, so a signed grant records
+        the window the approver actually authorized rather than the store's
+        default TTL. A later transition re-applies those fields unchanged,
+        because they are facts about the grant rather than about the current
+        state.
         """
+        artifact = artifact or {}
         changes: dict[str, object] = {
             "status": new_status,
             "consumed": new_status is ApprovalStatus.CONSUMED,
@@ -1040,7 +1332,11 @@ class DurableApprovalStore:
         if ticket.decided_at is None:
             changes["decided_at"] = moment
         if new_status is ApprovalStatus.GRANTED:
-            changes["execution_deadline"] = moment + self._execution_ttl
+            changes["execution_deadline"] = artifact.get(
+                "execution_deadline", moment + self._execution_ttl
+            )
+        if artifact:
+            changes.update(artifact)
         if decided_by:
             changes["decided_by"] = decided_by
         if reason:
@@ -1070,6 +1366,13 @@ class DurableApprovalStore:
             execution_intent_key=ticket.execution_intent_key,
             evidence_digest=ticket.evidence_digest,
             execution_deadline=ticket.execution_deadline,
+            signer_key_id=ticket.signer_key_id,
+            executor_instance_id=ticket.executor_instance_id,
+            account_id=ticket.account_id,
+            region=ticket.region,
+            nonce=ticket.nonce,
+            issued_at=ticket.issued_at,
+            signature=ticket.signature,
         )
         try:
             conn.execute(
@@ -1077,8 +1380,10 @@ class DurableApprovalStore:
                 "event_id, ticket_id, revision, event_type, occurred_at, "
                 "status, resource_id, action, plan_id, decided_by, "
                 "decision_reason, execution_intent_key, evidence_digest, "
-                "execution_deadline) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "execution_deadline, signer_key_id, executor_instance_id, "
+                "account_id, region, nonce, issued_at, signature) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?)",
                 (
                     event.event_id,
                     event.ticket_id,
@@ -1094,6 +1399,13 @@ class DurableApprovalStore:
                     event.execution_intent_key,
                     event.evidence_digest,
                     _format_ts(event.execution_deadline),
+                    event.signer_key_id,
+                    event.executor_instance_id,
+                    event.account_id,
+                    event.region,
+                    event.nonce,
+                    _format_ts(event.issued_at),
+                    event.signature,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -1127,6 +1439,13 @@ class DurableApprovalStore:
                 "execution_intent_key": row["execution_intent_key"],
                 "evidence_digest": row["evidence_digest"],
                 "execution_deadline": _parse_ts(row["execution_deadline"]),
+                "signer_key_id": row["signer_key_id"],
+                "executor_instance_id": row["executor_instance_id"],
+                "account_id": row["account_id"],
+                "region": row["region"],
+                "nonce": row["nonce"],
+                "issued_at": _parse_ts(row["issued_at"]),
+                "signature": row["signature"],
             }
         )
 
@@ -1146,6 +1465,13 @@ class DurableApprovalStore:
             execution_intent_key=row["execution_intent_key"],
             evidence_digest=row["evidence_digest"],
             execution_deadline=_parse_ts(row["execution_deadline"]),
+            signer_key_id=row["signer_key_id"],
+            executor_instance_id=row["executor_instance_id"],
+            account_id=row["account_id"],
+            region=row["region"],
+            nonce=row["nonce"],
+            issued_at=_parse_ts(row["issued_at"]),
+            signature=row["signature"],
         )
 
 
@@ -1166,6 +1492,13 @@ def _ticket_row(ticket: ApprovalTicket) -> tuple[object, ...]:
         ticket.execution_intent_key,
         ticket.evidence_digest,
         _format_ts(ticket.execution_deadline),
+        ticket.signer_key_id,
+        ticket.executor_instance_id,
+        ticket.account_id,
+        ticket.region,
+        ticket.nonce,
+        _format_ts(ticket.issued_at),
+        ticket.signature,
     )
 
 

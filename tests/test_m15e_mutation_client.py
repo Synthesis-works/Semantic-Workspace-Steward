@@ -39,6 +39,7 @@ from sws_agent.ec2_mutation_client import (
     mutation_iam_policy,
     validate_iam_policy,
 )
+from sws_agent.ec2_mutation_client import _ALLOWED_AGENT_ACTIONS
 
 botocore = pytest.importorskip("botocore", reason="M15-E tests need the AWS SDK")
 
@@ -374,25 +375,114 @@ def test_the_generated_policy_grants_stop_on_one_instance_and_describe_on_star()
     policy = mutation_iam_policy(_settings())
     validate_iam_policy(policy, _settings())
 
-    stop, describe = policy["Statement"]
+    stop, describe, transport = policy["Statement"]
     assert stop["Action"] == ["ec2:StopInstances"]
     assert stop["Resource"] == [INSTANCE_ARN]
     assert describe["Action"] == ["ec2:DescribeInstances"]
     assert describe["Resource"] == "*"
+    # Candidate 1 statement C: the SSM Agent transport grant, all 24 actions
+    # from AmazonSSMManagedInstanceCore v1, all on "*".
+    assert transport["Action"] == sorted(_ALLOWED_AGENT_ACTIONS)
+    assert transport["Resource"] == ["*"]
     assert policy["Version"] == IAM_POLICY_VERSION
 
 
-def test_the_describe_wildcard_is_confined_to_the_one_unavoidable_statement():
-    """A '*' resource anywhere but DescribeInstances is a policy bug."""
+def test_the_describe_wildcard_is_confined_to_the_ratified_statements():
+    """A '*' resource anywhere but the two ratified statements is a policy bug.
+
+    Exactly two statements may carry a wildcard resource: the unavoidable
+    ``ec2:DescribeInstances`` grant (M15-E) and the SSM Agent transport grant
+    (Candidate 1). ``ec2:StopInstances`` must never be among them -- the
+    sacrificial instance ARN is the whole point of that statement.
+    """
     settings = _settings()
     policy = mutation_iam_policy(settings)
-    wildcards = [
-        statement
+    wildcard_sids = {
+        statement["Sid"]
         for statement in policy["Statement"]
-        if "*" in (statement["Resource"] if isinstance(statement["Resource"], list) else [statement["Resource"]])
-    ]
-    assert len(wildcards) == 1
-    assert wildcards[0]["Action"] == ["ec2:DescribeInstances"]
+        if "*"
+        in (
+            statement["Resource"]
+            if isinstance(statement["Resource"], list)
+            else [statement["Resource"]]
+        )
+    }
+    assert wildcard_sids == {
+        "DescribeInstancesForSettlement",
+        "SsmAgentTransport",
+    }
+    stop = policy["Statement"][0]
+    assert stop["Sid"] == "StopSacrificialInstanceOnly"
+    assert stop["Resource"] == [INSTANCE_ARN]
+
+
+def test_allowed_actions_is_exactly_the_two_mutation_actions():
+    """Pin the mutation allow-list so it cannot be silently widened.
+
+    The instance profile AWS evaluates is derived from this set. A single
+    added name here would be a new capability, and no other test would
+    necessarily notice, so the exact contents are asserted rather than its
+    size.
+    """
+    from sws_agent.ec2_mutation_client import _ALLOWED_ACTIONS
+
+    assert _ALLOWED_ACTIONS == frozenset(
+        {"ec2:StopInstances", "ec2:DescribeInstances"}
+    )
+
+
+def test_allowed_agent_actions_is_exactly_the_ssm_core_transport_set():
+    """Pin the transport allow-list to the AWS managed policy, action by action.
+
+    This set is ``AmazonSSMManagedInstanceCore`` v1. Adding an action here is
+    a permission change against AWS's own artifact, so the membership is
+    written out rather than counted: a count would still pass after a
+    swap.
+    """
+    from sws_agent.ec2_mutation_client import _ALLOWED_AGENT_ACTIONS
+
+    assert _ALLOWED_AGENT_ACTIONS == frozenset(
+        {
+            "ssm:DescribeAssociation",
+            "ssm:DescribeDocument",
+            "ssm:GetDeployablePatchSnapshotForInstance",
+            "ssm:GetDocument",
+            "ssm:GetManifest",
+            "ssm:GetParameters",
+            "ssm:ListAssociations",
+            "ssm:ListInstanceAssociations",
+            "ssm:PutComplianceItems",
+            "ssm:PutConfigurePackageResult",
+            "ssm:PutInventory",
+            "ssm:UpdateAssociationStatus",
+            "ssm:UpdateInstanceAssociationStatus",
+            "ssm:UpdateInstanceInformation",
+            "ssmmessages:CreateControlChannel",
+            "ssmmessages:CreateDataChannel",
+            "ssmmessages:OpenControlChannel",
+            "ssmmessages:OpenDataChannel",
+            "ec2messages:AcknowledgeMessage",
+            "ec2messages:DeleteMessage",
+            "ec2messages:FailMessage",
+            "ec2messages:GetEndpoint",
+            "ec2messages:GetMessages",
+            "ec2messages:SendReply",
+        }
+    )
+    assert len(_ALLOWED_AGENT_ACTIONS) == 24
+
+
+def test_the_mutation_and_agent_allow_lists_are_disjoint():
+    """Disjointness is what stops a transport action carrying EC2 authority."""
+    from sws_agent.ec2_mutation_client import (
+        _ALL_ALLOWED_ACTIONS,
+        _ALLOWED_ACTIONS,
+        _ALLOWED_AGENT_ACTIONS,
+    )
+
+    assert _ALLOWED_ACTIONS & _ALLOWED_AGENT_ACTIONS == frozenset()
+    assert _ALL_ALLOWED_ACTIONS == _ALLOWED_ACTIONS | _ALLOWED_AGENT_ACTIONS
+    assert len(_ALL_ALLOWED_ACTIONS) == 26
 
 
 def _policy_with(statement_patch: dict[str, Any]) -> dict[str, Any]:
@@ -459,6 +549,411 @@ def test_a_deny_statement_is_refused_as_out_of_scope():
     )
     with pytest.raises(MutationClientConfigurationError):
         validate_iam_policy(policy, settings)
+
+
+# ---------------------------------------------------------------------------
+# 5b. The Candidate 1 SSM Agent transport statement.
+# ---------------------------------------------------------------------------
+
+
+def _policy_with_agent(
+    actions: Any, resource: Any = "*", *, extra: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The two mutation statements plus one hand-shaped agent statement.
+
+    Statement 0 and 1 come from the real generator untouched, so a failure
+    here is attributable to the agent statement under test rather than to a
+    mutated StopInstances or DescribeInstances rule.
+    """
+    settings = _settings()
+    policy = copy.deepcopy(mutation_iam_policy(settings))
+    statement: dict[str, Any] = {
+        "Sid": "SsmAgentTransport",
+        "Effect": "Allow",
+        "Action": actions,
+        "Resource": resource,
+    }
+    if extra:
+        statement.update(extra)
+    policy["Statement"][2] = statement
+    return policy
+
+
+def _refuses(policy: dict[str, Any], expected: str) -> None:
+    with pytest.raises(MutationClientConfigurationError) as excinfo:
+        validate_iam_policy(policy, _settings())
+    assert expected in str(excinfo.value)
+
+
+def test_every_one_of_the_24_agent_actions_is_accepted_individually():
+    """Each transport action, alone in its own statement, is valid.
+
+    Checked one at a time rather than only as the full set: a set assertion
+    passes after a swap, while this catches an action that validates only
+    because a sibling in the same statement was already known-good.
+    """
+    for action in sorted(_ALLOWED_AGENT_ACTIONS):
+        policy = _policy_with_agent([action])
+        validate_iam_policy(policy, _settings())
+
+
+def test_the_exact_24_action_set_is_accepted_as_one_statement():
+    policy = _policy_with_agent(sorted(_ALLOWED_AGENT_ACTIONS))
+    validate_iam_policy(policy, _settings())
+
+
+def test_a_subset_of_agent_actions_is_accepted():
+    """Any non-empty subset is valid; transport grants are additive, not atomic."""
+    policy = _policy_with_agent(["ssmmessages:CreateControlChannel"])
+    validate_iam_policy(policy, _settings())
+
+
+def test_an_empty_agent_action_list_is_refused():
+    _refuses(_policy_with_agent([]), "every statement needs an Action")
+
+
+def test_a_non_string_agent_resource_entry_is_refused():
+    _refuses(_policy_with_agent(["ssm:GetDocument"], [123]), "non-string resource")
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        # Arbitrary SSM outside the managed policy.
+        "ssm:GetParameter",
+        "ssm:GetParametersByPath",
+        "ssm:ListCommandInvocations",
+        "ssm:ListCommands",
+        "ssm:GetCalendarState",
+        "ssm:SendCommand",
+        "ssm:StartSession",
+        "ssm:StartSessionToPort",
+        "ssm:StartSessionOnPort",
+        "ssm:StartAutomationExecution",
+        "ssm:RegisterTargetWithMaintenanceWindow",
+        "ssm:RegisterTarget",
+        "ssm:CreateDocument",
+        "ssm:UpdateDocument",
+        "ssm:DeleteDocument",
+        "ssm:ModifyDocumentPermission",
+        "ssm:UpdateDocumentDefaultVersion",
+        # Cross-domain: the transport identity holds none of these.
+        "sts:GetCallerIdentity",
+        "sts:AssumeRole",
+        "sts:AssumeRoleWithWebIdentity",
+        "iam:PassRole",
+        "iam:CreateRole",
+        "iam:AttachRolePolicy",
+        "iam:CreatePolicy",
+        "iam:CreateAccessKey",
+        "cloudtrail:LookupEvents",
+        "cloudtrail:DescribeTrails",
+        "cloudtrail:GetTrailStatus",
+        # EC2 mutations beyond the two the identity holds.
+        "ec2:TerminateInstances",
+        "ec2:RebootInstances",
+        "ec2:StartInstances",
+        "ec2:ModifyInstanceAttribute",
+        "ec2:RunInstances",
+        "ec2:CreateTags",
+    ],
+)
+def test_an_action_outside_the_two_allow_lists_is_refused(action: str):
+    """Arbitrary SSM, STS, IAM, CloudTrail, and extra EC2 mutations all fail."""
+    _refuses(_policy_with_agent([action]), "outside the mutation identity")
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "ssm:*",
+        "ssm:?",
+        "ssmmessages:*",
+        "ec2messages:*",
+        "ec2:*",
+        "*",
+        "?",
+        "sts:*",
+        "iam:*",
+        "cloudtrail:*",
+    ],
+)
+def test_a_wildcard_action_is_refused_before_any_grouping_is_considered(
+    action: str,
+):
+    """A wildcard action never reaches the grouping logic at all.
+
+    The wildcard guard runs first on purpose: ``ssm:*`` would otherwise match
+    nothing and land in the "unexpected action grouping" branch, which is a
+    true but much less specific reason to refuse.
+    """
+    _refuses(_policy_with_agent([action]), "wildcard action")
+
+
+def test_a_mutation_action_alone_in_an_agent_sized_statement_is_not_a_transport_grant():
+    """A StopInstances statement with a wildcard resource is still refused.
+
+    ``["ec2:StopInstances"]`` is a legal *shape*, so it is matched by the
+    StopInstances branch rather than by the agent branch. That branch then
+    applies the exact-ARN rule, which is what actually refuses it. The point
+    of asserting the message is to show which guard fired: the transport
+    branch must not be the one accepting a wildcard-resource Stop statement.
+    """
+    _refuses(
+        _policy_with_agent(["ec2:StopInstances"], ["*"]),
+        "must be scoped to exactly",
+    )
+    _refuses(
+        _policy_with_agent(
+            ["ec2:StopInstances"],
+            ["arn:aws:ec2:us-east-1:123456789012:instance/*"],
+        ),
+        "must be scoped to exactly",
+    )
+
+
+def test_a_describe_statement_shape_grants_nothing_new():
+    """``["ec2:DescribeInstances"]`` on ``"*"`` is the legal statement itself.
+
+    Written as a separate test rather than folded into the mixing cases
+    because it is *not* a refusal: a hand-written statement byte-identical to
+    an already-legal one grants no new authority, and a validator that
+    refused it would be refusing the generated DescribeInstances statement
+    whenever it appeared in a different position. What must never happen is a
+    statement that widens the grant, and the next test shows that does not
+    happen.
+    """
+    settings = _settings()
+    policy = _policy_with_agent(["ec2:DescribeInstances"], ["*"])
+    validate_iam_policy(policy, settings)
+
+    widened = _policy_with_agent(
+        ["ec2:DescribeInstances"],
+        ["arn:aws:ec2:us-east-1:123456789012:instance/*"],
+    )
+    with pytest.raises(MutationClientConfigurationError) as excinfo:
+        validate_iam_policy(widened, settings)
+    assert "Resource" in str(excinfo.value) or "wildcard" in str(
+        excinfo.value
+    ).lower() or "unexpected" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        # A transport action plus an EC2 mutation action: the case that
+        # matters most, because the StopInstances exact-ARN branch only
+        # matches a single-action list, so a two-action list would otherwise
+        # fall through to the agent branch and be accepted on "*".
+        ["ec2:StopInstances", "ssm:GetDocument"],
+        ["ssm:GetDocument", "ec2:StopInstances"],
+        # DescribeInstances mixed with a transport action.
+        ["ec2:DescribeInstances", "ssm:GetDocument"],
+        ["ssm:GetDocument", "ec2:DescribeInstances"],
+    ],
+)
+def test_mutating_actions_are_never_mixed_into_an_agent_statement(
+    actions: list[str],
+):
+    """The disjointness rule is what stops a second grant riding along.
+
+    This is the case that matters most. A single statement carrying a
+    legitimate transport action *and* ``ec2:StopInstances`` would give the
+    executor a second, unscoped stop grant that the exact-ARN rule never
+    checks, because a two-action list does not match the
+    ``["ec2:StopInstances"]`` shape and would otherwise fall through to the
+    agent branch. Both actions here are in the union allow-list, so the
+    refusal comes from the grouping rule rather than from a membership check
+    -- which is the only guard that would catch it.
+    """
+    _refuses(_policy_with_agent(actions), "unexpected action grouping")
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        ["ssm:GetDocument", "ec2:TerminateInstances"],
+        ["ssm:GetDocument", "ec2:RebootInstances"],
+        ["ssm:GetDocument", "sts:AssumeRole"],
+        ["ssm:GetDocument", "iam:PassRole"],
+        ["ssm:GetDocument", "cloudtrail:LookupEvents"],
+        ["ssm:GetDocument", "ec2:*"],
+        ["ssm:GetDocument", "*"],
+    ],
+)
+def test_cross_domain_and_wildcard_actions_are_refused_even_alongside_a_legal_transport_action(
+    actions: list[str],
+):
+    """A forbidden action is caught by membership, before grouping is reached.
+
+    These still refuse, and they refuse for a more specific reason than the
+    disjointness rule: the offending action is not in either allow-list (or
+    carries a wildcard), so the per-action guard fires first. Covered here as
+    well because a mixed statement is the shape a widened hand-edit most
+    plausibly takes.
+    """
+    with pytest.raises(MutationClientConfigurationError) as excinfo:
+        validate_iam_policy(_policy_with_agent(actions), _settings())
+    message = str(excinfo.value)
+    assert (
+        "wildcard action" in message
+        or "outside the mutation identity" in message
+        or "unexpected action grouping" in message
+    ), message
+
+
+def test_an_agent_statement_with_a_non_star_resource_is_refused():
+    _refuses(
+        _policy_with_agent(
+            ["ssm:GetDocument"], ["arn:aws:ssm:us-east-1:527557823928:document/x"]
+        ),
+        "Resource",
+    )
+
+
+def test_an_agent_statement_with_an_instance_arn_is_refused():
+    _refuses(
+        _policy_with_agent(
+            ["ssm:GetDocument"],
+            ["arn:aws:ec2:us-east-1:527557823928:instance/i-0123456789abcdef0"],
+        ),
+        "Resource",
+    )
+
+
+def test_an_agent_statement_with_star_plus_another_resource_is_refused():
+    _refuses(
+        _policy_with_agent(["ssm:GetDocument"], ["*", "arn:aws:iam::aws:policy/x"]),
+        "Resource",
+    )
+
+
+def test_an_agent_statement_resource_must_normalize_to_exactly_star():
+    """A bare string "*" is the same grant as ["*"], so it is accepted.
+
+    The generator writes the DescribeInstances resource as a bare string, so
+    the validator normalizes a string to a one-element list before comparing.
+    What must be refused is any string that normalizes to something else.
+    """
+    settings = _settings()
+    validate_iam_policy(_policy_with_agent(["ssm:GetDocument"], "*"), settings)
+    validate_iam_policy(_policy_with_agent(["ssm:GetDocument"], ["*"]), settings)
+
+    _refuses(
+        _policy_with_agent(
+            ["ssm:GetDocument"],
+            "arn:aws:ssm:us-east-1:527557823928:document/x",
+        ),
+        "Resource",
+    )
+
+
+def test_a_wildcard_agent_action_is_refused_even_when_other_actions_are_legal():
+    _refuses(
+        _policy_with_agent(["ssm:GetDocument", "ssm:*"]), "wildcard action"
+    )
+
+
+def test_an_agent_statement_missing_a_resource_is_refused():
+    policy = _policy_with_agent(["ssm:GetDocument"])
+    del policy["Statement"][2]["Resource"]
+    _refuses(policy, "every statement needs a Resource")
+
+
+def test_an_agent_statement_with_a_deny_effect_is_refused():
+    _refuses(
+        _policy_with_agent(["ssm:GetDocument"], extra={"Effect": "Deny"}),
+        "only Allow statements",
+    )
+
+
+def test_an_unknown_sid_on_an_agent_statement_does_not_make_it_invalid():
+    """The validator checks shape, not labels; a Sid carries no authority."""
+    settings = _settings()
+    policy = copy.deepcopy(mutation_iam_policy(settings))
+    policy["Statement"][2]["Sid"] = "NotTheCanonicalSid"
+    validate_iam_policy(policy, settings)
+
+
+def test_the_mutation_only_policy_remains_valid():
+    """A narrower policy is a stricter policy, so it must still validate.
+
+    Candidate 1's generator emits three statements, but dropping the transport
+    statement must not make the artifact refuse to deploy. The risk would run
+    the other way: a validator that *required* the agent statement would
+    reject the safer two-statement form.
+    """
+    settings = _settings()
+    policy = {
+        "Version": IAM_POLICY_VERSION,
+        "Statement": mutation_iam_policy(settings)["Statement"][:2],
+    }
+    validate_iam_policy(policy, settings)
+
+
+def test_an_agent_statement_is_optional_but_a_second_stop_statement_is_not():
+    """A second StopInstances grouping is still the one legal shape."""
+    policy = _policy_with_agent(["ssm:GetDocument"])
+    policy["Statement"].append(
+        {
+            "Sid": "SecondStop",
+            "Effect": "Allow",
+            "Action": ["ec2:StopInstances"],
+            "Resource": [INSTANCE_ARN],
+        }
+    )
+    # Two identical Stop statements are the same shape twice, which the
+    # exact-list rule accepts; the danger is a Stop statement whose resource
+    # is not the target ARN. That is covered separately.
+    validate_iam_policy(policy, _settings())
+
+    widened = _policy_with_agent(["ssm:GetDocument"])
+    widened["Statement"].append(
+        {
+            "Sid": "SecondStop",
+            "Effect": "Allow",
+            "Action": ["ec2:StopInstances"],
+            "Resource": ["arn:aws:ec2:us-east-1:123456789012:instance/*"],
+        }
+    )
+    with pytest.raises(MutationClientConfigurationError):
+        validate_iam_policy(widened, _settings())
+
+
+def test_the_generated_candidate1_policy_carries_no_forbidden_action():
+    """End-to-end: no wildcard, no STS/IAM/CloudTrail, no session or document.
+
+    Asserted against the artifact the generator actually emits, so a future
+    edit to ``mutation_iam_policy`` cannot quietly introduce one.
+    """
+    policy = mutation_iam_policy(_settings())
+    actions = [
+        action
+        for statement in policy["Statement"]
+        for action in (
+            statement["Action"]
+            if isinstance(statement["Action"], list)
+            else [statement["Action"]]
+        )
+    ]
+    assert len(actions) == len(set(actions))
+    assert all("*" not in action and "?" not in action for action in actions)
+    services = {action.split(":", 1)[0] for action in actions}
+    assert services == {"ec2", "ssm", "ssmmessages", "ec2messages"}
+    assert not any(action.startswith(("sts:", "iam:", "cloudtrail:")) for action in actions)
+    assert not any(
+        action
+        in {
+            "ssm:StartSession",
+            "ssm:StartSessionToPort",
+            "ssm:StartSessionOnPort",
+            "ssm:SendCommand",
+            "ssm:StartAutomationExecution",
+            "ssm:RegisterTargetWithMaintenanceWindow",
+            "ssm:CreateDocument",
+        }
+        for action in actions
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -80,6 +80,7 @@ from .interfaces import (
 )
 from .execution_ledger import ReexecutionClass
 from .models import (
+    ApprovalTicket,
     DispatchEvidence,
     ExecutionRequest,
     ExecutionResult,
@@ -509,6 +510,15 @@ class ExecutionCoordinator:
     construction. It is never regenerated per request, so a worker's ownership
     of a reservation holds for the whole transaction.
 
+    Candidate 1, Option B: ``approval_verifier`` is an optional injected
+    callable that runs as the *last* step of the ticket gate. It is never
+    imported or constructed here -- this module stays free of the signature
+    primitives -- so the coordinator cannot be tricked into verifying against
+    a default. When supplied it receives the store's authoritative ticket and
+    returns ``(reason, detail)`` to refuse, or ``None`` to accept. When
+    omitted, the gate behaves exactly as before the signature feature
+    existed: unsigned approvals flow with the ticket state.
+
     Refusals write no audit record: SWS never records a false durable claim,
     and a refused request performs no AWS call.
     """
@@ -527,6 +537,9 @@ class ExecutionCoordinator:
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] | None = None,
         max_observation_age_seconds: int = SWS_MAX_OBSERVATION_AGE_SECONDS,
+        approval_verifier: (
+            Callable[[ApprovalTicket], tuple[RefusalReason, str] | None] | None
+        ) = None,
     ) -> None:
         self._store = approval_store
         self._ledger = execution_ledger
@@ -537,6 +550,7 @@ class ExecutionCoordinator:
         )
         self._audit_store = audit_store
         self._id_source = id_source or (lambda: uuid4().hex)
+        self._approval_verifier = approval_verifier
         # Generated once, here, and never per request. Ownership that changed
         # between the reservation and the transition would prove nothing: the
         # whole point is that the worker which claimed the execution is the only
@@ -1436,6 +1450,18 @@ class ExecutionCoordinator:
                 RefusalReason.TICKET_MISMATCH_PLAN,
                 "ticket is not bound to this plan",
             )
+        # Candidate 1, Option B: the detached-approval verification runs last,
+        # after every ticket-state and binding check. It is deliberate that
+        # this is the only step that can be switched off: when the executor is
+        # configured with pinned signer keys the callable is always injected,
+        # and when it is not the approval path is the unsigned one it replaces.
+        # The verifier decides a refusal on its own (and maps signature
+        # failures to the *_APPROVAL_* reasons), so the coordinator only has to
+        # enforce "verifier says no -> this attempt says no".
+        if self._approval_verifier is not None:
+            refusal = self._approval_verifier(stored)
+            if refusal is not None:
+                return refusal
         return None
 
     def _decision_gate(

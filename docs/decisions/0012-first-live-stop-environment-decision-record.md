@@ -22,7 +22,7 @@ performed; no code, test, or IAM artifact was modified.
 | `%USERPROFILE%\.aws\credentials` | **Does not exist.** No static credentials file. |
 | `AWS_*` environment variables | **None set.** |
 | `aws sts get-caller-identity --profile opencode` (read-only) | Account `527557823928`, identity **`arn:aws:iam::527557823928:root`**. Re-confirmed during the Q1 investigation. |
-| `aws cloudtrail describe-trails --region us-east-1` (read-only) | `{"trailList": []}` — **no trail exists** in this account/region. |
+| `aws cloudtrail describe-trails --region us-east-1` (read-only) | `{"trailList": []}` — **no trail existed** in this account/region at the time of the original investigation. **SUPERSEDED:** a dedicated trail `sws-first-live-stop-evidence` has since been created in this account/region. See Decision 4. |
 | `.github\workflows\ci.yml` (Q1 investigation) | The **only** workflow. `runs-on: ubuntu-latest`, GitHub-hosted and ephemeral. No `self-hosted`, no `aws-actions/configure-aws-credentials`, no OIDC/trust reference, no role ARN. States the suite is deliberately hermetic and that adding the AWS extra would invite the live-AWS validation the suite avoids. |
 | Repository scan for `self-hosted` / `oidc` / `role_arn` / `assume-role` | No CI or infrastructure occurrence. The only `assume-role` reference is a **placeholder** in the runbook (`--role-arn <mutating-role-arn>`), and all `amazonaws.com` matches are synthetic fixtures or the expected `eventSource`. |
 | Local AWS config keys (Q1 investigation) | Profiles `opencode` and `default` carry **only** `region` and `login_session`. No `role_arn`, no `source_profile`, no `credential_process`. No configured assume-role path. |
@@ -588,7 +588,7 @@ role.
 | `ec2:StopInstances` | **Prohibited** | precondition 16 |
 | Any `ec2:*` | **Prohibited** | it must not be a second mutation path |
 | `iam:*` | **Prohibited** | blast radius |
-| Where it runs | the executor, using a **second, distinct** credential source | ADR 0011 |
+| Where it runs | the operator's runbook environment, using a **second, distinct** credential source | Q3 architecture, Decision 3 |
 
 **Why separate:** "the credential that can change things must not be able to
 inspect itself." A witness plus a self-read is one actor's account of itself.
@@ -734,7 +734,31 @@ design work.
 | --- | --- | --- | --- | --- | --- |
 | Trail exists covering target account + region | operator | `DescribeTrails` returns it | account decision | yes | **yes** |
 | Lookup region + trail identity fixed in Q4 in advance | operator | 0012 Decision 4 filled | F1 | no | **yes** (precondition 18) |
-| Event selector includes `StopInstances` | operator | selector config | F1 | yes | **yes** |
+| Effective selector read back and recorded before first dispatch | operator | `GetEventSelectors` output recorded below | F1 | no | **yes** |
+
+**F.3 — CloudTrail management-event capture (CloudTrail gate A3)**
+
+> The dedicated CloudTrail trail MUST be provisioned with management-event capture
+> appropriate for the live-stop evidence path, and its effective selector
+> configuration MUST be read back and recorded before the first live mutation.
+>
+> The trail configuration MUST NOT be represented as an exclusive `StopInstances`
+> filter, because CloudTrail trails do not support an
+> `eventSource = Equals ec2.amazonaws.com` combined with
+> `eventCategory = Equals Management` selector for this purpose.
+>
+> Specific `StopInstances` attribution MUST instead be established at evidence time
+> by the separate forensic reader using CloudTrail `LookupEvents` filtered for
+> `eventSource = ec2.amazonaws.com` and `eventName = StopInstances`.
+>
+> An empty `LookupEvents` result is NOT sufficient until the CloudTrail
+> delivery-lag reconciliation policy (Decision 5, Policy A) has completed.
+
+This row replaces an earlier checklist item, "Event selector includes
+`StopInstances`", which required a trail-selector configuration CloudTrail does not
+support. The forensic requirement is **not** weakened by the change: the guarantee
+moves from configuration time to read time, where it is actually checkable. See
+Decision 4 for the verified basis.
 
 **G. Target**
 
@@ -914,6 +938,22 @@ sts:AssumeRole permitted:
 The mutation executor **must not** also become the CloudTrail forensic reader
 merely for convenience.
 
+**Q3 — Forensic reader architecture (2026-10-07):** the repository architecture
+supports an **operator-side forensic reader**. `sws_agent.reconciliation`
+consumes `CloudTrailEvidence` as data and never fetches CloudTrail (ADR 0011);
+the provenance check requires only that `reader_principal_arn` be distinct from
+the mutating principal and be present; and the runbook's §12/§10.2 CloudTrail
+read is performed "with a separate read-only forensic role" and never requires
+the lookup to run on the executor. Independence is preserved because separation
+is principal-based and code-enforced, not host-based. Recommended concrete
+architecture: a distinct read-only role holding only `cloudtrail:LookupEvents`
+and `cloudtrail:DescribeTrails`, with no `ec2:*`, reached from the operator's
+runbook environment (for example `sts:AssumeRole` by the operator identity,
+with the trust policy restricted to it). The executor's mutation role has no
+CloudTrail read at all. This resolves Q3's architecture; Q3 remains OPEN only
+because no such role exists, and the decision line stays unchecked until the
+owner approves.
+
 **Decision:** [ ] ACCEPTED  [ ] REJECTED  [ ] OPEN
 
 **Notes:** OPEN, and blocked by Q1 as well as by its own absence. The intended
@@ -955,28 +995,60 @@ CloudTrail lookup region:
     region cannot be fixed to it yet.
 
 Trail name:
-    NONE — Established negative. `aws cloudtrail describe-trails --region
-    us-east-1 --profile opencode` returned {"trailList": []}. No trail exists in
-    the only reachable account/region.
+    sws-first-live-stop-evidence
 
 Trail ARN:
-    NONE — No trail exists to name.
+    arn:aws:cloudtrail:us-east-1:527557823928:trail/sws-first-live-stop-evidence
 
 Trail home region:
-    NONE — No trail exists.
+    us-east-1
+
+Trail S3 destination:
+    sws-live-stop-cloudtrail-evidence-527557823928
+    Dedicated bucket, SSE-S3 (AES256), all four public-access blocks enabled, and a
+    bucket policy granting only cloudtrail.amazonaws.com PutObject delivery into
+    AWSLogs/527557823928/*. Verified by read-back.
+
+Trail logging state:
+    STOPPED — `GetTrailStatus` reports IsLogging=false, TimeLoggingStopped
+    2026-10-05T15:35:50Z. Logging was started during provisioning before the
+    selector question was settled, then stopped deliberately to prevent
+    unintended catch-all ingestion. It has NOT been restarted.
+
+Effective event selector (read back via GetEventSelectors):
+    EventSelectors:
+        ReadWriteType                   = All
+        IncludeManagementEvents         = true
+        DataResources                   = []
+        ExcludeManagementEventSources   = []
+    This is management-event capture. It is NOT an exclusive StopInstances filter,
+    and it is not represented as one.
 
 Trail covers target account:
-    [ ] YES
-    [ ] NO
-    [ ] UNKNOWN
-    NOT APPLICABLE — There is no trail to cover anything. This is a confirmed
-    absence, distinct from "not yet checked".
+    PARTIAL — the trail records events for account 527557823928, which is the only
+    reachable account. Whether that is the target account is still OPEN, because no
+    target has been selected.
 
 Trail covers target region:
     [ ] YES
     [ ] NO
     [ ] UNKNOWN
-    NOT APPLICABLE — As above.
+    OPEN — home region is us-east-1, but the target region is unchosen.
+
+Selector capability finding (verified, not inferred):
+    A CloudTrail trail CANNOT be configured to select StopInstances exclusively.
+    The basic EventSelector shape has exactly four members — DataResources,
+    ExcludeManagementEventSources, IncludeManagementEvents, ReadWriteType — and
+    has no EventSource or EventNames member. Confirmed against the PutEventSelectors
+    API reference and against two independent service models (the CLI-vendored
+    botocore model and botocore 1.43.101); both lack those fields entirely, so this
+    is a service-side limitation rather than a stale-tooling one.
+    AdvancedEventSelectors do support eventName and eventSource, but AWS rejects
+    eventSource selectors combined with eventCategory = Equals "Management" on a
+    trail (InvalidEventSelectorsException). The documented eventSource Equals form
+    applies to event data stores, not trails.
+    Consequence: this is an architecture correction, not a tooling defect. No CLI or
+    SDK upgrade would change the outcome.
 
 Lookup region rationale:
     OPEN — Cannot be reasoned about until a target account and region are chosen.
@@ -992,22 +1064,25 @@ interpreted as proof that no AWS-side event exists.
 
 **Decision:** [ ] ACCEPTED  [ ] REJECTED  [ ] OPEN
 
-**Notes:** OPEN, with one hard blocker that is **established rather than
-unresolved**: no CloudTrail trail exists in the reachable account. This is the
-most consequential finding in the record.
+**Notes:** OPEN. The trail and its destination now exist and their facts are
+recorded above, which retires the "no trail exists" blocker. What remains open is
+the account/region binding, not the artifact's existence.
 
-Without a trail there is no CloudTrail event history, so `LookupEvents` can only
-ever return zero rows. Every M15-G guarantee — independent AWS-side
-verification, AWS-wins-on-disagreement, exact dispatch-count confirmation — would
-be satisfied vacuously or not at all. Worse, it would fail in the most dangerous
-direction available: with no trail, a lookup returns clean and empty, which
-Policy A would eventually mature into a "settled" zero-event conclusion — an
-apparently legitimate finding that no dispatch ever happened.
+**Q4 no longer asks whether a trail can be configured to explicitly select
+`StopInstances`.** That question is withdrawn as unanswerable: the capability does
+not exist on a trail. The evidence guarantee is therefore established at
+read/evidence time rather than by selector-level filtering — the trail's job is to
+retain management events, and the forensic reader's `LookupEvents` call, filtered for
+`ec2.amazonaws.com` / `StopInstances`, is what establishes attribution. This
+satisfies the required invariant above unchanged, because `LookupEvents` remains
+performed against a deliberately selected region/trail context; only the location of
+the filter moved.
 
-**Required before this decision can be made:** a trail must exist covering the
-target account and region, and its identity recorded above. Creating a trail is
-an AWS mutation and is **not authorized by this record**. Note that trail choice
-also carries a scope decision — a trail records events for its own account and
+**Required before this decision can be made:** the trail's account and region must
+be bound to the target environment, and logging must be started. The trail is
+currently STOPPED by design, so the artifact exists but captures nothing. Starting
+logging is an AWS mutation and is **not authorized by this record**. Note that trail
+choice also carries a scope decision — a trail records events for its own account and
 region, so for a target in another account an organization trail may be required
 instead.
 
@@ -1221,7 +1296,10 @@ following are true:
                                                        NOT IN PLACE — one identity only
 [ ] Forensic reader access is verified.               BLOCKED — no reader exists
 [ ] CloudTrail region/trail identity is fixed.        OPEN (Q4)
-[ ] CloudTrail coverage is verified.                  NO — no trail exists
+[ ] CloudTrail coverage is verified.                  PARTIAL — trail exists and
+                                                        selector read back; not
+                                                        logging, and target
+                                                        account/region unbound (Q4)
 [ ] Delivery policy is selected and operationally executable.
                                                        PROPOSED, NOT APPROVED (Q5);
                                                        not executable without a trail
@@ -1269,17 +1347,111 @@ It does **not** mean: `NO DISPATCH`
 
 ---
 
+## Environment re-check — 2026-10-07 (read-only, no changes)
+
+The environment was re-read on 2026-10-07 with read-only AWS calls only and
+matches the facts recorded above; nothing was created, modified, or deleted —
+no EC2, IAM, VPC, network endpoint, NAT, or trail change. There are no running
+instances in us-east-1, so no instance could be mistaken for a target.
+
+| Fact | 2026-10-07 reading | Record matches |
+| --- | --- | --- |
+| Caller identity | `arn:aws:iam::527557823928:root` (profile `opencode`, region us-east-1) | yes |
+| CloudTrail trail | `sws-first-live-stop-evidence`; home us-east-1; S3 `sws-live-stop-cloudtrail-evidence-527557823928`; not multi-region | yes (Decision 4) |
+| Trail logging | `IsLogging=false`, `TimeLoggingStopped=2026-10-05T15:35:50Z` | yes |
+| Effective selector | `ReadWriteType=All`, `IncludeManagementEvents=true`, `DataResources=[]`, `ExcludeManagementEventSources=[]` | yes (management capture, not a StopInstances filter) |
+| SWS IAM roles / instance profiles | none (filtered `list-roles`, `list-instance-profiles`) | yes (Q2/Q3) |
+| SWS-tagged instances | none tagged `SwsPurpose=sacrificial-stop-validation` | yes (Q1 target) |
+| Running EC2 instances (us-east-1) | none | no instance can be mistaken for the target |
+| Default VPC / subnets | `vpc-048db5da1422e908b` (172.31.0.0/16); default subnets in six AZs, all `MapPublicIpOnLaunch=true` | no private subnet exists |
+| NAT gateways / VPC endpoints | none | private networking would require provisioning |
+
+### Recommended executor specification (evidence-based; NOT provisioned)
+
+Account 527557823928, region us-east-1, architecture A, same account.
+
+- Dedicated disposable EC2 instance, sole purpose this run.
+- AMI: Ubuntu 24.04 LTS x86_64 (stock `python3` is 3.12, satisfying
+  `requires-python >= 3.12`; SSM agent preinstalled). Fallback: Amazon Linux
+  2023 with the `python3.12` package.
+- Class: t3.micro (2 vCPU / 1 GiB). Root: 8 GiB gp3, delete-on-termination.
+- Placement: default VPC public subnet; **no key pair**; security group with
+  zero inbound rules and unrestricted egress; operator access via SSM Session
+  Manager only. The executor's public IPv4 is an accepted consequence and is
+  unrelated to the *target*, which must have no public IP (runbook §1
+  precondition 6).
+- Software: Python 3.12 venv; `pip install .[aws,signature]` (boto3 for the
+  real client factory; cryptography lazily loaded for the detached-approval
+  verifier); awscliv2 for the runbook's manual `sts`/`ec2`/`dry-run` steps.
+  No `dev`/`mcp`/`simulator` extras on the executor.
+- Outbound: public AWS endpoints via the internet gateway — `ec2`, `sts`,
+  `ssm`, `ssmmessages`, `ec2messages`. No VPC endpoints or NAT (none exist;
+  see owner decisions).
+- Transport: the instance profile carries the Candidate 1 mutation role whose
+  policy is the validated artifact — `ec2:StopInstances` on the exact target
+  ARN, `ec2:DescribeInstances` on `*` (ratified M15-E), and the 24-action
+  `AmazonSSMManagedInstanceCore` transport set so the SSM agent channel
+  operates. Operator-side `ssm:StartSession` is a separate grant on the
+  operator identity and is not part of the 24.
+- CloudTrail read on the executor: none. The forensic read is the
+  operator-side reader (Q3).
+- Lifetime: created for the run; terminated after reconciliation closes and
+  evidence is retained (runbook §11). Teardown deletes the executor and its
+  EBS; instance-profile/role retention is an owner decision.
+- Cost: KNOWN list prices — t3.micro $0.0104/hr on-demand Linux; 8 GiB gp3
+  ~$0.64/mo prorated. ESTIMATED total for a 2-6 hour window: well under
+  USD 1.
+
+### Recommended target specification (NOT to be created here)
+
+Purpose-created, disposable sacrificial instance per runbook §1:
+
+- Any lightweight stock AMI; t3.nano suffices (it only needs to boot and stop).
+- Launch in the default VPC, public subnet, WITHOUT a public IPv4; security
+  group ingress none; no key pair; no instance profile; volumes
+  delete-on-termination and empty.
+- Tags: `SwsPurpose=sacrificial-stop-validation`, `SwsOwner=<operator>`,
+  `RunId=<uuid>` (runbook §1 precondition 7).
+- Lifecycle: created for the run; stopped by the run; terminated after evidence
+  is retained. Pre-stop evidence = §5 pre-state observation; post-stop evidence
+  = §8 `StopInstancesResult` and §9 settle polls to `stopped`.
+- The exact instance ARN (`arn:aws:ec2:us-east-1:527557823928:instance/<i-id>`)
+  must be captured at creation; it is required before the mutation policy can
+  be generated and precondition 14 re-validated.
+
+### Owner decisions still required (unresolved)
+
+1. Approve the executor specification: public-subnet no-ingress versus a
+   private subnet with a NAT gateway (~$32.40/mo) or VPC endpoints
+   (~$7.20/endpoint/mo) as standing cost.
+2. Approve Q3 as the operator-side forensic reader with an `sts:AssumeRole`
+   read-only role (trust restricted to the operator identity), then provision
+   it with only `cloudtrail:LookupEvents` and `cloudtrail:DescribeTrails`.
+3. Approve Policy A delivery values (Decision 5) — still PROPOSED, NOT
+   APPROVED; the trail is still STOPPED and starting logging is a separate,
+   authorized step.
+4. Confirm the target region is us-east-1 (the only region evidenced) and
+   supply the operator identity for the forensic role trust.
+
 ## Current status
 
 ```
 M15-G:                 COMPLETE (accepted)
 Checkpoint:            5e4215f (pushed to origin/main)
-Environment record:    POPULATED — 4 hard blockers, all decisions OPEN
+Re-check:              2026-10-07 — read-only; environment unchanged (see below)
+Environment record:    POPULATED — 4 hard blockers; Q1/Q3 OPEN WITH A DEFINED
+                       TARGET ARCHITECTURE; Q2/Q4/Q5 OPEN
 Implementation:        FROZEN
 Q1 target architecture: A — dedicated AWS execution environment (NOT provisioned)
 Live mutation:        NOT AUTHORIZED
-AWS mutations:        NONE across the whole investigation. Read-only calls only:
-                      sts get-caller-identity (twice), cloudtrail describe-trails
+CloudTrail trail:     CREATED, VERIFIED, currently STOPPED (not logging)
+Q4 evidence guard:    trail-selector-based StopInstances attribution is not
+                       supported by CloudTrail; attribution is established at
+                       LookupEvents time instead. See Decision 4.
+AWS mutations:        S3 bucket + bucket policy + public-access block + encryption,
+                       CloudTrail trail, start-logging, then stop-logging.
+                       NO EC2 mutation of any kind. No IAM role, no executor,
+                       no target, no forensic reader.
 ```
 
 ### Blockers
@@ -1289,10 +1461,13 @@ infrastructure mutations and none is authorized here. Q1 is no longer simply
 "undecided" — it now has a recommended target architecture, but that architecture
 does not exist, so the blocker is unchanged in substance.
 
-1. **No CloudTrail trail exists** (Q4). Without one there is no AWS-side evidence,
-   and Policy A would mature an empty result into a false "no dispatch" finding.
-   A trail covering the target account and region is a precondition for the entire
-   M15-G verification architecture.
+1. **The CloudTrail trail is not yet logging.** The trail
+   `arn:aws:cloudtrail:us-east-1:527557823928:trail/sws-first-live-stop-evidence`
+   and its dedicated S3 destination now exist and are verified, but `IsLogging` is
+   false by design. Until logging is started there is no AWS-side evidence and
+   Policy A would mature an empty result into a false "no dispatch" finding.
+   Starting logging, and binding the trail to the target account and region, are
+   both prerequisites of the M15-G verification architecture.
 2. **The only reachable identity is account root** (`arn:aws:iam::527557823928:root`).
    It cannot be scoped to one instance ARN, so it can never be the mutation
    principal (Q2), and using it as the forensic reader would collapse the

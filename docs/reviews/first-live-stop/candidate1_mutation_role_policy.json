@@ -1,0 +1,56 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "ec2:StopInstances"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:ec2:us-east-1:527557823928:instance/i-00000000"
+      ],
+      "Sid": "StopSacrificialInstanceOnly"
+    },
+    {
+      "Action": [
+        "ec2:DescribeInstances"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "DescribeInstancesForSettlement"
+    },
+    {
+      "Action": [
+        "ec2messages:AcknowledgeMessage",
+        "ec2messages:DeleteMessage",
+        "ec2messages:FailMessage",
+        "ec2messages:GetEndpoint",
+        "ec2messages:GetMessages",
+        "ec2messages:SendReply",
+        "ssm:DescribeAssociation",
+        "ssm:DescribeDocument",
+        "ssm:GetDeployablePatchSnapshotForInstance",
+        "ssm:GetDocument",
+        "ssm:GetManifest",
+        "ssm:GetParameters",
+        "ssm:ListAssociations",
+        "ssm:ListInstanceAssociations",
+        "ssm:PutComplianceItems",
+        "ssm:PutConfigurePackageResult",
+        "ssm:PutInventory",
+        "ssm:UpdateAssociationStatus",
+        "ssm:UpdateInstanceAssociationStatus",
+        "ssm:UpdateInstanceInformation",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "*"
+      ],
+      "Sid": "SsmAgentTransport"
+    }
+  ],
+  "Version": "2012-10-17"
+}

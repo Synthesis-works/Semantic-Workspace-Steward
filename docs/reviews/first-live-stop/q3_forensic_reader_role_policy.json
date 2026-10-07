@@ -1,0 +1,14 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "cloudtrail:LookupEvents",
+        "cloudtrail:DescribeTrails"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "CloudTrailLookupOnly"
+    }
+  ],
+  "Version": "2012-10-17"
+}

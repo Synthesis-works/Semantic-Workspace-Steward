@@ -1433,11 +1433,49 @@ Purpose-created, disposable sacrificial instance per runbook §1:
 4. Confirm the target region is us-east-1 (the only region evidenced) and
    supply the operator identity for the forensic role trust.
 
+## Non-mutating policy preparation — 2026-10-07
+
+One stage of non-mutating preparation is complete: the concrete IAM policy
+artifacts that would bound the future mutation identity and the Q3 forensic
+reader are generated, cross-checked against the repository implementation, and
+preserved for review at `docs/reviews/first-live-stop/`.
+
+| Artifact | Source | Status |
+| --- | --- | --- |
+| `candidate1_mutation_role_policy.json` | repository `mutation_iam_policy`, passed the repository's `validate_iam_policy` | READY as structure; NOT provision-ready (target ARN placeholder) |
+| `q3_forensic_reader_role_policy.json` | hand-authored (no repository generator exists); `cloudtrail:LookupEvents` + `cloudtrail:DescribeTrails` only | READY as structure; NOT provision-ready |
+| `q3_forensic_reader_role_trust.template.json` | hand-authored template | NOT provision-ready (`<OPERATOR-IDENTITY>` unresolved) |
+
+**READY:**
+
+- Candidate 1 authorization architecture (committed `0ad0771`)
+- local mutation policy structure (generated and validated in-repo)
+- local forensic-reader policy structure
+
+**NOT READY — none of the following exists yet, and the local JSON does not
+change that:**
+
+- real target ARN (the artifact carries the placeholder `i-00000000`; it must
+  not be mistaken for a valid target)
+- real operator trust principal (`arn:aws:iam::527557823928:user/<OPERATOR-IDENTITY>`)
+- executor instance
+- mutation role
+- forensic-reader role
+- CloudTrail logging / start
+- live-stop execution
+
+Producing `candidate1_mutation_role_policy.json` does **not** resolve Q2, and
+producing the two Q3 artifacts does **not** resolve Q3. A review artifact is
+not a role, a trust, or an approval. Q2/Q3/Q4/Q5 remain OPEN, and no
+provisioning has occurred.
+
 ## Current status
 
 ```
 M15-G:                 COMPLETE (accepted)
-Checkpoint:            5e4215f (pushed to origin/main)
+Checkpoint:            346f69d (pushed to origin/main)
+Policy artifacts:      docs/reviews/first-live-stop/ — structures READY, NOT
+                       provision-ready (target ARN + operator principal pending)
 Re-check:              2026-10-07 — read-only; environment unchanged (see below)
 Environment record:    POPULATED — 4 hard blockers; Q1/Q3 OPEN WITH A DEFINED
                        TARGET ARCHITECTURE; Q2/Q4/Q5 OPEN

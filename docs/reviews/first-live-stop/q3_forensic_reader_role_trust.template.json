@@ -1,0 +1,15 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "sts:AssumeRole"
+      ],
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::527557823928:user/<OPERATOR-IDENTITY>"
+      },
+      "Sid": "OperatorAssumeRoleOnly"
+    }
+  ],
+  "Version": "2012-10-17"
+}

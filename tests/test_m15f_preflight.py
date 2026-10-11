@@ -40,6 +40,13 @@ from sws_agent.preflight import (
     require_preflight,
 )
 
+# The factory builds a real botocore client (only the credentials are stubs), so
+# these tests need the AWS SDK. Skip cleanly where it is absent -- CI installs
+# only [dev,mcp,simulator] on purpose -- rather than fail on a missing import.
+pytest.importorskip(
+    "botocore", reason="M15-F preflight tests exercise the real botocore client"
+)
+
 INSTANCE_ARN = "arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890"
 INSTANCE_ID = "i-0abcdef1234567890"
 OTHER_INSTANCE_ARN = "arn:aws:ec2:us-east-1:123456789012:instance/i-0fffffffffffffff0"

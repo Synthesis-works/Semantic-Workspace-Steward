@@ -1525,3 +1525,513 @@ account versus a separate executor account**, then the attachment mechanism. Tha
 is the smallest operator choice that unblocks the chain; everything downstream
 follows from it. No runbook step may be attempted until Q1 through Q5 are
 resolved and the live mutation is separately authorized.
+
+---
+
+## DECISION 2 — RATIFICATION (concrete mutation execution identity, attachment, credential delivery, signer) — Stage D amendment, 2026-10-10
+
+**Status: ARCHITECTURE DECIDED. Implementation wiring and signer provisioning
+remain OPEN.**
+
+This amendment converts Decision 2's previously OPEN target architecture into a
+concrete, provisionable architecture. It ratifies the already-reviewed Candidate 1
+architecture at the level the earlier record left as *target*: **same account ·
+dedicated executor · direct EC2 instance-profile attachment · no `AssumeRole`
+hop.** It creates nothing and does **not** authorize `ec2:StopInstances`.
+
+**Supersession.** This amendment moves Decision 2's OPEN cells — mutation
+principal ARN, role attachment mechanism, credential delivery — and the
+corresponding `Current status` line for Q2, from OPEN to
+**DECIDED ARCHITECTURE (some cells DECIDED ARCHITECTURE / IMPLEMENTATION-OPEN)**.
+It also supersedes the `Next action` statement that the attachment mechanism was
+still to be selected; the attachment mechanism is now decided at the architecture
+level. The prior OPEN text above is preserved unaltered for history. A cell that
+is genuinely not established is recorded as **DECIDED ARCHITECTURE /
+IMPLEMENTATION-OPEN**, never as complete. **Nothing is provisioned by this
+amendment**: Decision 2's blocker ("no mutation identity exists") remains true,
+because this amendment is a decision, not a creation.
+
+**Ratified facts**
+
+- Account: `527557823928`; region `us-east-1`; same account for execution and target.
+- Dedicated executor: `i-0c37dfef1dd3fcea7`.
+- The mutation capability originates from the executor's **instance-profile
+  credentials**; the instance-profile role **is** the execution principal.
+- No `AssumeRole` hop; no operator credentials on the executor; no root
+  credentials on the executor; no long-lived access keys.
+- Operator identity remains distinct from the mutation identity. Forensic-reader
+  identity remains distinct from the mutation identity.
+- Trust: **EC2 (`ec2.amazonaws.com`) is the sole trusted principal** of the
+  execution role via its instance profile. No operator is trusted directly; no
+  SSM service principal is added to the execution role to perform `StopInstances`;
+  no `AssumeRole` trust is introduced.
+
+### 1.1 Mutation execution identity
+
+- Canonical role name: **`sws-live-stop-mutation-role`** (proposed; owner to confirm).
+- Resulting ARN **pattern**:
+  `arn:aws:iam::527557823928:role/sws-live-stop-mutation-role`.
+- **The concrete ARN is not recorded here.** It is recorded only after AWS creates
+  the role and the value is read back and verified (see §9).
+
+### 1.2 Attachment
+
+EC2 permits exactly one role per instance profile, so the dedicated mutation role
+replaces `sws-executor-role` as the executor's runtime principal. **No second
+instance-profile role is created.** `sws-executor-role` (and its artifact-read
+capability) is retained in IAM as an **unused historical/bootstrap role**, but is
+not attached to `sws-executor-instance-profile` after the controlled transition.
+
+### 1.3 Runtime principal's permission set
+
+The executor's runtime principal carries exactly one inline policy:
+
+- **`sws-live-stop-mutation-candidate1`** — the reviewed Candidate 1 policy,
+  byte-for-byte the reviewed 3-statement artifact: `StopSacrificialInstanceOnly`
+  (`ec2:StopInstances` on the exact target ARN), `DescribeInstancesForSettlement`
+  (`ec2:DescribeInstances` on `*`), `SsmAgentTransport` (the 24-action set on `*`).
+  Validated by `validate_iam_policy`.
+
+The mutation principal carries the **smallest useful steady-state permission
+set**. It holds **no S3 permission** and **no artifact-read capability**.
+
+**Artifact retrieval is complete and outside the steady-state mutation runtime.**
+Stage B bootstrap already delivered and verified the artifact on the executor, and
+the live-stop runtime performs no S3 retrieval. `sws-executor-artifact-read` is
+therefore **not** attached to the mutation role. The historical `sws-executor-role`
+(with its artifact-read capability) remains in IAM as an unused/bootstrap role, is
+not the live mutation principal, and is not attached to the executor after the
+controlled transition.
+
+**Explicit statements:** the Candidate 1 artifact contains no S3/artifact-read
+capability; **neither does the steady-state mutation runtime role.**
+
+### 1.4 SSM transport capability
+
+- **Candidate 1's `SsmAgentTransport` is the authoritative SSM transport
+  permission.** It is the exact 24-action transcription of
+  `AmazonSSMManagedInstanceCore` v1.
+- The standalone `AmazonSSMManagedInstanceCore` attachment is therefore **not**
+  re-attached to the new role; doing so would be redundant.
+- `ssm:StartSession` is **not** among the 24; operator-side SSM access is a
+  separate operator grant, not part of the execution role.
+- Trade-off recorded: an inline transcription of a managed policy does not track
+  future AWS updates to that managed policy.
+
+### 1.5 Credential delivery to the running SWS process
+
+- The SWS process obtains mutation credentials **from the executor's
+  instance-profile credentials** and passes them **explicitly** to
+  `MutationClientFactory` via `MutationClientSettings`/`MutationCredentials` (with
+  `source` recording the origin, e.g.
+  `instance-profile:sws-live-stop-mutation-role`). The factory never consults the
+  ambient chain and has no profile parameter.
+- **DECIDED ARCHITECTURE / IMPLEMENTATION-OPEN:** no live composition root exists
+  today. `sws_agent.composition` builds only the dry-run composition with a
+  `NonMutatingMutationHandler`; there is no code that (a) reads the
+  instance-profile credentials, (b) builds a `MutationClientSettings` with the real
+  target ARN, (c) constructs the `MutationClientFactory` client, and (d) injects
+  `StopInstancesHandler`. That wiring, and flipping `STOP_RESOURCE.implemented` to
+  `True`, are implementation prerequisites (see §5).
+
+### 1.5.1 What the mutation runtime must NOT receive
+
+No `AssumeRole` credentials, no operator credentials, and no root credentials are
+delivered to the executor. Operator access to the executor is an operator-side
+grant (for example SSM), not a credential placed on the executor.
+
+### 1.6 Detached cryptographic approval — signer model
+
+- Signer is an **independent cryptographic approval identity**, **not an AWS IAM
+  role**. It is distinct from the AWS execution principal and from the operator.
+- Key type: **Ed25519** (`approval_signature.py`).
+- Key ID: `ed25519:<derived>` — derived from the public key (`_key_id`); one key
+  ↔ one id.
+- Private-key custody: **approver-side only** (independent workstation or
+  environment). Never on the executor; never in the mutation role; never in the
+  ticket.
+- Public-key placement: pinned in `ApprovalVerificationPolicy.public_keys`
+  (signer key id → raw 32-byte Ed25519 public key), supplied to the composition
+  explicitly (config / parameter store). Public material only.
+- Verification location: on the executor, at the execution gate
+  (`build_approval_verifier` → `verify_approval_for_execution`).
+- Signer ≠ operator: `operator_identities` must include the operator's identity;
+  enforced by `ApprovalSignerForbiddenError`.
+- Signed vocabulary: the exact **12 fields** (`ticket_id, resource_id, action,
+  plan_id, execution_intent_key, execution_deadline, executor_instance_id,
+  account_id, region, nonce, issued_at, signer_key_id`). **`evidence_digest`
+  remains unsigned.**
+- Rotation/revocation: rotation = pin a new key id alongside/replacing the old;
+  revocation = remove the key id from the pinned map (fail-closed for artifacts
+  signed with it).
+
+**Architecture DECIDED; signer provisioning and key pinning IMPLEMENTATION-OPEN.**
+The Ed25519 detached-approval architecture is ratified. The following remain
+**DECIDED ARCHITECTURE / IMPLEMENTATION-OPEN** (not provisioned): the concrete
+signer key; the signer key ID; the public-key pin; the operator-identity binding
+(`operator_identities`); private-key custody implementation; and
+rotation/revocation implementation. No concrete signer exists; no key is
+generated; no approval material is created; no AWS identity is created for the
+signer by this amendment.
+
+### 1.7 Forensic reader (unchanged)
+
+Separate read-only identity holding only `cloudtrail:LookupEvents` +
+`cloudtrail:DescribeTrails`, reached operator-side; the execution role holds
+**no** CloudTrail permission. Still not created (implementation-open); the
+decision is unchanged from Q3.
+
+**Decision line.** Replaced for the cells in §3. The original `[ ] OPEN` line
+above is preserved unaltered for history.
+
+### 2. Required ADR amendment references
+
+- **ADR 0010** — "Items 1–4: environment, credentials, target, attachment" and
+  "Role attachment: the decision rule, not the decision" (executor location and
+  IAM attachment were deliberately deferred). This amendment applies ADR 0010's
+  own decision rule ("attach the dedicated mutation role directly if the
+  environment supports it; use `sts:AssumeRole` only when no direct attachment is
+  available") to the two-account/executor facts now fixed.
+- **ADR 0009** — §"The IAM artifact": "The policy is an artifact only. It is not
+  attached, and attaching it belongs to the first live stop milestone." This
+  amendment names the attachment; the attachment itself remains a future, separate
+  AWS authorization.
+- **ADR 0008 / ADR 0006** — handler and dispatch-evidence/settlement contracts are
+  unchanged by this amendment.
+- **ADR 0011** — CloudTrail independent verification; the separation between the
+  mutation role and the forensic reader is preserved and restated in §7.
+- **ADR 0005** — dry-run composition: unchanged; the live composition (§1.5)
+  remains future work.
+
+### 3. Before/after decision table (Decision 2)
+
+| Decision 2 cell | Before | After |
+| --- | --- | --- |
+| Mutation principal ARN | OPEN | DECIDED ARCHITECTURE / ARN OPEN — `arn:aws:iam::527557823928:role/sws-live-stop-mutation-role` (concrete ARN recorded only after create + read-back) |
+| Role attachment mechanism | OPEN | DECIDED — direct EC2 instance-profile attachment; `sws-executor-instance-profile` → `sws-live-stop-mutation-role` |
+| Credential delivery | OPEN | DECIDED ARCHITECTURE / IMPLEMENTATION-OPEN — instance-profile credentials passed explicitly to `MutationClientFactory`; live composition not yet implemented |
+| Executor runtime principal | `sws-executor-role` | DECIDED — `sws-live-stop-mutation-role` (replaces it on the profile; old role retained, detached) |
+| Artifact-read capability | inline on `sws-executor-role` | DECIDED — NOT attached to the mutation role. Bootstrap complete; artifact retrieval is outside the steady-state runtime. `sws-executor-role` retained in IAM, detached/unused. |
+| SSM transport capability | `AmazonSSMManagedInstanceCore` (managed) | DECIDED — Candidate 1 `SsmAgentTransport` (24-action transcription) is authoritative; managed policy not re-attached |
+| Detached approval signer | OPEN | DECIDED ARCHITECTURE / IMPLEMENTATION-OPEN — Ed25519 detached signer; private key approver-only; public key pinned; ≠ operator; key material not yet created |
+| Forensic reader | OPEN | DECIDED ARCHITECTURE (unchanged from Q3) / NOT CREATED — separate read-only role; no `ec2:*`; execution role holds no CloudTrail |
+
+### 3b. Inconsistency corrected
+
+An earlier stage-3 runbook annotation (`first-live-stop-instances.md` §3,
+"Amended") asserted that "Decision record 0012 … selected direct instance-profile
+attachment" while Decision 2 recorded that mechanism OPEN. This amendment makes
+that citation true. No runbook text is changed by this amendment.
+
+### 4. Explicit invariants
+
+1. `StopInstances` is scoped to exactly
+   `arn:aws:ec2:us-east-1:527557823928:instance/i-0a881305e5bc3c133`.
+2. No wildcard `StopInstances`.
+3. No `TerminateInstances`. 4. No `RebootInstances`. 5. No `StartInstances`.
+6. No IAM administration on the runtime role.
+7. No STS permissions on the runtime role (direct attachment removes the need).
+8. No CloudTrail permissions on the runtime role.
+9. No operator credentials on the executor.
+10. No private approval-signing key on the executor (or in the mutation role or ticket).
+11. Operator identity ≠ mutation identity.
+12. Forensic reader ≠ mutation identity.
+13. Detached approval is verified independently at the execution gate.
+14. `execution_intent_key` remains bound to the durable reservation (digest over
+    snapshot id, resource id, action).
+15. `evidence_digest` remains unsigned.
+16. `MutationClient` retry contract remains `total_max_attempts=1`, `mode=standard`.
+17. No external retry loop.
+18. `StopInstances` remains a single dispatch attempt.
+19. The steady-state mutation runtime principal carries no S3/artifact-read
+    permission (smallest useful set; Candidate 1 only).
+
+### 5. Exact items that remain IMPLEMENTATION-OPEN
+
+1. Concrete role ARN (pending AWS create + read-back).
+2. Confirm the exact current contents of `sws-executor-role` (its SSM-transport
+   mechanism) before replacement — read-only verification.
+3. Live composition root: read instance-profile credentials →
+   `MutationClientSettings` (real target ARN) → `MutationClientFactory` → inject
+   `StopInstancesHandler`; and flip `STOP_RESOURCE.implemented = True` (currently
+   `False`) — gated on independent review.
+4. Concrete Ed25519 signer key id + raw public key; `operator_identities` value;
+   placement of the pinned public key on the executor.
+5. Durable ledger file locations on the executor (`approvals.sqlite3`,
+   `executions.sqlite3`, audit JSONL).
+6. Owner confirmation of the canonical role name and the profile-repoint method.
+7. Separate prerequisites not owned by this amendment: Q4 trail binding, Policy A
+   delivery values (Decision 5), and the forensic-reader role — required for the
+   post-dispatch forensic step, not for this architecture.
+
+**Resolved by this amendment (recorded as decided, not open):** artifact-read is
+**not** attached to the mutation role; `sws-executor-role` is retained in IAM,
+detached/unused. Bootstrap artifact retrieval is complete and outside the
+steady-state mutation runtime. Signer provisioning (item 4) and live-composition
+wiring (item 3) remain open.
+
+### 6. Exact AWS mutations a FUTURE implementation gate would need
+
+1. `iam:CreateRole` — `sws-live-stop-mutation-role`, trust = `ec2.amazonaws.com`.
+2. `iam:PutRolePolicy` — `sws-live-stop-mutation-candidate1` (exact reviewed
+   3 statements, real target ARN; pass `validate_iam_policy`).
+3. `iam:CreateInstanceProfile` (or reuse) + `iam:AddRoleToInstanceProfile`.
+4. `ec2:AssociateIamInstanceProfile` / `ec2:ReplaceIamInstanceProfileAssociation`
+   — point the executor's profile at the new role.
+5. `iam:RemoveRoleFromInstanceProfile` — detach `sws-executor-role` (role retained
+   in IAM, unused).
+6. Read-only verification: `iam:GetRole`, `iam:GetRolePolicy`,
+   `iam:GetInstanceProfile`, `iam:SimulatePrincipalPolicy`, and executor
+   `sts:GetCallerIdentity`.
+
+No S3/artifact-read step is included. No `ec2:StopInstances` here — that is a
+separate gate.
+
+### 7. Exact AWS mutations that remain FORBIDDEN
+
+- Any `ec2:StopInstances` / `TerminateInstances` / `RebootInstances` /
+  `StartInstances` dispatch.
+- Broadening Candidate 1 (any action outside the two EC2 actions + the 24
+  transport actions; any wildcard action; any `Deny` rewrite).
+- `iam:*` beyond creating/attaching this one scoped role.
+- `sts:*` on the runtime role; `cloudtrail:*` on the runtime role.
+- Operator/root credentials on the executor; private signing key on the executor.
+- Adding S3/artifact-read permission to the mutation role.
+- Creating a second runtime instance-profile role.
+- Modifying the reviewed Candidate 1 artifact contents.
+- `D:\SMS`; repo commits/pushes; modifying any repository file.
+
+### 7.1 Invariants preserved from the reviewed decision
+
+Unchanged: account `527557823928`; region `us-east-1`; dedicated-executor
+architecture; direct EC2 instance-profile attachment; no `AssumeRole` hop; no
+operator/root credentials on executor; no long-lived access keys; EC2 as the
+execution-role trust principal; operator ≠ mutation identity; forensic reader ≠
+mutation identity; Candidate 1's exact 3-statement structure; exact target
+`StopInstances` ARN; `SsmAgentTransport` 24-action set; `total_max_attempts=1`; no
+external retry loop; detached Ed25519 approval architecture; `evidence_digest`
+unsigned; ADR references 0006 / 0008 / 0009 / 0010 / 0011.
+
+### 8. Migration / attachment sequence (descriptive — NOT executed)
+
+1. Read-only verify current executor profile/role + SSM liveness.
+2. Create `sws-live-stop-mutation-role` (EC2 trust) + inline policy
+   `sws-live-stop-mutation-candidate1` (exact reviewed 3 statements, real target
+   ARN).
+3. Create/reuse instance profile; `AddRoleToInstanceProfile`.
+4. Repoint the executor to the new role; `RemoveRoleFromInstanceProfile` for
+   `sws-executor-role` (retained in IAM, unused).
+5. Read back and verify role ARN, trust, and inline policy; run
+   `validate_iam_policy`.
+6. Confirm the executor's `sts:GetCallerIdentity` returns the new role ARN;
+   confirm the SSM channel survived the swap.
+7. *(later, separate gate)* live composition → flip `implemented` → approval →
+   reservation → preflight → **STOP before dispatch**.
+
+None of these AWS mutations has been performed. Repointing a running instance's
+profile briefly interrupts role-credential refresh; sequencing and timing are
+implementation concerns.
+
+### 9. Statement on recording the mutation role ARN
+
+The concrete mutation role ARN cannot and must not be recorded in this record
+until AWS creates `sws-live-stop-mutation-role` and the value is read back and
+verified. Until then the record fixes only the **canonical name and ARN pattern**.
+`MutationClientSettings.target_instance_arn` and the Candidate 1 policy's
+`StopInstances` resource bind to the **target** ARN, not the role ARN, so nothing
+downstream depends on the role ARN existing yet.
+
+### 10. Final status
+
+**ARCHITECTURE READY FOR IMPLEMENTATION-GATE APPROVAL.**
+
+- The architecture is now **decided** (same-account, dedicated executor, direct EC2
+  instance-profile attachment, no `AssumeRole`, EC2 trust, operator ≠ mutation
+  identity, forensic reader ≠ mutation identity).
+- **Implementation wiring remains open** (live composition root; flipping
+  `STOP_RESOURCE.implemented`).
+- **Signer provisioning remains open** (concrete key, key ID, public-key pin,
+  operator-identity binding, private-key custody, rotation/revocation).
+- **AWS mutation role creation is NOT authorized by this amendment.**
+- **Executor profile replacement is NOT authorized by this amendment.**
+- **`StopInstances` is NOT authorized.**
+
+Where a detail is genuinely not established, it is recorded as **DECIDED
+ARCHITECTURE / IMPLEMENTATION-OPEN**, not as complete.
+
+---
+
+## 11. Provisioning record + root-authorized provisioning-only deviation (2026-10-10)
+
+The owner explicitly authorized **root** credentials for **this one run only**,
+and **only** for the Phase 2/3 AWS provisioning below plus read-back verification
+of it. Root was **not** authorized for the live execution, approval-signature
+handling, or any resource outside this scope. No root credential material was
+printed, logged, or stored.
+
+### 11.1 What was provisioned (root, provisioning-only)
+
+- Role `sws-live-stop-mutation-role` created (ARN
+  `arn:aws:iam::527557823928:role/sws-live-stop-mutation-role`); trust principal
+  is `ec2.amazonaws.com` **solely** (no `AssumeRole` eligibility for anyone).
+- Inline policy `sws-live-stop-mutation-candidate1` attached: exactly three
+  statements — `StopSacrificialInstanceOnly` (`ec2:StopInstances` on
+  `arn:aws:ec2:us-east-1:527557823928:instance/i-0a881305e5bc3c133`),
+  `DescribeInstancesForSettlement` (`ec2:DescribeInstances` on `*`), and
+  `SsmAgentTransport` (the 24-action `AmazonSSMManagedInstanceCore` transport set
+  on `*`). Generated by the repository's own `mutation_iam_policy` and passed
+  `validate_iam_policy` (byte-stable, order-independent). No S3/artifact-read, no
+  IAM, no STS/AssumeRole, no PassRole, no unrelated EC2 mutation.
+- `sws-executor-role` removed from `sws-executor-instance-profile`;
+  `sws-live-stop-mutation-role` added to the same profile (reuse of the single
+  profile per §1.2 — no second instance profile was created).
+- Read-back verified: profile holds only the new role; the new role is in no
+  other profile; the old role is in no profile; executor
+  `i-0c37dfef1dd3fcea7` is `running` with `sws-executor-instance-profile`;
+  executor SSM `Online`; target `i-0a881305e5bc3c133` still `running`; trail
+  `sws-first-live-stop-evidence` logging; `sws-forensic-reader` present.
+
+### 11.2 The deviation, and why it was necessary
+
+Root was used because **no authorized non-root identity could perform the Phase
+2/3 mutations**: `sws-provisioner`'s inline policy explicitly `Deny`s
+`iam:CreateRole`, `iam:PutRolePolicy`, `iam:CreateInstanceProfile`,
+`iam:AddRoleToInstanceProfile`, `ec2:AssociateIamInstanceProfile`, and
+`ec2:ReplaceIamInstanceProfileAssociation`; `sws-operator` holds no IAM or EC2
+write. This is recorded as a **provisioning-only deviation**: explicitly scoped,
+single-run, read back, and with no effect on steady-state separation.
+
+### 11.3 Steady-state separation preserved
+
+SSO operator ≠ mutation role ≠ forensic reader. The executor's runtime principal
+is now exactly the dedicated mutation role, which is scoped to the single
+sacrificial target ARN and carries no read of the evidence it is verified against.
+
+### 11.4 What this record does NOT authorize
+
+This record does not implement the live composition root, does not flip
+`STOP_RESOURCE.implemented`, does not sign or pin any approval key, and does not
+authorize the live `StopInstances` itself. Those remain separate, still-open
+milestones.
+
+---
+
+## 12. First live `StopInstances`: executed and independently verified (2026-10-11)
+
+This section records the first live mutation performed under the §11 environment,
+the two provisioning deviations it required, and the AWS-side evidence that
+verifies it. It closes the "live `StopInstances`" open item of §11.4 for this run
+only; it does **not** flip `STOP_RESOURCE.implemented` and does not change the
+design constraints of §3/§10.
+
+### 12.1 What was executed
+
+The SSO operator invoked document `SWS-InvokeLiveStop` (v1, Active) over SSM
+`SendCommand`. The document pins every literal (target ARN, account, region,
+executor id, ledger path, binary path, pinned approver key, operator ARN), so the
+operator supplies only `action` and `snapshotId`, and `execute` additionally
+consumes the base64 detached approval.
+
+Two prepare/sign/execute cycles were run:
+
+1. **First cycle (refused).** `snapshotId=opencode_sucks`; ticket
+   `live-stop-655cd6d46e0940efb4b9ef8711978296`; plan
+   `b076041aa88642a0b5f7689fdc25e17c`; intent
+   `83eb246d46e794e8c2bc2ce423161214421d7e264e41af1cbc4096b6b66a438c`; signing
+   deadline `2026-10-11T05:02:54Z`. The approver signed out-of-band, but `execute`
+   returned `observation_provider_unavailable` and **no dispatch occurred** (no
+   `StopInstances` call, no CloudTrail event). Root cause and fix in §12.3.
+2. **Second cycle (successful).** `snapshotId=opencode_sucks2`; ticket
+   `live-stop-923e07e6dabe4a528d2136b57e4c0bac`; plan
+   `739c99d60f79451ca343704fa790fa94`; intent
+   `b8ae91603e56b07e33ecc5ed8738bfb0b97c18b068d621a108bcfc9ad1c9cca6`; signing
+   deadline `2026-10-11T05:21:45.291564+00:00`. The approver signed the prepare
+   `signing_request.json` out-of-band and the signed artifact was passed to the
+   executor. The agent never generated, read, or stored the private key.
+
+### 12.2 Executor-side result (witness)
+
+- status: `verified_success`
+- `execution_id` / `attempt_id`: `bc18167844ac43fc9af9c39dc6990f5f`
+- `reservation_id`: `bc1d52bc607840a4b7d39d8371d20904`
+- started: `2026-10-11T04:54:00.628704Z`
+- completed: `2026-10-11T04:54:16.498784Z`
+- settle note: post-state converged to `stopped` after 2 observation(s)
+
+### 12.3 Deviation A: EC2 interface VPC endpoint (new infra)
+
+The first cycle's `observation_provider_unavailable` was a *path* failure, not an
+authorization failure. The executor subnet `subnet-062fa1b3272217900` routed only
+`local` plus the S3 gateway endpoint (`pl-63a5400a` -> `vpce-051aa710437696153`);
+the VPC's endpoints were `ssm`/`ssmmessages`/`ec2messages` (interface) and `s3`
+(gateway). There was **no path to the EC2 API**, so the observer's
+`ec2:DescribeInstances` (needed to settle the mutation) could not be reached.
+
+Fix (root, provisioning-only, this run): created interface VPC endpoint
+`vpce-09185581e1362bd8d` (`com.amazonaws.us-east-1.ec2`) in
+`subnet-062fa1b3272217900`, security group `sg-062a710cc9a4aedd4`
+(`sws-private-sg`), private DNS enabled, in VPC `vpc-048db5da1422e908b`.
+
+This is a **provisioning-only deviation**: new infrastructure not present in the
+original §1 environment. It is independently visible in the evidence, because the
+verifying CloudTrail event records `vpcEndpointId: vpce-09185581e1362bd8d`.
+
+### 12.4 Deviation B: operator SendCommand scope via Identity Center
+
+The `sws-operator` runtime role is Identity Center (SSO) managed, so
+`iam:PutRolePolicy` on it fails (`UnmodifiableEntity`). The two `SendCommand`
+statements that scope the operator to the live-stop document and the executor were
+therefore added to the `sws-operator` **permission set** via `sso-admin`:
+
+- instance: `arn:aws:sso:::instance/ssoins-72234c0f5cb237ee`
+- permission set: `arn:aws:sso:::permissionSet/ssoins-72234c0f5cb237ee/ps-72234e8a13e41f74`
+- statements added: `LiveStopSendCommandDocument`, `LiveStopSendCommandInstance`
+
+`sso-admin put-inline-policy-to-permission-set` does not auto-provision; the
+change was published with `provision-permission-set` (`AWS_ACCOUNT`,
+`527557823928`) and confirmed by reading the effective policy back.
+
+This is the second **provisioning-only deviation**: the operator scope is correct
+and least-privilege, but it was applied through the SSO permission set rather than
+an IAM inline policy, because the role is SSO-managed.
+
+### 12.5 Independent AWS-side verification (CloudTrail)
+
+- Target `i-0a881305e5bc3c133`: state `stopped`,
+  `StateTransitionReason = "User initiated (2026-10-11 04:54:01 GMT)"`.
+- Exactly one `StopInstances` event in the window `04:45:00Z`-`05:10:00Z`:
+  - `eventTime`: `2026-10-11T04:54:01Z`
+  - `eventSource`: `ec2.amazonaws.com`; `eventName`: `StopInstances`
+  - `sourceIPAddress`: `172.31.96.58` (executor private IP)
+  - principal: `arn:aws:sts::527557823928:assumed-role/sws-live-stop-mutation-role/i-0c37dfef1dd3fcea7`
+  - `requestParameters.instancesSet.items`: `[{instanceId: i-0a881305e5bc3c133}]`,
+    `force=false`
+  - resource: `AWS::EC2::Instance i-0a881305e5bc3c133`
+  - `vpcEndpointId`: `vpce-09185581e1362bd8d`
+  - `eventID`: `ffa2047f-90e3-3a00-a8d4-e404f648f950`; `requestID`:
+    `50170e77-3317-41f7-8e9c-5626d4701408`
+- Trail `sws-first-live-stop-evidence` is logging (`IsLogging: true`, no delivery
+  error) and delivering to `sws-live-stop-cloudtrail-evidence-527557823928`.
+
+Verdict: **Policy A satisfied** - exactly one `StopInstances`, by the intended
+mutation role, at the pinned target, within the window, corroborated by the
+target's own state transition.
+
+The read was performed with a separate, non-mutating administrative identity; the
+mutation role holds no CloudTrail read. Routing the retrieval through the pinned
+`sws-forensic-reader` role and `reconciliation.py` remains the steady-state path.
+
+### 12.6 Steady-state separation preserved
+
+SSO operator != mutation role != forensic reader still holds after this run. The
+mutation executed as `sws-live-stop-mutation-role` (single-target scope, no
+CloudTrail read); the operator only dispatched via SSM; the forensic read used a
+separate non-mutating identity. No root credential was used for the execution, the
+approval, or the verification.
+
+### 12.7 What this record does not do
+
+It does not flip `STOP_RESOURCE.implemented`, does not edit the reviewed
+`execution.py`/`composition.py`, and does not widen the runner's authority. The
+`vpce-09185581e1362bd8d` endpoint and the `sso-admin` permission-set edit are
+recorded above as the two deviations, both provisioning-only.

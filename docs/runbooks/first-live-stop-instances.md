@@ -292,7 +292,7 @@ attempt at botocore's sender. Arm it before dispatch and retain its record.
 Record the report *after* the run as well as during it. `violations()` returning
 an empty tuple is the negative result, and it must be written down as such —
 "no violation observed" is not the same claim as "one dispatch occurred", and
-only the first is available before the CloudTrail cross-check in section 10.2.
+only the first is available before the CloudTrail cross-check in section 12.
 
 Two facts about this evidence, established against botocore 1.43.101 rather
 than assumed, both in ADR 0010:
@@ -445,6 +445,31 @@ systems, and only the second one can contradict the first.
 Read it with the **separate read-only forensic role** (section 3). The mutating
 role must not hold CloudTrail read access, and `reconciliation.py` refuses
 evidence whose reader is the mutating principal.
+
+### What the trail does and does not do
+
+Keep these five stages distinct. Collapsing them is how a verification step turns
+into a self-fulfilling one.
+
+| # | Stage | What it establishes |
+| --- | --- | --- |
+| 1 | **Trail configuration / read-back** | The trail exists, captures management events, and its effective selector has been read back and recorded. It is *not* a `StopInstances` filter. |
+| 2 | **CloudTrail delivery** | The trail is actually logging and delivers to its S3 destination. |
+| 3 | **Post-dispatch `LookupEvents`** | The separate forensic reader queries for `eventSource = ec2.amazonaws.com` and `eventName = StopInstances` within the correlation window. This is where attribution is established. |
+| 4 | **Delivery-lag reconciliation** | Policy A's bounded wait and re-query makes a zero result *mature* rather than premature. |
+| 5 | **Final forensic conclusion** | `reconcile_dispatch` returns one of the four outcomes in 12.1. Only a settled result may carry a zero-event conclusion. |
+
+**A trail cannot be configured to filter exclusively to `StopInstances`.** The
+basic event selector has no `eventSource`/`eventNames` fields, and AWS rejects
+`eventSource` selectors combined with `eventCategory = Management` on a trail. So
+stage 1 guarantees *retention* of management events, and stage 3 performs the
+*filtering*. Do not describe the trail as though it selects `StopInstances`; that
+would overstate what was verified.
+
+This does **not** weaken the forensic requirement. The assertion "this run
+dispatched exactly one `StopInstances`" is still checked, just at read time
+instead of configuration time — which is where it can actually be checked. An empty
+`LookupEvents` result proves nothing until stage 4 has completed.
 
 ### Delivery maturity — read this before 12.1
 

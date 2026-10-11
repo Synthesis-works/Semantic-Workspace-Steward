@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sws-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Semantic Workspace Steward (SWS) - semantic governance and workspace intelligence for an individual AWS account."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -69,6 +69,9 @@ simulator = [
 
 [project.urls]
 Repository = "https://github.com/Synthesis-works/Semantic-Workspace-Steward"
+
+[project.scripts]
+sws-live-stop = "sws_live.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

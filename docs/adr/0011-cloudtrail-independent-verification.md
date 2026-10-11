@@ -161,6 +161,40 @@ like a pass.
 Correlation is by principal + session + target + window. The invocation id is
 retained as a witness-side record, not as a join key.
 
+### Attribution happens at read time, not in the trail's selector
+
+Of the attributes above, only `eventName == StopInstances` and
+`eventSource == ec2.amazonaws.com` come from the `LookupEvents` query itself, and
+they are applied by the reader. The remaining four are applied by
+`reconcile_dispatch` against the retrieved evidence.
+
+This is worth stating because the natural assumption is the opposite: that the
+trail is *configured* to select exactly the events of interest, so that a correct
+trail selector is part of the verification design. A CloudTrail trail cannot be
+configured that way. The basic `EventSelector` shape has exactly four members
+(`DataResources`, `ExcludeManagementEventSources`, `IncludeManagementEvents`,
+`ReadWriteType`) and has no `EventSource` or `EventNames` member, and AWS rejects
+`eventSource` selectors combined with `eventCategory = Equals "Management"` on a
+trail. Advanced selectors support both fields, but the exclusion form
+(`eventSource NotEquals`) is the only form available for a trail.
+
+The consequence for this ADR is narrow and worth being precise about, because
+"the trail doesn't filter" sounds like a weakness in the design:
+
+- The trail's role is **retention** — keeping management events so an independent
+  reader has something to query. It is not the filter.
+- The filtering is done by the reader's `LookupEvents` query, and the judgement by
+  `reconcile_dispatch`. Both are part of this ADR's design, and both are already
+  implemented.
+- The verification is therefore **stronger** than a selector-based design, not
+  weaker. A trail selector would narrow what is retained; it would not verify
+  anything. Verification has always been the reconciliation module's job, and it
+  does not move.
+
+The one real consequence is that a wrong or absent trail produces a clean empty
+lookup rather than a loud failure, which is why the delivery-maturity section
+exists and why a zero result is not dispositive until the query is settled.
+
 ## CloudTrail is post-dispatch evidence, not a prerequisite
 
 The ruling is explicit that this distinction must be preserved:
@@ -199,7 +233,7 @@ SETTLE / OBSERVE          15s × 40; only `stopped` is success
       ↓
 CLOUDTRAIL                what AWS received and processed
       ↓
-RECONCILE                 agreement, or an incident
+LOOKUP + RECONCILE        reader filters ec2 + StopInstances; agreement, or an incident
 ```
 
 Runbook §0.1 carries this sequence, and §12 carries the CloudTrail procedure.
@@ -257,7 +291,10 @@ prose** — prose is what the stray branch contradicted while reading as correct
 - It does not decide success. Post-state evidence does that (only `stopped`).
 - It is not required before dispatch.
 - It does not implement the CloudTrail retrieval or IAM for the forensic role;
-  those remain runbook steps pending the environment decision from M15-F.
+  those remain runbook and environment provisioning steps. The environment
+  architecture decision from M15-F is complete (decision record 0012), but the
+  forensic reader's provisioning and trust-principal choice remain open under the
+  current Q2/Q3/Q5 gates.
 
 ## Exposure
 

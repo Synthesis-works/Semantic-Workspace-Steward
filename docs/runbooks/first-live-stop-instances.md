@@ -446,6 +446,18 @@ Read it with the **separate read-only forensic role** (section 3). The mutating
 role must not hold CloudTrail read access, and `reconciliation.py` refuses
 evidence whose reader is the mutating principal.
 
+Stage 3's lookup is implemented by
+`sws_agent.cloudtrail_reader.LookupEventsEvidenceReader`, which queries through an
+injected read-only client seam and returns `CloudTrailEvidence` for
+`reconcile_dispatch` to judge. It retrieves and normalizes only; it never
+attributes, re-queries, or decides. Two properties of the API shape the module:
+`LookupEvents` accepts only **one** `LookupAttributes` entry per call, so
+`eventName = StopInstances` is applied by the query and
+`eventSource = ec2.amazonaws.com` is filtered in code (both are still the reader's
+responsibility, per ADR 0011); and a failed or unreadable lookup is returned as
+`available=False`, never as an empty event list. See
+[`docs/adr/0012-forensic-cloudtrail-reader.md`](../adr/0012-forensic-cloudtrail-reader.md).
+
 ### What the trail does and does not do
 
 Keep these five stages distinct. Collapsing them is how a verification step turns

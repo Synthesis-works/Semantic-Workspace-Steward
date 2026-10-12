@@ -57,7 +57,7 @@ onto a neighbouring state. Two boundary decisions are load-bearing:
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Iterable
+from typing import Iterable
 
 from .constants import (
     EC2_STOP_ELIGIBLE_STATES,

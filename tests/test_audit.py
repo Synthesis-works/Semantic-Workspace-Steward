@@ -15,7 +15,6 @@ from datetime import date, datetime, timezone
 
 import pytest
 
-from sws_agent.approval import InMemoryApprovalStore
 from sws_agent.audit import (
     AUDIT_SCHEMA_VERSION,
     AuditRecordKind,
@@ -652,7 +651,7 @@ def test_decide_ticket_writes_transition_record(tmp_path):
     )
     ticket = plan.ticket
     assert ticket is not None
-    decided = backend.decide_ticket(ticket.ticket_id, decision="grant", decided_by="ops")
+    backend.decide_ticket(ticket.ticket_id, decision="grant", decided_by="ops")
     tickets = [
         r
         for r in backend._audit_store.records()

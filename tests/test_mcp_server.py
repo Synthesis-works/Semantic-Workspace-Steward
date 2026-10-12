@@ -37,7 +37,7 @@ from sws_agent.constants import (
     SWSResourceType,
 )
 from sws_agent.explanation import NullExplanationProvider
-from sws_agent.mcp import MCPServer, ToolRegistry
+from sws_agent.mcp import ToolRegistry
 from sws_agent.mcp.server import (
     BUILTIN_TOOL_NAMES,
     SERVER_DESCRIPTION,

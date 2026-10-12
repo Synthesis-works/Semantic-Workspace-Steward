@@ -195,6 +195,23 @@ The one real consequence is that a wrong or absent trail produces a clean empty
 lookup rather than a loud failure, which is why the delivery-maturity section
 exists and why a zero result is not dispositive until the query is settled.
 
+### Implementation note (M16): the reader half
+
+This ADR specified both halves; M15-G implemented the judgement half only.
+`sws_agent.reconciliation` consumes `CloudTrailEvidence` as data — it does not
+query — so the reader that produces that evidence was left to a later milestone.
+M16 adds `sws_agent.cloudtrail_reader`:
+`LookupEventsEvidenceReader` performs the `LookupEvents` query through an injected
+read-only seam and returns `CloudTrailEvidence`. `reconcile_dispatch` is unchanged
+and remains the only thing that decides.
+
+The split above is enforced in the reader as designed: it applies the two
+read-time attributes (`eventName`, `eventSource`) and nothing else, returning
+every matching event without attributing by principal, session, or target; and it
+reports a failed or unreadable lookup as `available=False` rather than an empty
+result, so a failure cannot be read as an absence. The reader's design — including
+why it does not retry and does not enforce delivery maturity — is ADR 0012.
+
 ## CloudTrail is post-dispatch evidence, not a prerequisite
 
 The ruling is explicit that this distinction must be preserved:

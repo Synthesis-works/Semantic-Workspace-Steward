@@ -434,30 +434,144 @@ no autonomous execution, no audit schema change, and no M10 semantic change.**
 `PotentialAction.STOP_RESOURCE` remains `implemented=False`; M11 makes its
 read-side evidence available and its write side remains unreachable. The EC2
 client is built lazily, so inventory runs that never observe an instance never
-construct one. **M12 is next and is not implemented.**
+construct one.
+
+The later execution milestones — the durable approval and execution ledgers, the
+single-dispatch witness and preflight gate, and the M15 first-live-stop
+preflight/execution path — are recorded in ADRs
+[0003](docs/adr/0003-execution-reservation-separation.md)–[0011](docs/adr/0011-cloudtrail-independent-verification.md)
+and decision record
+[0012](docs/decisions/0012-first-live-stop-environment-decision-record.md); they
+add no execute/apply MCP tool and keep `PotentialAction.STOP_RESOURCE`
+`implemented=False`.
+
+## M16: read-only forensic CloudTrail reader (still nothing executes)
+
+M16 adds the **retrieval** half of the independent verification ADR 0011
+specified. ADR 0011 split CloudTrail verification into a reader and a judge and
+kept them apart on purpose; M15-G built the judge (`sws_agent.reconciliation`,
+which consumes `CloudTrailEvidence` as data and never queries anything), and this
+milestone adds the reader that produces it:
+`sws_agent.cloudtrail_reader.LookupEventsEvidenceReader`
+([`src/sws_agent/cloudtrail_reader.py`](src/sws_agent/cloudtrail_reader.py)).
+
+- **Retrieve, never judge.** The reader performs one logical `LookupEvents`
+  operation, drains every page, and normalizes each record into the
+  `CloudTrailStopEvent`/`CloudTrailEvidence` shapes reconciliation already
+  consumes. It does not count, attribute, or decide.
+- **The two read-time attributes.** `LookupEvents` accepts only **one**
+  `LookupAttributes` entry per call, so `eventName = StopInstances` is applied by
+  the query and `eventSource = ec2.amazonaws.com` is filtered in code. Both are
+  the reader's responsibility (ADR 0011); principal, session, target, and window
+  stay `reconcile_dispatch`'s job, which is why the reader returns *every*
+  matching event rather than one best candidate.
+- **A failure is never an absence.** A denied, throttled, or timed-out call, a
+  malformed page, an unreadable `StopInstances` record, and an unusable window all
+  become `CloudTrailEvidence(available=False, …)` — never an empty event tuple
+  that reconciliation would have to read as "probably fine". The AWS exception's
+  own message is deliberately not carried into the record: only the failure kind.
+- **No dispatch, no SDK, no self-inspection.** The reader imports no AWS SDK (the
+  transport stays behind the injected read seam), contains no mutating call, and
+  records the ARN of the principal that ran the query so `reconcile_dispatch` can
+  refuse evidence read by the mutating principal.
+
+M16 boundaries, all still true: **no mutation, no `StopInstances`, no MCP tool, no
+autonomous execution, and no change to `reconcile_dispatch`.**
+`PotentialAction.STOP_RESOURCE` remains `implemented=False`, and MCP remains at
+**nine tools**. The retrieval policy that could not live in the reader (delivery
+maturity, Policy A) stays procedural in runbook §12. The design is in
+[`docs/adr/0012-forensic-cloudtrail-reader.md`](docs/adr/0012-forensic-cloudtrail-reader.md).
 
 ## Layout
 
 ```
 src/sws_agent/
-    constants.py     canonical enums, action vocabulary, and limits
-    models.py        SWS domain models (pydantic)
-    trace.py         execution-event trace recording
-    interfaces.py    protocol boundaries between orchestration layers
-    authorization.py deterministic authorization gate
-    relationships.py deterministic-evidence-over-inference merging
-    config.py        fail-fast configuration validation
-    aws.py           real AWS client factory (M6, lazy optional boto3)
-    ec2_observation.py  read-only EC2 instance observation provider (M11)
-    audit.py         durable append-only JSONL audit ledger (M8)
-    _identity.py     UTC-aware clock + id sources (stdlib-only, hermetic)
-    mcp/             MCP boundary (real Streamable HTTP server, M4)
-    simulator/       M5 web demo: demo backend, router, client, service, app
-tests/               hermetic unit tests (no AWS credentials)
-docs/                reuse decisions and current scope
-docs/adr/            architecture decision records
-scripts/experiments/ throwaway experiments (not committed)
+    constants.py         canonical enums, action vocabulary, and limits
+    models.py            SWS domain models (pydantic)
+    canonical.py         canonical encodings and labels
+    trace.py             execution-event trace recording
+    interfaces.py        protocol boundaries between orchestration layers
+    _identity.py         UTC-aware clock + id sources (stdlib-only, hermetic)
+    config.py            fail-fast configuration validation
+
+    inventory.py         read-only resource inventory collectors
+    workspace.py         workspace snapshot collection
+    relationships.py     deterministic-evidence-over-inference merging
+    cost_explorer.py     Cost Explorer collection
+    policy.py            deterministic policy engine
+    authorization.py     deterministic authorization gate
+    workflow.py          action planning + approval-ticket planning
+    explanation.py       explanation provider seam
+    bedrock_explanation.py  optional Bedrock explanation provider
+    aws.py               real AWS client factory (M6, lazy optional boto3)
+    audit.py             durable append-only JSONL audit ledger (M8)
+
+    approval.py          in-memory approval store
+    approval_ledger.py   durable (SQLite) approval ledger
+    approval_signature.py  detached Ed25519 approval signing/verification
+    execution.py         gated execution boundary + action registry (M9/M10)
+    execution_ledger.py  durable execution reservation ledger (M13)
+    verification.py      post-state verification contracts (M9)
+    composition.py       dry-run composition root (safe rail)
+    ec2_observation.py   read-only EC2 instance observation provider (M11)
+    ec2_mutation.py      EC2 StopInstances handler (the one mutation seam)
+    ec2_mutation_client.py  the only factory that builds a mutating client
+    mutation_evidence.py single-dispatch witness at botocore's sender
+    preflight.py         deterministic pre-deployment checks (not auto-invoked)
+    reconciliation.py    CloudTrail-vs-witness judgement (M15-G, consumes evidence)
+    cloudtrail_reader.py read-only forensic CloudTrail reader (M16)
+
+    mcp/                 MCP boundary (real Streamable HTTP server, M4)
+    simulator/           M5 web demo: demo backend, router, client, service, app
+src/sws_live/            fixed live-stop entry point (prepare/execute); not MCP-reachable
+tests/                   hermetic unit tests (no AWS credentials)
+docs/                    reuse decisions and current scope
+docs/adr/                architecture decision records
+docs/runbooks/           operational procedures (incl. the first live StopInstances)
+scripts/experiments/     throwaway experiments (not committed)
 ```
+
+## Deliberately unwired safety and forensic layers
+
+SWS v1 ships safety/forensic components that are **not automatically invoked by
+the live mutation path**. This is intentional and easy to misread, so it is left
+in one place:
+
+- **Preflight** (`src/sws_agent/preflight.py`) contains deterministic
+  pre-deployment checks and contracts, but it is **not** wired as a separate
+  automatic production stage by the live executor. The live path has its own
+  execution gates and invariants (`src/sws_agent/execution.py`,
+  `src/sws_live/`); the preflight findings are exercised in tests and by the
+  runbook.
+- **CloudTrail / reconciliation** (`src/sws_agent/cloudtrail_reader.py`,
+  `src/sws_agent/reconciliation.py`) are implemented forensic verification
+  components. They are deliberately **not** automatically invoked by the live
+  mutation path in v1. They are exercised through the independent forensic
+  verification procedure in
+  [`docs/runbooks/first-live-stop-instances.md`](docs/runbooks/first-live-stop-instances.md)
+  (§12); the decision is recorded in
+  [`docs/adr/0012-forensic-cloudtrail-reader.md`](docs/adr/0012-forensic-cloudtrail-reader.md).
+
+Therefore:
+
+> **SWS v1 must not be described as automatically performing CloudTrail
+> verification after every live mutation.** A live stop's automated corroboration
+> is its post-state verification; the CloudTrail cross-check is a separate,
+> procedural runbook step.
+
+Two further intentional v1 choices in the live path:
+
+- **Two approval surfaces exist.** MCP's `decide_ticket` transitions the MCP
+  approval store; the live executor has its own grant path over the live
+  approval ledger. MCP approval is **not** sufficient to authorize live
+  execution — the live execution gate additionally requires the signature-bound
+  approval verification. The two surfaces are intentional defense-in-depth, not
+  a bypass.
+- **The live path synthesizes an `AUTHORIZED` decision.** `src/sws_live/live_stop.py`
+  constructs the `AuthorizationResult`/`PolicyDecision` it hands to the gate. The
+  detached signed approval is the authority for the live path; the synthesized
+  result is not an independent authorization bypass, and the gate still verifies
+  the signed approval.
 
 ## Development
 

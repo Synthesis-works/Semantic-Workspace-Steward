@@ -554,6 +554,14 @@ def _build_request(
     ``decision.snapshot_id`` equals the snapshot's id; and the snapshot record's
     identity equals the target ARN. The observation the gate requires is *not*
     supplied -- the coordinator obtains it from the observer, as A5 requires.
+
+    The ``AUTHORIZED`` authorization decision and ``PolicyDecision`` are
+    synthesized here **intentionally**. The live path's authority is the detached,
+    signature-bound approval -- not a fresh call to the policy engine -- and these
+    objects exist only to express the cross-references the gate re-checks. The
+    synthesized result is therefore *not* an independent authorization bypass: the
+    gate still verifies the signed approval (via ``approval_verifier``) and still
+    enforces the ticket, reservation, and post-state rules.
     """
     fields = signed.fields
     if fields.plan_id is None:

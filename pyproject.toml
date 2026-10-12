@@ -29,6 +29,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "cryptography>=42",
+    "ruff>=0.6",
 ]
 # Optional detached-approval signing (Candidate 1, Option B): the Ed25519
 # signature layer. Importing sws_agent and the approval gate never requires it
@@ -79,3 +80,15 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+# Lint gate. Scoped to the pyflakes/error subsets (unused imports and variables,
+# f-strings without placeholders, undefined names, syntax errors) rather than the
+# full default set, so the gate is about correctness and never about style churn.
+# The formatter is deliberately NOT a repo-wide gate: the existing tree predates
+# formatting and `ruff format --check` would rewrite ~88 files, which would bury
+# a real diff in whitespace.
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

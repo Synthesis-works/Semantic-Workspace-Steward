@@ -110,7 +110,7 @@ from ..workspace import (
 from . import ToolHandler, ToolRegistry
 
 SERVER_NAME: str = "sws"
-SERVER_VERSION: str = "0.1.0"
+SERVER_VERSION: str = "0.2.0"
 SERVER_DESCRIPTION: str = (
     "SWS (Semantic Workspace Steward): deterministic AWS workspace inventory, "
     "relationships, policy, cost, and explanation over MCP."

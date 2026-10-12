@@ -92,7 +92,7 @@ def test_client_connects_to_the_real_m4_server(live_mcp_url: str) -> None:
 
     info = _run_with_client(live_mcp_url, scenario)
     assert info["name"] == "sws"
-    assert info["version"] == "0.1.0"
+    assert info["version"] == "0.2.0"
 
 
 def test_tool_discovery_matches_the_real_m4_toolset(

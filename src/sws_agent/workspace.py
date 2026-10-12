@@ -64,7 +64,7 @@ from .constants import (
 )
 from .cost_explorer import CostExplorerCollector
 from .inventory import collect_all, normalize_limit
-from .models import CollectionFailure, CostEstimate, ResourceRecord, WorkspaceSnapshot
+from .models import CollectionFailure, CostEstimate, WorkspaceSnapshot
 from .trace import TraceRecorder
 
 DEFAULT_RESOURCE_TYPES: tuple[SWSResourceType, ...] = (

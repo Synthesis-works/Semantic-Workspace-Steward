@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from sws_agent.constants import MAX_TRACE_EVENTS, TraceEventType, TraceStatus
+from sws_agent.constants import TraceEventType, TraceStatus
 from sws_agent.trace import TraceCapacityError, TraceEvent, TraceRecorder
 
 

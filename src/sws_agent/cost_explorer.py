@@ -240,7 +240,7 @@ class CostExplorerCollector(_InventoryCollectorBase):
                     amount = self._amount(entry.get("Total"))
                     if amount is None:
                         self._trace_fail(
-                            f"skipped Cost Explorer entry with an unparseable total",
+                            "skipped Cost Explorer entry with an unparseable total",
                             category=CollectionFailureCategory.PARSE,
                         )
                         continue

@@ -32,6 +32,11 @@ jobs:
         # here would invite the live-AWS validation the suite is built to avoid.
         run: pip install -e ".[dev,mcp,simulator]"
 
+      - name: Lint
+        # Correctness-only subset (E4/E7/E9/F): unused imports and variables,
+        # f-strings without placeholders, undefined names. Not a formatter gate.
+        run: python -m ruff check .
+
       - name: Run hermetic tests
         # No AWS credentials are provided: this suite is fully hermetic.
         run: python -m pytest tests -q

@@ -1,6 +1,6 @@
 # M15 — Environment Decision Record
 
-**Status: DRAFT — NO LIVE MUTATION AUTHORIZED — ENVIRONMENT BLOCKED**
+**Status: POPULATED — the environment was provisioned (§11, 2026-10-10) and the first live `StopInstances` was executed and independently verified (§12, 2026-10-11). This record authorizes no further mutation: `STOP_RESOURCE.implemented` remains `False`, and each new run requires its own explicit authorization.**
 
 - HEAD at record creation: `39fac2c`; M15-A through M15-G checkpoint: `5e4215f`
 - Scope: first live `STOP_RESOURCE` execution

@@ -10,6 +10,21 @@ Two subcommands, and nothing else:
 The entry point is deliberately narrow: every environment fact is an explicit
 argument so the SSM invocation document can pin them as fixed literals rather
 than letting anything be discovered. It prints only public material.
+
+Exit codes keep three outcomes apart, because a reader at a shell prompt should
+not have to parse JSON to tell them apart:
+
+* ``0`` -- the run reached ``verified_success``.
+* ``1`` -- something ran but is not a success: an execution outcome of ``FAILED``,
+  ``PARTIALLY_VERIFIED``, ``UNKNOWN``, or ``NOT_EXECUTED``. The outcome is still
+  printed as JSON, and an unestablished outcome is never collapsed into a refusal.
+* ``2`` -- a deliberate refusal: a well-formed request the safety boundary
+  declined (a :class:`LiveStopError`, or an execution result whose outcome is
+  ``REFUSED``).
+* ``3`` -- a runtime/infrastructure failure: a durable store or the AWS SDK could
+  not run at all. Reported as ``error:`` and deliberately *not* labelled a
+  refusal, because "the system declined" and "the system could not run" call for
+  different responses.
 """
 
 from __future__ import annotations
@@ -19,7 +34,13 @@ import json
 import sys
 from pathlib import Path
 
+from sws_agent.approval import ApprovalError
+from sws_agent.audit import AuditStoreError
+from sws_agent.ec2_mutation import MutationClientConfigurationError
 from sws_agent.ec2_observation import DEFAULT_PARTITION
+from sws_agent.interfaces import ExecutionLedgerError
+from sws_agent.models import ExecutionResult
+from sws_agent.mutation_evidence import SingleDispatchViolation
 
 from sws_live.live_stop import (
     DEFAULT_DEADLINE_MINUTES,
@@ -27,6 +48,19 @@ from sws_live.live_stop import (
     execute_live_stop,
     parse_signed_approval_artifact,
     prepare_live_stop,
+)
+
+#: Failures that mean "the tool could not run", as opposed to a deliberate
+#: refusal. A durable authority being unwritable, or the SDK being absent or
+#: misconfigured, is an environment fault -- not a statement that the request
+#: was unsafe. Each base is caught rather than its many subclasses so the
+#: handling cannot drift as new store errors are added.
+_RUNTIME_ERRORS: tuple[type[BaseException], ...] = (
+    ApprovalError,
+    ExecutionLedgerError,
+    AuditStoreError,
+    MutationClientConfigurationError,
+    SingleDispatchViolation,
 )
 
 
@@ -110,7 +144,23 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     if args.out:
         Path(args.out).write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
-    return 0 if result.outcome.value == "verified_success" else 1
+    return _exit_code_for(result)
+
+
+def _exit_code_for(result: ExecutionResult) -> int:
+    """Map an execution outcome to an exit code without losing the distinction.
+
+    ``REFUSED`` is the safety boundary declining a request, so it shares the
+    refusal code (``2``). Every other non-success -- an unestablished ``UNKNOWN``
+    above all -- is ``1``: something ran and the outcome is not a verified
+    success, which is a different fact from a refusal.
+    """
+    outcome = result.outcome.value
+    if outcome == "verified_success":
+        return 0
+    if outcome == "refused":
+        return 2
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -174,8 +224,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except LiveStopError as exc:
+        # A deliberate refusal: the boundary declined a well-formed request.
         print(f"refused: {exc}", file=sys.stderr)
         return 2
+    except ModuleNotFoundError as exc:
+        if exc.name == "boto3":
+            print(
+                "error: the live stop needs boto3; install the 'aws' extra "
+                "(pip install 'sws-agent[aws]')",
+                file=sys.stderr,
+            )
+            return 3
+        raise
+    except _RUNTIME_ERRORS as exc:
+        # The tool could not run: a durable store, the SDK, or a safety invariant
+        # failed. This is not a refusal and is not reported as one.
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

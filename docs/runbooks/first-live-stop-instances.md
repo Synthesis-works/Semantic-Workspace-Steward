@@ -1,10 +1,10 @@
 # Runbook: the first live `ec2:StopInstances`
 
-- **Status**: Draft for a future milestone. **Not executable today.** `STOP_RESOURCE.implemented` is `False`, no mutating handler is registered, and MCP exposes exactly nine tools. Nothing in this document runs until a later milestone implements ADR 0006 and this runbook is executed under its own human authorization.
+- **Status**: The environment this runbook operates in exists and has been exercised: decision record 0012 records the provisioning (§11) and the **first live `StopInstances`, executed and independently verified on 2026-10-11** (§12). The machinery is implemented and inventoried — `src/sws_live/` builds the real mutation client and injects a `StopInstancesHandler`, exposed as the `sws-live-stop` console script (§0.2). It is still not reachable through MCP, which exposes exactly nine tools, and `STOP_RESOURCE.implemented` remains `False`. **This runbook authorizes nothing by itself**: each new run needs its own explicit human authorization, and no step of it may be attempted without one.
 - **Authority**: ADR 0006 (`docs/adr/0006-stop-instances-dispatch-evidence-and-settle.md`); design and the single-dispatch invariant in ADR 0010 (`docs/adr/0010-first-live-stop-preflight-design.md`); AWS-side verification and reconciliation in ADR 0011 (`docs/adr/0011-cloudtrail-independent-verification.md`)
 - **Scope**: one stop, of one purpose-created sacrificial EC2 instance, performed once, under observation, with the evidence retained.
 - **Exposure**: the mutation stays **private and local**. It is not reachable through MCP, and MCP remains at nine tools no matter what this runbook produces.
-- **Prerequisite — blocking**: `docs/decisions/0012-first-live-stop-environment-decision-record.md` must be populated and reviewed **before any step of this runbook is attempted**. That record fixes the executor environment, the mutation principal, the separate forensic reader, the CloudTrail lookup region and trail identity, and the delivery policy. This runbook does not choose any of them, and none of them can be inferred at the console. **The live run is blocked until every required field in that record is filled, every gate checkbox in it is satisfied, and the live mutation is separately and explicitly authorized.** A populated record is necessary but not sufficient: it does not authorize anything by itself.
+- **Prerequisite — blocking**: `docs/decisions/0012-first-live-stop-environment-decision-record.md` must be populated and reviewed **before any step of this runbook is attempted**. That record fixes the executor environment, the mutation principal, the separate forensic reader, the CloudTrail lookup region and trail identity, and the delivery policy. This runbook does not choose any of them, and none of them can be inferred at the console. **A live run proceeds only once every required field in that record is filled, every gate checkbox in it is satisfied, and that specific mutation is separately and explicitly authorized.** That was satisfied for the 2026-10-11 run (§12) and must be satisfied afresh for any new run: a populated record is necessary but not sufficient, and it authorizes nothing by itself.
 
 ## 0. What this runbook is for
 
@@ -48,6 +48,93 @@ RECONCILE                 §12.1   agreement, or an incident
 The witness is read *before* CloudTrail so its record exists even if the
 reconciliation step fails, but the reconciliation verdict is never derived from
 it alone.
+
+---
+
+## 0.2 The executable path (the tool)
+
+Sections 1–12 describe the *evidence discipline* for a run. The mutation itself
+is performed by one narrow entry point — `sws-live-stop`, the console script for
+`src/sws_live/cli.py` — which is not reachable through MCP and is deliberately not
+exercised by the hermetic AWS-free test suite. On the executor, install the two
+extras it needs and run the three steps below. Every value is a pinned literal;
+nothing is discovered at the console.
+
+```bash
+pip install -e ".[signature,aws]"
+```
+
+The four environment facts are the same ones recorded in sections 1–5; substitute
+them once so the commands below are literal:
+
+```bash
+LEDGER_DIR="./live-stop-ledger"
+TARGET_ARN="arn:aws:ec2:<region>:<account-id>:instance/<target-instance-id>"
+REGION="<region>"
+ACCOUNT_ID="<account-id>"
+EXECUTOR_ID="<executor-instance-id>"
+SNAPSHOT_ID="<snapshot-id>"
+```
+
+**Step 1 — prepare.** Mints a durable PENDING ticket and writes
+`signing_request.json`. **No AWS call and no credentials:**
+
+```bash
+sws-live-stop prepare \
+  --ledger-dir "$LEDGER_DIR" \
+  --target-instance-arn "$TARGET_ARN" \
+  --region "$REGION" \
+  --executor-instance-id "$EXECUTOR_ID" \
+  --account-id "$ACCOUNT_ID" \
+  --snapshot-id "$SNAPSHOT_ID" \
+  --out signing_request.json
+```
+
+**Step 2 — sign (approver's own workstation, out of band).** SWS never generates,
+reads, or stores the private key. The approver runs their own signer:
+
+```bash
+python scripts/approver/sign_live_stop_approval.py init        # once: generates the key, prints the pinned public key
+python scripts/approver/sign_live_stop_approval.py public-key  # prints signer_key_id and the raw public key
+python scripts/approver/sign_live_stop_approval.py sign \
+  --request signing_request.json \
+  --out signed_approval.json
+```
+
+**Step 3 — execute.** Ingests the signed artifact and crosses the boundary exactly
+once. Paste the approver's `signer_key_id` and the 32-byte public key as hex into
+`--pin`:
+
+```bash
+PIN_KEY_ID="<signer_key_id>"
+PIN_HEX="<public-key-hex>"
+
+sws-live-stop execute \
+  --ledger-dir "$LEDGER_DIR" \
+  --target-instance-arn "$TARGET_ARN" \
+  --region "$REGION" \
+  --executor-instance-id "$EXECUTOR_ID" \
+  --account-id "$ACCOUNT_ID" \
+  --snapshot-id "$SNAPSHOT_ID" \
+  --artifact signed_approval.json \
+  --pin "$PIN_KEY_ID=$PIN_HEX" \
+  --out result.json
+```
+
+The exit code states the outcome without anyone parsing `result.json`:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | `verified_success`. |
+| `2` | **Deliberate refusal** — a `refused:` reason on stderr. The request was well-formed and the safety boundary declined it. Section 6: this is the system working. |
+| `3` | **Runtime/infrastructure failure** — an `error:` on stderr. A durable store or the AWS SDK could not run at all. This is *not* a refusal. |
+| `1` | Something ran and is not a verified success — `FAILED`, `PARTIALLY_VERIFIED`, `UNKNOWN`, or `NOT_EXECUTED`. An `UNKNOWN` here is **not** a refusal and, per section 10, is never retried. |
+
+On the real executor these three steps are driven by the SSM document
+`SWS-InvokeLiveStop`, which pins every literal above and passes only `action` and
+`snapshotId` (plus the base64 detached approval). That document lives in the AWS
+account, not in this repository; the commands above are the same program it
+invokes, run by hand.
 
 ---
 

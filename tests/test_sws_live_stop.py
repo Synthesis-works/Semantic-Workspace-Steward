@@ -381,3 +381,49 @@ def test_cli_prepare_writes_a_signing_request(tmp_path) -> None:
 def test_cli_pin_parsing_rejects_bad_hex() -> None:
     with pytest.raises(LiveStopError):
         cli._parse_pins(["ed25519:abc=nothex"])
+
+
+def test_cli_exit_code_preserves_outcome_semantics() -> None:
+    def code(outcome: str) -> int:
+        result = SimpleNamespace(outcome=SimpleNamespace(value=outcome))
+        return cli._exit_code_for(result)
+
+    assert code("verified_success") == 0
+    assert code("refused") == 2
+    # An unestablished outcome is not a refusal: it must stay on its own code.
+    assert code("unknown") == 1
+    assert code("failed") == 1
+    assert code("partially_verified") == 1
+    assert code("not_executed") == 1
+
+
+def test_cli_reports_a_runtime_failure_as_an_error_not_a_refusal(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from sws_agent.approval import ApprovalStoreUnavailableError
+
+    def boom(_args):
+        raise ApprovalStoreUnavailableError("the approval store is unwritable")
+
+    monkeypatch.setattr(cli, "_cmd_prepare", boom)
+    rc = cli.main(
+        [
+            "prepare",
+            "--ledger-dir",
+            str(tmp_path / "ledger"),
+            "--target-instance-arn",
+            ARN,
+            "--region",
+            REGION,
+            "--executor-instance-id",
+            EXECUTOR,
+            "--account-id",
+            ACCOUNT,
+            "--snapshot-id",
+            "snap-1",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert captured.err.startswith("error:")
+    assert "refused" not in captured.err

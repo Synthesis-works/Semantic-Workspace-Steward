@@ -573,6 +573,26 @@ Two further intentional v1 choices in the live path:
   result is not an independent authorization bypass, and the gate still verifies
   the signed approval.
 
+### Runtime requirements of the live executor
+
+The live entry point (`src/sws_live/`, console script `sws-live-stop`) is the only
+path that can mutate. It needs two optional extras that the default install and
+the hermetic test suite never pull in:
+
+- **`signature`** — Ed25519 detached approval signing/verification
+  (`sws_agent.approval_signature`).
+- **`aws`** — boto3/botocore, for the mutation client and the read-only observer.
+
+```bash
+pip install -e ".[signature,aws]"
+```
+
+`sws-live-stop prepare` performs no AWS call and needs no credentials;
+`sws-live-stop execute` is the step that crosses the boundary. The full
+prepare → out-of-band sign → execute sequence is in
+[`docs/runbooks/first-live-stop-instances.md`](docs/runbooks/first-live-stop-instances.md)
+(§0.2).
+
 ## Development
 
 ```bash

@@ -17,6 +17,7 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from .agent import agent_from_env
 from .client import LiveMcpClient
 from .service import Simulator
 
@@ -54,7 +55,7 @@ def create_app(
         url = mcp_url or os.environ.get(
             "SWS_MCP_URL", "http://127.0.0.1:8765/mcp"
         )
-        simulator = Simulator(LiveMcpClient(url))
+        simulator = Simulator(LiveMcpClient(url), agent=agent_from_env())
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[dict[str, Any]]:
@@ -81,6 +82,7 @@ def create_app(
         return JSONResponse(
             {
                 "demo": True,
+                "mode": simulator.mode,
                 "service": "SWS interactive demo (M5)",
                 "mcp_endpoint": os.environ.get(
                     "SWS_MCP_URL", "http://127.0.0.1:8765/mcp"

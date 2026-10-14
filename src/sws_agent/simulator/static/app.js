@@ -8,6 +8,7 @@
   const input = document.getElementById("message-input");
   const commandsEl = document.getElementById("commands");
   const endpointEl = document.getElementById("mcp-endpoint");
+  const modeEl = document.getElementById("mode-badge");
 
   let history = [];
 
@@ -122,7 +123,8 @@
 
   function renderTrace(trace) {
     trace.forEach(function (event) {
-      const item = el("li", event.state || "", event.tool + " — " + event.summary);
+      const label = event.state === "success" ? "✓ " : event.state === "error" ? "✗ " : "";
+      const item = el("li", event.state || "", label + event.tool + " — " + event.summary);
       traceEl.appendChild(item);
     });
     traceEl.scrollTop = traceEl.scrollHeight;
@@ -139,7 +141,10 @@
       const meta = await fetch("/api/meta").then(function (r) {
         return r.json();
       });
-      endpointEl.textContent = meta.mcp_endpoint;
+      endpointEl.textContent = meta.mcp_endpoint || "";
+      if (modeEl && meta.mode) {
+        modeEl.textContent = meta.mode;
+      }
     } catch (_) {
       /* meta is non-critical in a demo */
     }

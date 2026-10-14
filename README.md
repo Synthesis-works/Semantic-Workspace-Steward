@@ -146,6 +146,15 @@ block, and trace entry is derived from the real MCP tool result returned over
 the wire; malformed or failed tool results are surfaced as explicit errors,
 never as fabricated success. No AWS access, no real costs, no actions execute.
 
+An **optional conversational layer** may interpret natural language and
+orchestrate the same read-only MCP tools in a bounded loop. When configured
+(``SWS_AGENT_MODEL``), the model sees a hard-coded catalog of read-only tools
+(excluding ``decide_ticket`` and any execution/mutation tool), proposes at most
+one tool per step, and every proposal is validated by deterministic SWS code
+before any MCP call. Tool output and metadata are treated as untrusted data;
+the model writes prose only and is never given credentials or AWS SDK access.
+Without configuration the simulator stays strictly deterministic.
+
 ### Run
 
 ```bash
@@ -161,12 +170,14 @@ This starts two local-only processes:
 | Web simulator | `http://127.0.0.1:8080` | the demo UI |
 
 Environment overrides: `SWS_MCP_HOST`/`SWS_MCP_PORT`, `SWS_SIM_HOST`/
-`SWS_SIM_PORT`, and `SWS_MCP_URL` (set it to run the web app alone against an
-already-running M4 endpoint).
+`SWS_SIM_PORT`, `SWS_MCP_URL` (run the web app alone against an
+already-running M4 endpoint), and `SWS_AGENT_MODEL` (enable the optional
+conversational orchestration layer over the same read-only MCP tools; absent
+keeps the simulator deterministic).
 
 ### Demo commands
 
-The router is deterministic (no free-form LLM): same input, same command.
+The router is deterministic (no free-form LLM) by default: same input, same command. When `SWS_AGENT_MODEL` is configured, a bounded conversational loop may interpret natural language over the same read-only MCP tool catalog (with `decide_ticket` excluded and no execution tool exposed). In all cases every MCP call is validated and executed by deterministic SWS code, facts/blocks/trace remain deterministic, and tool output is untrusted data.
 
 - `Audit my AWS workspace` — runs `audit_workspace`
 - `What resources need attention?` — evaluates and lists flagged resources

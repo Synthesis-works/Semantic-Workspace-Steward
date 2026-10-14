@@ -7,7 +7,29 @@ deterministic synthetic dataset (``sws_agent.simulator.demo``) that feeds
 real deterministic SWS core functions (policy, relationships, approval).
 """
 
+from .agent import (
+    AgentAction,
+    AgentActionError,
+    AgentError,
+    AgentToolRefused,
+    AgentUnavailableError,
+    ConversationAgent,
+    StrandsConversationAgent,
+    agent_from_env,
+)
 from .demo import DemoBackend, build_demo_snapshot
 from .service import Simulator
 
-__all__ = ["DemoBackend", "Simulator", "build_demo_snapshot"]
+__all__ = [
+    "AgentAction",
+    "AgentActionError",
+    "AgentError",
+    "AgentToolRefused",
+    "AgentUnavailableError",
+    "ConversationAgent",
+    "DemoBackend",
+    "Simulator",
+    "StrandsConversationAgent",
+    "agent_from_env",
+    "build_demo_snapshot",
+]

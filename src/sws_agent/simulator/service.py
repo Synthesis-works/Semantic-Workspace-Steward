@@ -16,6 +16,22 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from .agent import (
+    AGENT_HISTORY_LIMIT,
+    AGENT_MAX_STEPS,
+    AGENT_TOOL_RESULT_MAX_CHARS,
+    AgentActionError,
+    AgentError,
+    AgentToolRefused,
+    COLLECTION_TOOLS,
+    ConversationAgent,
+    SNAPSHOT_TOOLS,
+    build_tool_catalog,
+    parse_agent_action,
+    render_agent_prompt,
+    strip_forbidden,
+    validate_agent_tool_call,
+)
 from .client import McpClient
 from .router import Command, route
 
@@ -96,6 +112,74 @@ def _resource_name(snapshot: dict[str, Any], resource_id: str) -> str:
     return resource_id
 
 
+def _summary_block(
+    snapshot: dict[str, Any], decisions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    attention = _attention(decisions)
+    return {
+        "type": "summary",
+        "title": "Workspace audit",
+        "snapshot_id": snapshot.get("snapshot_id"),
+        "resource_count": len(snapshot.get("resources", [])),
+        "attention": [
+            {
+                "resource_id": d["resource_id"],
+                "action": d.get("recommended_action"),
+                "risk": d.get("risk_level"),
+                "rule": d.get("rule"),
+                "rationale": d.get("rationale"),
+            }
+            for d in attention
+        ],
+    }
+
+
+def _attention_rows(
+    snapshot: dict[str, Any], decisions: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for decision in _attention(decisions):
+        resource_id = decision["resource_id"]
+        rows.append(
+            {
+                "resource_id": resource_id,
+                "name": _resource_name(snapshot, resource_id),
+                "action": decision.get("recommended_action"),
+                "risk": decision.get("risk_level"),
+                "rule": decision.get("rule"),
+                "rationale": decision.get("rationale"),
+            }
+        )
+    return rows
+
+
+def _explanation_block(
+    snapshot: dict[str, Any],
+    resource_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "explanation",
+        "resource_id": resource_id,
+        "name": _resource_name(snapshot, resource_id),
+        "decision": payload.get("decision", {}),
+        "explanation": payload.get("explanation", {}),
+        "interpreted": True,
+    }
+
+
+def _observation(payload: dict[str, Any]) -> str:
+    """A bounded, forbidden-key-free view of a tool result for the model."""
+    projected = strip_forbidden(payload)
+    try:
+        text = json.dumps(projected, sort_keys=True)
+    except (TypeError, ValueError):
+        text = json.dumps({"note": "unserializable tool result"})
+    if len(text) > AGENT_TOOL_RESULT_MAX_CHARS:
+        text = text[:AGENT_TOOL_RESULT_MAX_CHARS] + "…[truncated]"
+    return text
+
+
 class Simulator:
     """Stateless-ish conversational shell over a live MCP client.
 
@@ -108,11 +192,23 @@ class Simulator:
         client: McpClient,
         *,
         demo: bool = True,
+        agent: ConversationAgent | None = None,
     ) -> None:
         self._client = client
         self.demo = demo
+        # ``agent is None`` keeps the fully deterministic, rule-based demo.
+        # When set, a bounded model-driven tool loop runs instead, but every
+        # tool call still goes through this class's own validated ``_tool``
+        # path -- the model never touches MCP (or AWS) directly.
+        self._agent = agent
         self.trace: list[dict[str, Any]] = []
         self._last_snapshot: dict[str, Any] | None = None
+        self._history: list[dict[str, Any]] = []
+
+    @property
+    def mode(self) -> str:
+        """``"llm"`` when a conversational agent is configured, else ``"deterministic"``."""
+        return "llm" if self._agent is not None else "deterministic"
 
     async def connect(self) -> None:
         await self._client.connect()
@@ -124,6 +220,15 @@ class Simulator:
         return await self._client.list_tools()
 
     async def chat(self, message: str, *, history: list[dict] | None = None) -> ChatResponse:
+        if self._agent is not None:
+            try:
+                return self._finalize(await self._chat_with_agent(message))
+            except SimulatorError as exc:
+                return self._finalize(self._error_response(str(exc)))
+            except Exception as exc:  # pragmatic demo boundary: any failure is visible
+                return self._finalize(
+                    self._error_response(f"simulator error: {exc!r}")
+                )
         command = route(message)
         try:
             if command.intent == "unknown":
@@ -281,24 +386,7 @@ class Simulator:
             f"({count_text}). {len(attention)} resource(s) need attention: "
             f"{names}."
         )
-        blocks = [
-            {
-                "type": "summary",
-                "title": "Workspace audit",
-                "snapshot_id": snapshot.get("snapshot_id"),
-                "resource_count": len(snapshot.get("resources", [])),
-                "attention": [
-                    {
-                        "resource_id": d["resource_id"],
-                        "action": d.get("recommended_action"),
-                        "risk": d.get("risk_level"),
-                        "rule": d.get("rule"),
-                        "rationale": d.get("rationale"),
-                    }
-                    for d in attention
-                ],
-            }
-        ]
+        blocks = [_summary_block(snapshot, payload.get("decisions", []))]
         return ChatResponse(reply=reply, blocks=blocks, demo=self.demo)
 
     async def _run_attention(self) -> ChatResponse:
@@ -313,22 +401,8 @@ class Simulator:
                 blocks=[{"type": "attention", "resources": []}],
                 demo=self.demo,
             )
-        rows = []
-        lines = []
-        for decision in attention:
-            resource_id = decision["resource_id"]
-            name = _resource_name(snapshot, resource_id)
-            rows.append(
-                {
-                    "resource_id": resource_id,
-                    "name": name,
-                    "action": decision.get("recommended_action"),
-                    "risk": decision.get("risk_level"),
-                    "rule": decision.get("rule"),
-                    "rationale": decision.get("rationale"),
-                }
-            )
-            lines.append(f"- {name} -> {decision.get('recommended_action')}")
+        rows = _attention_rows(snapshot, payload.get("decisions", []))
+        lines = [f"- {r['name']} -> {r['action']}" for r in rows]
         reply = (
             f"{len(attention)} resource(s) need attention:\n" + "\n".join(lines)
         )
@@ -366,16 +440,7 @@ class Simulator:
             "Meaning (interpretive demo explanation): "
             f"{explanation.get('text') or 'none'}"
         )
-        blocks = [
-            {
-                "type": "explanation",
-                "resource_id": resource_id,
-                "name": name,
-                "decision": decision,
-                "explanation": explanation,
-                "interpreted": True,
-            }
-        ]
+        blocks = [_explanation_block(snapshot, resource_id, payload)]
         return ChatResponse(reply=reply, blocks=blocks, demo=self.demo)
 
     async def _run_approvals(self) -> ChatResponse:
@@ -436,4 +501,158 @@ class Simulator:
                 {"type": "ticket_update", "ticket": ticket, "decision": decision}
             ],
             demo=self.demo,
+        )
+
+    async def _resolve_agent_arguments(
+        self, name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        resolved: dict[str, Any] = dict(arguments)
+        # Never trust a model-supplied snapshot; SWS injects the real one.
+        resolved.pop("snapshot", None)
+        if name in SNAPSHOT_TOOLS:
+            snapshot = await self._ensure_audit()
+            resolved["snapshot"] = snapshot
+        if name in COLLECTION_TOOLS:
+            resolved.setdefault("regions", [DEMO_REGION])
+        return resolved
+
+    def _blocks_for(
+        self, collected: list[tuple[str, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+        for name, payload in collected:
+            if name in ("audit_workspace", "collect_workspace"):
+                blocks.append(
+                    _summary_block(
+                        payload.get("snapshot", {}), payload.get("decisions", [])
+                    )
+                )
+            elif name == "evaluate_workspace":
+                blocks.append(
+                    {
+                        "type": "attention",
+                        "resources": _attention_rows(
+                            self._last_snapshot or {}, payload.get("decisions", [])
+                        ),
+                    }
+                )
+            elif name == "explain_resource":
+                decision = payload.get("decision", {})
+                resource_id = decision.get("resource_id") or ""
+                blocks.append(
+                    _explanation_block(
+                        self._last_snapshot or {}, resource_id, payload
+                    )
+                )
+            elif name == "list_approvals":
+                blocks.append(
+                    {"type": "tickets", "tickets": payload.get("approvals", [])}
+                )
+        return blocks
+
+    @staticmethod
+    def _agent_summary_reply(collected: list[tuple[str, dict[str, Any]]]) -> str:
+        for name, payload in collected:
+            if name in ("audit_workspace", "collect_workspace"):
+                snapshot = payload.get("snapshot", {})
+                attention = len(_attention(payload.get("decisions", [])))
+                return (
+                    f"Audit complete. Collected "
+                    f"{len(snapshot.get('resources', []))} resources; "
+                    f"{attention} need attention."
+                )
+        return "I gathered the information you asked for from the SWS tools."
+
+    def _remember(self, reply: str) -> None:
+        self._history.append({"role": "assistant", "content": reply})
+        if len(self._history) > AGENT_HISTORY_LIMIT:
+            self._history = self._history[-AGENT_HISTORY_LIMIT:]
+
+    def _agent_degraded_response(self, message: str) -> ChatResponse:
+        self.trace.append(
+            {
+                "tool": "agent",
+                "state": "error",
+                "summary": f"conversational model unavailable: {message}",
+                "payload": None,
+            }
+        )
+        reply = (
+            "The conversational model is unavailable, so I did not answer "
+            "this turn. You can still use the deterministic demo commands, "
+            'for example "Audit my AWS workspace".'
+        )
+        return ChatResponse(
+            reply=reply,
+            blocks=[{"type": "error", "message": f"model unavailable: {message}"}],
+            demo=self.demo,
+        )
+
+    def _refusal_response(self, message: str, tool_name: str | None) -> ChatResponse:
+        tool = tool_name or "agent"
+        self.trace.append(
+            {
+                "tool": tool,
+                "state": "error",
+                "summary": f"refused: {message}",
+                "payload": None,
+            }
+        )
+        reply = (
+            "I refused that request for safety: it was not a valid SWS demo "
+            f"tool call ({message}). No MCP tool was invoked."
+        )
+        return ChatResponse(
+            reply=reply,
+            blocks=[{"type": "error", "message": message}],
+            demo=self.demo,
+        )
+
+    async def _chat_with_agent(self, message: str) -> ChatResponse:
+        self._history.append({"role": "user", "content": message})
+        collected: list[tuple[str, dict[str, Any]]] = []
+        for _ in range(AGENT_MAX_STEPS):
+            catalog = build_tool_catalog()
+            prompt = render_agent_prompt(transcript=self._history, catalog=catalog)
+            try:
+                raw = self._agent.respond(prompt)  # type: ignore[operator]
+            except AgentError as exc:
+                return self._agent_degraded_response(str(exc))
+            except Exception as exc:  # pragma: no cover
+                return self._agent_degraded_response(f"model error: {exc!r}")
+            try:
+                action = parse_agent_action(raw)
+            except AgentActionError as exc:
+                return self._agent_degraded_response(str(exc))
+            if action.kind == "answer":
+                reply = (action.text or "").strip() or self._agent_summary_reply(
+                    collected
+                )
+                self._remember(reply)
+                return ChatResponse(
+                    reply=reply, blocks=self._blocks_for(collected), demo=self.demo
+                )
+            try:
+                validate_agent_tool_call(action.tool_name, action.arguments)
+            except AgentToolRefused as exc:
+                return self._refusal_response(str(exc), action.tool_name)
+            try:
+                arguments = await self._resolve_agent_arguments(
+                    action.tool_name or "", action.arguments or {}
+                )
+                payload = await self._tool(action.tool_name or "", arguments)
+            except SimulatorError as exc:
+                return self._error_response(str(exc))
+            collected.append((action.tool_name or "", payload))
+            self._history.append(
+                {
+                    "role": "tool",
+                    "name": action.tool_name or "",
+                    "content": _observation(payload),
+                }
+            )
+        reply = self._agent_summary_reply(collected)
+        self._remember(reply)
+        return ChatResponse(
+            reply=reply, blocks=self._blocks_for(collected), demo=self.demo
         )

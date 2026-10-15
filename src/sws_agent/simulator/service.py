@@ -112,6 +112,45 @@ def _resource_name(snapshot: dict[str, Any], resource_id: str) -> str:
     return resource_id
 
 
+_SNAPSHOT_ENVELOPE_KEYS = (
+    "snapshot_id",
+    "created_at",
+    "collected_at",
+    "run_id",
+    "requested_limit",
+    "regions",
+    "resource_types",
+    "counts",
+    "partial",
+    "truncated",
+    "failures",
+    "cost",
+)
+
+
+def _minimal_snapshot(
+    snapshot: dict[str, Any], resource_id: str
+) -> dict[str, Any]:
+    """A single-resource snapshot that preserves the deterministic envelope.
+
+    ``explain_resource`` resolves ONE resource; its decision depends only on
+    that resource's own fields plus the snapshot completeness flags (no rule
+    consumes other resources or relationships), so sending a single-resource
+    snapshot keeps the decision -- and its ``snapshot_id``-stamped
+    ``decision_id`` -- identical while keeping the MCP payload small. SWS
+    builds this from the real snapshot; the model never supplies it.
+    """
+    envelope: dict[str, Any] = {
+        key: snapshot[key] for key in _SNAPSHOT_ENVELOPE_KEYS if key in snapshot
+    }
+    envelope["resources"] = [
+        resource
+        for resource in snapshot.get("resources", [])
+        if resource.get("resource_id") == resource_id
+    ]
+    return envelope
+
+
 def _summary_block(
     snapshot: dict[str, Any], decisions: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -511,6 +550,9 @@ class Simulator:
         resolved.pop("snapshot", None)
         if name in SNAPSHOT_TOOLS:
             snapshot = await self._ensure_audit()
+            resource_id = resolved.get("resource_id")
+            if name == "explain_resource" and isinstance(resource_id, str):
+                snapshot = _minimal_snapshot(snapshot, resource_id)
             resolved["snapshot"] = snapshot
         if name in COLLECTION_TOOLS:
             resolved.setdefault("regions", [DEMO_REGION])

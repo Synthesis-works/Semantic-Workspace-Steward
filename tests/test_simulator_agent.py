@@ -237,6 +237,68 @@ def test_multi_turn_reference_injects_snapshot() -> None:
     assert explain_call[1]["snapshot"]["snapshot_id"] == SNAPSHOT["snapshot_id"]
 
 
+def test_explain_resource_receives_minimal_snapshot() -> None:
+    client = ScriptedMcpClient()
+    agent_fake = ScriptedAgent(
+        [
+            '{"tool": "audit_workspace", "arguments": {}}',
+            '{"tool": "explain_resource", "arguments": {"resource_id": "ghost-bucket-no-owner"}}',
+            '{"answer": "Explained."}',
+        ]
+    )
+    sim = Simulator(client, agent=agent_fake)
+    _run(sim.chat("Audit"))
+    _run(sim.chat("Why does ghost-bucket-no-owner matter?"))
+    _, args = next(c for c in client.calls if c[0] == "explain_resource")
+    snapshot = args["snapshot"]
+    # Only the referenced resource is sent, but the deterministic envelope and
+    # its snapshot_id (which stamps the decision_id) are preserved.
+    assert snapshot["snapshot_id"] == SNAPSHOT["snapshot_id"]
+    assert [r["resource_id"] for r in snapshot["resources"]] == [
+        "ghost-bucket-no-owner"
+    ]
+    assert snapshot["counts"] == SNAPSHOT["counts"]
+
+
+def test_minimal_snapshot_omits_other_resources() -> None:
+    from sws_agent.simulator.service import _minimal_snapshot
+
+    minimal = _minimal_snapshot(SNAPSHOT, "ghost-bucket-no-owner")
+    assert minimal["snapshot_id"] == SNAPSHOT["snapshot_id"]
+    assert minimal["regions"] == SNAPSHOT["regions"]
+    assert len(minimal["resources"]) == 1
+    assert minimal["resources"][0]["resource_id"] == "ghost-bucket-no-owner"
+
+
+def test_agent_max_tokens_is_bounded() -> None:
+    assert isinstance(agent.AGENT_MAX_TOKENS, int)
+    assert agent.AGENT_MAX_TOKENS > 0
+
+
+def test_last_assistant_text_extracts_partial() -> None:
+    messages = [
+        {"role": "user", "content": [{"text": "hi"}]},
+        {"role": "assistant", "content": [{"text": "par"}, {"text": "tial"}]},
+    ]
+    assert agent._last_assistant_text(messages) == "partial"
+    assert agent._last_assistant_text([]) == ""
+    assert agent._last_assistant_text([{"role": "user", "content": []}]) == ""
+
+
+def test_system_prompt_forbids_invented_commands() -> None:
+    prompt = agent.AGENT_SYSTEM_PROMPT
+    assert "Never invent a command name" in prompt
+    assert "not available" in prompt
+    assert "Deny <id>" in prompt
+
+
+def test_system_prompt_requires_grounded_language() -> None:
+    prompt = agent.AGENT_SYSTEM_PROMPT
+    assert '"clean"' in prompt
+    assert "Do NOT infer, rank, or compare risk" in prompt
+    assert "Reuse authoritative facts" in prompt
+
+
 def test_unknown_tool_is_refused_and_no_mcp_call() -> None:
     client = ScriptedMcpClient()
     agent_fake = ScriptedAgent(

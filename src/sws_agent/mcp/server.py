@@ -36,8 +36,11 @@ Design contract:
     evaluation only; the LLM is never asked to re-derive a decision.
 
 The eventual AgentCore Harness consumes this server through its remote MCP
-integration; authentication and deployment are out of scope for the transport
-layer and documented for that later step.
+integration. Deployment is documented in docs/adr/0013-*; the transport layer
+gains exactly one deployment concern here -- an opt-in caller-authentication
+gate (``sws_agent.mcp.endpoint_auth``) that is a no-op unless
+``SWS_MCP_API_KEY_SECRET_ARN`` is set. It authenticates the transport caller
+only and makes no authorization decision.
 """
 
 from __future__ import annotations
@@ -107,7 +110,7 @@ from ..workspace import (
     _failure_from_event,
     collect_workspace as _collect_workspace,
 )
-from . import ToolHandler, ToolRegistry
+from . import endpoint_auth, ToolHandler, ToolRegistry
 
 SERVER_NAME: str = "sws"
 SERVER_VERSION: str = "0.2.0"
@@ -880,9 +883,21 @@ class SwsMcpServer:
         """Dispatch one tool call through the SDK server (used by tests)."""
         return await self._sdk.call_tool(name, arguments or {}, context=None)
 
-    def streamable_http_app(self, *, path: str = "/mcp"):
-        """Build the SDK Streamable HTTP ASGI application (no port opened)."""
-        return self._sdk.streamable_http_app(streamable_http_path=path)
+    def streamable_http_app(self, *, path: str = "/mcp", host: str = "127.0.0.1"):
+        """Build the SDK Streamable HTTP ASGI application (no port opened).
+
+        ``host`` is forwarded to the SDK, whose DNS-rebinding protection is
+        auto-enabled *only* for loopback hosts. A deployed endpoint binds
+        ``0.0.0.0`` (required to accept traffic from outside the container),
+        which leaves protection off so the load balancer's ``Host`` header is
+        accepted; binding loopback behind a proxy would answer 421 instead.
+        The app is always passed through the opt-in authentication gate
+        (a no-op unless ``SWS_MCP_API_KEY_SECRET_ARN`` is set).
+        """
+        app = self._sdk.streamable_http_app(
+            streamable_http_path=path, host=host
+        )
+        return endpoint_auth.gate(app)
 
     def run(
         self,
@@ -891,13 +906,26 @@ class SwsMcpServer:
         port: int = 8000,
         path: str = "/mcp",
     ) -> None:
-        """Serve the Streamable HTTP application explicitly (blocking)."""
+        """Serve the Streamable HTTP application explicitly (blocking).
+
+        Serves the same application ``streamable_http_app()`` returns -- the
+        SDK's own runner is not used, because it would build the app
+        independently and bypass the authentication gate.
+        """
         import asyncio
 
+        import uvicorn
+
+        app = self.streamable_http_app(path=path, host=host)
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level=self._sdk.settings.log_level.lower(),
+        )
+
         async def _serve() -> None:
-            await self._sdk.run_streamable_http_async(
-                host=host, port=port, streamable_http_path=path
-            )
+            await uvicorn.Server(config).serve()
 
         asyncio.run(_serve())
 
@@ -987,6 +1015,14 @@ def main(argv: list[str] | None = None) -> int:
     is no default path and no fallback: an unusable ledger aborts startup
     rather than silently downgrading to an authority that loses approvals on
     exit.
+
+    ``SWS_MCP_API_KEY_SECRET_ARN`` (M17) opts the endpoint into caller
+    authentication. When set, the API key is read once from that Secrets
+    Manager secret at startup (the only path that imports boto3 at startup)
+    and every HTTP request must present it in ``SWS_MCP_AUTH_HEADER``
+    (default ``x-api-key``); an unreadable secret aborts startup. When absent
+    or blank the endpoint requires no credential and behaves exactly as
+    before.
     """
     parser = argparse.ArgumentParser(prog="sws-mcp-server")
     parser.add_argument("--host", default="127.0.0.1")

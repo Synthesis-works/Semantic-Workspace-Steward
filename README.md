@@ -493,6 +493,62 @@ autonomous execution, and no change to `reconcile_dispatch`.**
 maturity, Policy A) stays procedural in runbook §12. The design is in
 [`docs/adr/0012-forensic-cloudtrail-reader.md`](docs/adr/0012-forensic-cloudtrail-reader.md).
 
+## M17: AgentCore Harness integration (design, hermetic validation, deployment)
+
+M17 makes the agent runnable through **AgentCore Harness** — a managed Strands
+agent loop that consumes the existing SWS MCP server as a `remote_mcp` tool —
+**without weakening any boundary**. It is a hosting/runtime surface, not a new
+authority layer. The design and hermetic work create no AWS resource. The live
+deployment was subsequently authorized and executed (**M17, 2026-10-16**): the
+harness now invokes the authenticated HTTPS MCP endpoint end to end. Resource
+identifiers, deploy-time verification, and the one deferred limitation
+(VPC-mode AWS API egress for the inventory tools) are recorded in
+[`docs/adr/0013-agentcore-harness-integration.md`](docs/adr/0013-agentcore-harness-integration.md)
+under "Deployed realization".
+
+- `src/sws_agent/agentcore_harness.py` builds the `create-harness` request body
+  deterministically (stdlib-only; imports no AWS SDK). Its `allowedTools` is
+  **derived from** the same read-only catalog the local conversational layer uses
+  (`AGENT_TOOL_SCHEMAS`) and excludes `decide_ticket`, so there is no second
+  catalog and no state-changing tool on the loop.
+- The harness declares **exactly one** tool (the SWS MCP server over HTTPS); no
+  `shell`, `file_operations`, Browser, Code Interpreter, or Gateway tool is
+  declared. Memory is disabled and every limit (`maxIterations`, `maxTokens`,
+  `timeoutSeconds`, model `maxTokens`) is explicit.
+- Boundary note: unlike the local path, the managed loop calls MCP tools
+  directly, so the local `validate_agent_tool_call` interposition is **not**
+  present. The equivalent control is the harness allowlist **plus** the MCP
+  server's own deterministic, fail-closed `ToolError` validation. No
+  execution/mutation tool exists on the surface, so the loop can at most invoke
+  one of the eight read-only tools.
+- `tests/test_agentcore_harness.py` (hermetic, loopback uvicorn, no AWS) asserts
+  the allowlist against the **real** M4 server's advertised tools over the wire,
+  that MCP stays at nine tools, that `decide_ticket` is absent, and that the
+  module imports no SDK and contains no mutating call.
+- **Endpoint authentication is implemented, opt-in.**
+  `src/sws_agent/mcp/endpoint_auth.py` wraps the ASGI app with a constant-time
+  credential check that is a **no-op unless `SWS_MCP_API_KEY_SECRET_ARN` is
+  set** (the key is read once from that Secrets Manager secret, JSON field
+  `api_key`; the header defaults to `x-api-key`, overridable with
+  `SWS_MCP_AUTH_HEADER`). An unreadable/empty secret aborts startup (fail
+  closed). The harness sends the same secret as a `remoteMcp.headers`
+  credential-provider reference (`${arn:...}`), which the config builder
+  accepts *only* in that form — literal credentials are refused. The deployed
+  endpoint design (VPC-placed Fargate task behind an internal TLS NLB, TCP
+  health check, three-role IAM split) and its measured transport behaviour are
+  in the ADR; that design is now **deployed** (M17, 2026-10-16). Note the
+  deferred limitation: in VPC mode the MCP task has no route to the AWS APIs the
+  inventory tools read, so `audit_workspace`/`collect_workspace` and
+  `get_cost_estimates` hang until egress (interface endpoints or a NAT gateway)
+  is added; the non-AWS tools work end to end.
+  `tests/test_mcp_endpoint_auth.py` proves the gate end to end
+  against the real server on loopback.
+- The design, the resolved authentication mechanism, the remaining deploy-verify
+  items (VPC field spelling, built-in-tool exclusion, header delivery, reference
+  form, trust conditions, region availability), and the boundary proof are
+  recorded in
+  [`docs/adr/0013-agentcore-harness-integration.md`](docs/adr/0013-agentcore-harness-integration.md).
+
 ## Layout
 
 ```
@@ -532,8 +588,10 @@ src/sws_agent/
     reconciliation.py    CloudTrail-vs-witness judgement (M15-G, consumes evidence)
     cloudtrail_reader.py read-only forensic CloudTrail reader (M16)
 
-    mcp/                 MCP boundary (real Streamable HTTP server, M4)
+    mcp/                 MCP boundary (real Streamable HTTP server, M4;
+                         endpoint_auth.py = opt-in caller auth gate, M17)
     simulator/           M5 web demo: demo backend, router, client, service, app
+    agentcore_harness.py M17 AgentCore Harness config (design + hermetic tests)
 src/sws_live/            fixed live-stop entry point (prepare/execute); not MCP-reachable
 tests/                   hermetic unit tests (no AWS credentials)
 docs/                    reuse decisions and current scope

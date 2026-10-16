@@ -76,9 +76,20 @@ For every component reused from SMS, this document records:
   deterministically via `ToolError`. Explanations keep flowing only from
   `ExplanationProvider` (see above) and can never re-derive a decision.
 No action-execution tool is exposed; the approval ticket lifecycle is the
-   extent of state mutation and never touches AWS. There is no authentication
-   yet — that boundary is documented for the AgentCore Harness (which consumes
-   this server via its remote MCP integration) to solve at deployment.
+   extent of state mutation and never touches AWS. The endpoint's caller
+   authentication is opt-in and layer-local: `sws_agent.mcp.endpoint_auth`
+   requires the configured credential (read once from Secrets Manager) on every
+   request and is a no-op unless `SWS_MCP_API_KEY_SECRET_ARN` is set, so local
+   development and the hermetic suite are unchanged and the deterministic core
+   still makes every authorization decision. M17 begins the AgentCore Harness
+   step: `sws_agent.agentcore_harness` builds the Harness configuration
+   (one `remote_mcp` tool, the read-only allowlist derived from the local agent's
+   catalog, memory disabled, explicit limits) and validates it hermetically
+   against the real server's advertised tools. The live deploy is now complete
+   (M17, 2026-10-16): the harness invokes the authenticated HTTPS endpoint end to
+   end, with one deferred limitation (VPC-mode AWS API egress for the inventory
+   tools); see the "Deployed realization" section of
+   [`docs/adr/0013-agentcore-harness-integration.md`](adr/0013-agentcore-harness-integration.md).
 
 - **Web simulator (M5)** — `sws_agent.simulator` is a local, browser-based
   demo **over the real M4 MCP server**: the starlette web app drives the

@@ -1,0 +1,31 @@
+# Render Blueprint for the SWS public demo website.
+#
+# Free plan, Docker runtime. Runs the existing simulator image unchanged and is
+# synthetic-only: no AWS resources, no AWS credentials, no live AWS calls, and
+# no calls to the separate MCP deployment (mcp.sjsujalgupta.xyz).
+#
+# Deploy: create a Render Blueprint from this repo (New > Blueprint), or apply
+# via the Render dashboard. Custom domain is attached below; add the CNAME it
+# shows you at your external DNS provider for sjsujalgupta.xyz.
+#
+# Runbook: docs/runbooks/deploy-public-demo-render.md
+# Decision: docs/adr/0014-public-demo-website-hosting.md
+services:
+  - type: web
+    name: sws-public-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./deploy/web/Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    envVars:
+      # Bind the container interface. The port is taken from Render's injected
+      # PORT via sws_agent.simulator.__main__._resolve_web_port(), so no port is
+      # pinned here.
+      - key: SWS_SIM_HOST
+        value: 0.0.0.0
+    # Custom domain. Render provisions and renews the TLS certificate once the
+    # DNS record below resolves. Remove this block to add the domain manually
+    # from the dashboard instead.
+    domains:
+      - sws.sjsujalgupta.xyz

@@ -9,6 +9,9 @@ Environment overrides:
 
     SWS_MCP_HOST / SWS_MCP_PORT   (default 127.0.0.1:8765) real M4 server
     SWS_SIM_HOST / SWS_SIM_PORT   (default 127.0.0.1:8080) web simulator
+    PORT                          fallback web port when SWS_SIM_PORT is unset
+                                  (used by container hosts such as Render, which
+                                  inject PORT and expect the app to bind it)
     SWS_MCP_URL                   if set, run the web app only, pointing at an
                                   already-running M4 Streamable HTTP endpoint.
 
@@ -42,6 +45,16 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _resolve_web_port() -> int:
+    """Web port: ``SWS_SIM_PORT`` if set, else the platform ``PORT``, else 8080.
+
+    Container hosts (Render, Cloud Run, Heroku-style) inject ``PORT`` and route
+    traffic to it; honoring it lets the unchanged demo deploy without baking a
+    port into the image. Local runs are unchanged (both gates unset -> 8080).
+    """
+    return _env_int("SWS_SIM_PORT", _env_int("PORT", 8080))
+
+
 def _wait_for_port(host: str, port: int, timeout: float = 15.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -63,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     mcp_host = os.environ.get("SWS_MCP_HOST", "127.0.0.1")
     mcp_port = _env_int("SWS_MCP_PORT", 8765)
     web_host = os.environ.get("SWS_SIM_HOST", "127.0.0.1")
-    web_port = _env_int("SWS_SIM_PORT", 8080)
+    web_port = _resolve_web_port()
     external_mcp_url = os.environ.get("SWS_MCP_URL", "").strip()
 
     if external_mcp_url:

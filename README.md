@@ -549,6 +549,26 @@ under "Deployed realization".
   recorded in
   [`docs/adr/0013-agentcore-harness-integration.md`](docs/adr/0013-agentcore-harness-integration.md).
 
+## Public demo website (free external host)
+
+The **same M5 simulator** is published at `https://sws.sjsujalgupta.xyz` as a
+self-contained **synthetic** demo, hosted on a **Render free Web Service
+(Docker)** at **$0** — no AWS hosting, no AWS credits, and no change to the
+M17 MCP/AgentCore deployment (`https://mcp.sjsujalgupta.xyz`), which stays
+separate. The demo makes no AWS calls and needs no credentials.
+
+- `deploy/web/Dockerfile` builds the existing demo unchanged, installing only the
+  `simulator` extra (starlette + the MCP SDK + uvicorn + httpx; **no boto3**),
+  binding `0.0.0.0` and honoring the host-injected `PORT`.
+- `render.yaml` is the Render Blueprint (free plan, Docker, custom domain).
+- The only production code change is `_resolve_web_port` in
+  `src/sws_agent/simulator/__main__.py` (`SWS_SIM_PORT` → `PORT` → `8080`), with a
+  hermetic test in `tests/test_simulator_main.py`. Local runs are unchanged.
+- Decision and rationale (incl. why not Vercel/Cloud Run/AWS) are recorded in
+  [`docs/adr/0014-public-demo-website-hosting.md`](docs/adr/0014-public-demo-website-hosting.md);
+  the deploy steps are in
+  [`docs/runbooks/deploy-public-demo-render.md`](docs/runbooks/deploy-public-demo-render.md).
+
 ## Layout
 
 ```
@@ -593,6 +613,8 @@ src/sws_agent/
     simulator/           M5 web demo: demo backend, router, client, service, app
     agentcore_harness.py M17 AgentCore Harness config (design + hermetic tests)
 src/sws_live/            fixed live-stop entry point (prepare/execute); not MCP-reachable
+deploy/web/Dockerfile    M5 demo image for the public website (synthetic-only)
+render.yaml              Render Blueprint for the public demo website
 tests/                   hermetic unit tests (no AWS credentials)
 docs/                    reuse decisions and current scope
 docs/adr/                architecture decision records

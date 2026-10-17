@@ -77,6 +77,13 @@ sws-live-stop = "sws_live.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The simulator ships its web UI as non-Python static assets next to app.py.
+# Without this, `pip install .` (and therefore the deploy/web Docker image)
+# omits them and the app raises at startup ("Directory ... static does not
+# exist"). Declares data files only; no import or execution semantics change.
+[tool.setuptools.package-data]
+"sws_agent.simulator" = ["static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

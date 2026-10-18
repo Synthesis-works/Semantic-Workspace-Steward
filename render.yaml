@@ -1,12 +1,19 @@
 # Render Blueprint for the SWS public demo website.
 #
-# Free plan, Docker runtime. Runs the existing simulator image unchanged and is
-# synthetic-only: no AWS resources, no AWS credentials, no live AWS calls, and
-# no calls to the separate MCP deployment (mcp.sjsujalgupta.xyz).
+# Free plan, Docker runtime. Runs the existing simulator image unchanged. The
+# SWS workspace is synthetic-only (DemoBackend over an in-process MCP server):
+# no AWS resources, no AWS resource APIs, no live inventory, and no calls to
+# the separate live MCP deployment. The conversational layer is the real
+# Strands + Amazon Bedrock provider, restricted to a hard-coded read-only tool
+# catalog (no execution, no decide_ticket).
 #
 # Deploy: create a Render Blueprint from this repo (New > Blueprint), or apply
 # via the Render dashboard. Custom domain is attached below; add the CNAME it
 # shows you at your external DNS provider for sjsujalgupta.xyz.
+#
+# Credentials are NOT configured here: Render must receive the Bedrock-only
+# identity's AWS credentials as *secret* environment variables (see the
+# runbook for the exact keys and the minimal IAM policy). Do not commit them.
 #
 # Runbook: docs/runbooks/deploy-public-demo-render.md
 # Decision: docs/adr/0014-public-demo-website-hosting.md
@@ -24,6 +31,15 @@ services:
       # pinned here.
       - key: SWS_SIM_HOST
         value: 0.0.0.0
+      # Real conversational provider (Strands + Amazon Bedrock). Removing these
+      # (or setting SWS_AGENT_MODEL empty) falls back to the deterministic demo;
+      # the UI reports whichever mode is actually active.
+      - key: SWS_AGENT_PROVIDER
+        value: strands
+      - key: SWS_AGENT_MODEL
+        value: amazon.nova-lite-v1:0
+      - key: AWS_REGION
+        value: us-east-1
     # Custom domain. Render provisions and renews the TLS certificate once the
     # DNS record below resolves. Remove this block to add the domain manually
     # from the dashboard instead.

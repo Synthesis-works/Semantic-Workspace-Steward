@@ -8,6 +8,13 @@ structured JSON results become conversational replies and UI blocks.
 Every reply is derived from the MCP result actually returned; when a tool
 errors or returns a malformed payload the service says so explicitly and
 never fabricates a successful outcome.
+
+Two entry paths share this class:
+
+  * Deterministic (no agent configured): ``router`` maps a command to one tool.
+  * Conversational (agent configured): a bounded, validated model loop over the
+    read-only tool catalog. Explicit approve/deny demo commands are always
+    routed deterministically -- the model is never allowed to decide a ticket.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from typing import Any
 from .agent import (
     AGENT_HISTORY_LIMIT,
     AGENT_MAX_STEPS,
+    AGENT_PROVIDER_LABELS,
     AGENT_TOOL_RESULT_MAX_CHARS,
     AgentActionError,
     AgentError,
@@ -56,7 +64,7 @@ UNKNOWN_TEXT = (
 )
 
 DEMO_DISCLAIMER = (
-    "Synthetic demo environment: no AWS access, no real cost figures, "
+    "Synthetic demo environment: no real AWS resources, no real cost figures, "
     "no actions executed."
 )
 
@@ -249,6 +257,30 @@ class Simulator:
         """``"llm"`` when a conversational agent is configured, else ``"deterministic"``."""
         return "llm" if self._agent is not None else "deterministic"
 
+    @property
+    def provider(self) -> str | None:
+        """The conversational provider id (e.g. ``"strands"``), or ``None``."""
+        agent = self._agent
+        if agent is None:
+            return None
+        return getattr(agent, "provider", None)
+
+    @property
+    def model(self) -> str | None:
+        """The configured conversational model id, or ``None``."""
+        agent = self._agent
+        if agent is None:
+            return None
+        return getattr(agent, "model", None)
+
+    @property
+    def provider_label(self) -> str | None:
+        """Human-facing provider label for the UI, or ``None``."""
+        provider = self.provider
+        if provider is None:
+            return None
+        return AGENT_PROVIDER_LABELS.get(provider, provider)
+
     async def connect(self) -> None:
         await self._client.connect()
 
@@ -260,6 +292,20 @@ class Simulator:
 
     async def chat(self, message: str, *, history: list[dict] | None = None) -> ChatResponse:
         if self._agent is not None:
+            # Explicit approve/deny demo commands stay on the deterministic
+            # path: the conversational agent is never allowed to decide a
+            # ticket (``decide_ticket`` is absent from its catalog). Every
+            # other message goes to the bounded conversational loop.
+            explicit = route(message)
+            if explicit.intent == "decide":
+                try:
+                    return self._finalize(await self._execute(explicit))
+                except SimulatorError as exc:
+                    return self._finalize(self._error_response(str(exc)))
+                except Exception as exc:  # pragmatic demo boundary: any failure is visible
+                    return self._finalize(
+                        self._error_response(f"simulator error: {exc!r}")
+                    )
             try:
                 return self._finalize(await self._chat_with_agent(message))
             except SimulatorError as exc:

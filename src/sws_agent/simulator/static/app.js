@@ -9,6 +9,7 @@
   const commandsEl = document.getElementById("commands");
   const endpointEl = document.getElementById("mcp-endpoint");
   const modeEl = document.getElementById("mode-badge");
+  const footerEl = document.getElementById("demo-footer");
 
   let history = [];
 
@@ -143,7 +144,29 @@
       });
       endpointEl.textContent = meta.mcp_endpoint || "";
       if (modeEl && meta.mode) {
-        modeEl.textContent = meta.mode;
+        if (meta.mode === "llm") {
+          modeEl.textContent =
+            "conversational · " + (meta.provider_label || meta.provider || "llm");
+          modeEl.title = meta.model
+            ? "conversational provider: " + meta.model
+            : "conversational provider";
+          if (footerEl) {
+            footerEl.textContent =
+              "Synthetic SWS workspace: answers are produced by " +
+              (meta.provider_label || meta.provider || "an LLM") +
+              " over synthetic data. No real AWS resources, no real cost " +
+              "figures, and no actions are executed.";
+          }
+        } else {
+          modeEl.textContent = "deterministic";
+          modeEl.title = "deterministic demo (no LLM configured)";
+          if (footerEl) {
+            footerEl.textContent =
+              "Synthetic SWS workspace: answers are produced by a deterministic " +
+              "simulation with no LLM. No real AWS resources, no real cost " +
+              "figures, and no actions are executed.";
+          }
+        }
       }
     } catch (_) {
       /* meta is non-critical in a demo */

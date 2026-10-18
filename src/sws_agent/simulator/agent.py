@@ -42,6 +42,27 @@ AGENT_PROVIDER_STRANDS: str = "strands"
 AGENT_MODEL_ENV: str = "SWS_AGENT_MODEL"
 """Environment variable naming the conversational model. Absent = deterministic."""
 
+AGENT_PROVIDER_ENV: str = "SWS_AGENT_PROVIDER"
+"""Environment variable selecting the conversational provider.
+
+The only real provider is ``strands`` (Strands + Amazon Bedrock). When a model
+is configured and this is unset/blank it defaults to ``strands``; any other
+value keeps the simulator fully deterministic (and the UI says so honestly
+rather than pretending an LLM answered).
+"""
+
+AGENT_REGION_ENV: str = "AWS_REGION"
+"""Primary environment variable naming the Bedrock region."""
+
+AGENT_REGION_FALLBACK_ENV: str = "AWS_DEFAULT_REGION"
+"""Secondary region variable (the boto3 conventional fallback)."""
+
+AGENT_DEFAULT_REGION: str = "us-east-1"
+"""Region used when neither region variable is set."""
+
+AGENT_PROVIDER_LABELS: dict[str, str] = {AGENT_PROVIDER_STRANDS: "Amazon Bedrock"}
+"""Human-facing provider label for the demo UI (never claims execution)."""
+
 AGENT_MAX_STEPS: int = 6
 """Maximum tool-request/answer steps a single turn may take (bounded loop)."""
 
@@ -54,13 +75,13 @@ AGENT_TOOL_RESULT_MAX_CHARS: int = 8000
 AGENT_ANSWER_MAX_CHARS: int = 4000
 """Maximum accepted length of a model answer (defensive bound)."""
 
-AGENT_MAX_TOKENS: int = 2048
-"""Explicit generation ceiling for one model step.
+AGENT_MAX_TOKENS: int = 768
+"""Explicit generation ceiling for one model step (public-demo cost control).
 
-Asked-for directly: without this Strands omits ``maxTokens`` from the Bedrock
-Converse request, so the model's (low) default applies and a normal answer can
-end in a ``MaxTokensReachedException`` truncation. ``2048`` is ample for a
-short JSON action/answer while still bounding cost and latency.
+Asked-for directly: without this Strands omits ``maxTokens`` from the Converse
+request, so the model's default applies. ``768`` is ample for a short JSON
+action/answer (the answer is bounded separately by ``AGENT_ANSWER_MAX_CHARS``)
+while keeping one step's output cost tiny for a public, unauthenticated demo.
 """
 
 AGENT_FORBIDDEN_KEYS: frozenset[str] = frozenset({"raw", "arn", "account_id"})
@@ -430,7 +451,9 @@ def _last_assistant_text(messages: list[Any]) -> str:
     return ""
 
 
-def _model_invoker(model: str) -> Callable[[str], Any]:
+def _model_invoker(
+    model: str, *, region_name: str | None = None
+) -> Callable[[str], Any]:
     """Build a one-call, tool-less Strands invoker (lazy optional import).
 
     One ``Agent`` is reused but its history is reset before every step: SWS
@@ -451,7 +474,11 @@ def _model_invoker(model: str) -> Callable[[str], Any]:
             "'explanation' extra"
         ) from exc
     agent = Agent(
-        model=BedrockModel(model_id=model, max_tokens=AGENT_MAX_TOKENS),
+        model=BedrockModel(
+            model_id=model,
+            max_tokens=AGENT_MAX_TOKENS,
+            region_name=region_name,
+        ),
         tools=[],
         callback_handler=None,
         retry_strategy=None,
@@ -488,17 +515,21 @@ class StrandsConversationAgent:
         self,
         *,
         model: str,
+        region: str | None = None,
         invoke: Callable[[str], Any] | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty model identifier")
         self.model = model.strip()
+        self.region = region or None
         self._invoke = invoke
 
     def respond(self, prompt: str) -> str:
         invoke = self._invoke
         if invoke is None:
-            invoke = self._invoke = _model_invoker(self.model)
+            invoke = self._invoke = _model_invoker(
+                self.model, region_name=self.region
+            )
         result = invoke(prompt)
         text = "" if result is None else str(result)
         if not text.strip():
@@ -506,14 +537,35 @@ class StrandsConversationAgent:
         return text
 
 
-def agent_from_env() -> ConversationAgent | None:
-    """Resolve the conversational agent from ``SWS_AGENT_MODEL``.
+def _resolve_region() -> str:
+    """Bedrock region: ``AWS_REGION`` -> ``AWS_DEFAULT_REGION`` -> ``us-east-1``."""
+    for name in (AGENT_REGION_ENV, AGENT_REGION_FALLBACK_ENV):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            return raw
+    return AGENT_DEFAULT_REGION
 
-    Absent or blank opts into the deterministic demo (returns ``None``). A
-    non-blank value returns a ``StrandsConversationAgent``; the optional
-    package is imported lazily on first use, so this never fails at startup.
+
+def agent_from_env() -> ConversationAgent | None:
+    """Resolve the conversational agent from the environment.
+
+    Selection:
+      * ``SWS_AGENT_MODEL`` absent or blank -> ``None`` (fully deterministic).
+      * ``SWS_AGENT_PROVIDER`` unset/blank -> ``strands`` (the real Strands +
+        Amazon Bedrock provider), using the configured region.
+      * ``SWS_AGENT_PROVIDER`` set to anything other than ``strands`` -> ``None``
+        so the demo never claims an LLM it does not have.
+
+    The optional package is imported lazily on first use, so this never fails
+    at startup; a missing package surfaces as an honest degraded response.
     """
     raw = os.environ.get(AGENT_MODEL_ENV)
     if raw is None or not raw.strip():
         return None
-    return StrandsConversationAgent(model=raw.strip())
+    provider = (
+        os.environ.get(AGENT_PROVIDER_ENV, "").strip().lower()
+        or AGENT_PROVIDER_STRANDS
+    )
+    if provider != AGENT_PROVIDER_STRANDS:
+        return None
+    return StrandsConversationAgent(model=raw.strip(), region=_resolve_region())

@@ -148,12 +148,14 @@ never as fabricated success. No AWS access, no real costs, no actions execute.
 
 An **optional conversational layer** may interpret natural language and
 orchestrate the same read-only MCP tools in a bounded loop. When configured
-(``SWS_AGENT_MODEL``), the model sees a hard-coded catalog of read-only tools
-(excluding ``decide_ticket`` and any execution/mutation tool), proposes at most
-one tool per step, and every proposal is validated by deterministic SWS code
-before any MCP call. Tool output and metadata are treated as untrusted data;
-the model writes prose only and is never given credentials or AWS SDK access.
-Without configuration the simulator stays strictly deterministic.
+(``SWS_AGENT_MODEL``, with ``SWS_AGENT_PROVIDER=strands``), the model sees a
+hard-coded catalog of read-only tools (excluding ``decide_ticket`` and any
+execution/mutation tool), proposes at most one tool per step, and every proposal
+is validated by deterministic SWS code before any MCP call. Tool output and
+metadata are treated as untrusted data; the model writes prose only and is never
+given credentials or AWS SDK access. Explicit approve/deny demo commands stay on
+the deterministic path — the model can never decide a ticket. Without
+configuration the simulator stays strictly deterministic.
 
 ### Run
 
@@ -171,9 +173,17 @@ This starts two local-only processes:
 
 Environment overrides: `SWS_MCP_HOST`/`SWS_MCP_PORT`, `SWS_SIM_HOST`/
 `SWS_SIM_PORT`, `SWS_MCP_URL` (run the web app alone against an
-already-running M4 endpoint), and `SWS_AGENT_MODEL` (enable the optional
-conversational orchestration layer over the same read-only MCP tools; absent
-keeps the simulator deterministic).
+already-running M4 endpoint), and the conversational layer:
+`SWS_AGENT_PROVIDER` (`strands`; the real Strands + Amazon Bedrock provider),
+`SWS_AGENT_MODEL` (e.g. `amazon.nova-lite-v1:0`), and `AWS_REGION`
+(`AWS_DEFAULT_REGION` fallback, default `us-east-1`). With
+`SWS_AGENT_MODEL` absent the simulator is deterministic and makes no model
+calls.
+
+The public demo (`https://sws.sjsujalgupta.xyz`) runs the real provider on
+Amazon **Nova Lite** over a **synthetic** workspace: see
+`docs/adr/0015-public-demo-conversational-llm.md` and
+`docs/runbooks/deploy-public-demo-render.md`.
 
 ### Demo commands
 

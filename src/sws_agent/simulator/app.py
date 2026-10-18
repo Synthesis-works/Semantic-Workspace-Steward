@@ -82,7 +82,11 @@ def create_app(
         return JSONResponse(
             {
                 "demo": True,
+                "synthetic": True,
                 "mode": simulator.mode,
+                "provider": simulator.provider,
+                "provider_label": simulator.provider_label,
+                "model": simulator.model,
                 "service": "SWS interactive demo (M5)",
                 "mcp_endpoint": os.environ.get(
                     "SWS_MCP_URL", "http://127.0.0.1:8765/mcp"

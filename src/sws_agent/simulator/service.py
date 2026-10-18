@@ -602,6 +602,16 @@ class Simulator:
             resolved["snapshot"] = snapshot
         if name in COLLECTION_TOOLS:
             resolved.setdefault("regions", [DEMO_REGION])
+            # The conversational demo audit is deterministic and never collects
+            # cost; a model-invented, non-ISO cost_end_date can cause tool
+            # failures, so strip cost arguments entirely.
+            for key in (
+                "collect_cost",
+                "cost_end_date",
+                "cost_window_days",
+                "cost_group_by",
+            ):
+                resolved.pop(key, None)
         return resolved
 
     def _blocks_for(

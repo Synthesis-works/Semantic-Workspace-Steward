@@ -462,6 +462,12 @@ def _model_invoker(
     without bound across turns. An explicit ``max_tokens`` ceiling replaces the
     low Bedrock default, and a token-limit stop is handled by salvaging any
     partial text rather than surfacing a bare failure.
+
+    ``streaming=False`` forces Strands to call the non-streaming Bedrock
+    ``Converse`` API instead of ``ConverseStream``. This keeps the runtime to
+    the least-privilege ``bedrock:InvokeModel`` permission (no
+    ``InvokeModelWithResponseStream``) and matches the "no streaming" design
+    control; the demo re-renders a single answer anyway.
     """
     try:
         from strands import Agent
@@ -478,6 +484,7 @@ def _model_invoker(
             model_id=model,
             max_tokens=AGENT_MAX_TOKENS,
             region_name=region_name,
+            streaming=False,
         ),
         tools=[],
         callback_handler=None,

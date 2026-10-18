@@ -171,6 +171,9 @@ def test_model_invoker_configures_bedrock_with_bounds(monkeypatch) -> None:
     assert captured["bedrock"]["model_id"] == "amazon.nova-lite-v1:0"
     assert captured["bedrock"]["max_tokens"] == agent_mod.AGENT_MAX_TOKENS
     assert captured["bedrock"]["region_name"] == "us-east-1"
+    # Non-streaming: Strands must call Converse, not ConverseStream, so the
+    # runtime needs only bedrock:InvokeModel (no InvokeModelWithResponseStream).
+    assert captured["bedrock"]["streaming"] is False
     # No retries (no cost-multiplying retry storms), no tools, no streaming.
     assert captured["agent"]["tools"] == []
     assert captured["agent"]["retry_strategy"] is None

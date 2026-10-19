@@ -227,8 +227,8 @@ stopped `web-assets-api`?"), the backend runs `audit_workspace` →
 UI renders a structured card — **Resource / Observed state / Policy finding /
 Why it matters / Proposed action / Authorization / Approval ticket /
 Execution**. It opens a real `PENDING` approval ticket and still executes
-nothing (`ActionPlan.executed` is always `False`); "Execution: not executed (no
-live executor)". An **optional browser voice mode** (Web Speech API,
+nothing (`ActionPlan.executed` is always `False`); "Execution: not available
+from the public demo". An **optional browser voice mode** (Web Speech API,
 feature-detected, muted by default) adds speech input/output in Chrome/Edge and
 degrades to text elsewhere; it is an Alexa+-inspired interaction simulation, not
 an Alexa+ integration.

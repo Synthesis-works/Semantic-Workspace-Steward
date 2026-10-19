@@ -18,6 +18,28 @@ def test_unknown_input_is_deterministic_and_never_matches() -> None:
     assert first == second == Command(intent="unknown")
 
 
+def test_explain_intent_without_resource() -> None:
+    result = route("explain")
+    assert result.intent == "explain"
+    assert result.resource_id is None
+
+
+def test_briefing_intent_resolves_resource() -> None:
+    result = route("What would happen if I stopped web-assets-api?")
+    assert result.intent == "briefing"
+    assert result.resource_id == "web-assets-api"
+
+
+def test_briefing_intent_without_resource() -> None:
+    result = route("Give me a cloud action briefing")
+    assert result.intent == "briefing"
+    assert result.resource_id is None
+
+
+def test_briefing_does_not_hijack_approval_list() -> None:
+    assert route("what approvals are pending").intent == "approvals"
+
+
 def test_audit_intent() -> None:
     assert route("Audit my AWS workspace") == Command(intent="audit")
     assert route("please run an audit") == Command(intent="audit")
@@ -32,12 +54,6 @@ def test_explain_intent_resolves_demo_resource() -> None:
     result = route("Why does ghost-bucket-no-owner matter?")
     assert result.intent == "explain"
     assert result.resource_id == "ghost-bucket-no-owner"
-
-
-def test_explain_intent_without_resource() -> None:
-    result = route("explain")
-    assert result.intent == "explain"
-    assert result.resource_id is None
 
 
 def test_approvals_intent() -> None:

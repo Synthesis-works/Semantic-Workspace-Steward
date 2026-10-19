@@ -40,6 +40,22 @@ _APPROVALS_PHRASES = (
     "waiting for approval",
     "ticket list",
 )
+_BRIEFING_PHRASES = (
+    "what would happen if i stop",
+    "what would happen if we stop",
+    "what happens if i stop",
+    "what happens if we stop",
+    "what if i stop",
+    "what if we stop",
+    "should i stop",
+    "consider stopping",
+    "brief me",
+    "briefing",
+    "what approval is required",
+    "what approval would be required",
+    "what authorization",
+    "action briefing",
+)
 _ATTENTION_PHRASES = (
     "need attention",
     "needs attention",
@@ -49,6 +65,9 @@ _ATTENTION_PHRASES = (
     "problems",
     "what resources",
     "which resources",
+    "what's happening",
+    "whats happening",
+    "happening in my cloud",
     "action needed",
 )
 _HELP_PHRASES = ("help", "what can you do", "commands", "how do i", "usage")
@@ -117,6 +136,11 @@ def route(
 
     if _contains_any(text, _AUDIT_PHRASES) and "attention" not in text:
         return Command(intent="audit")
+
+    if _contains_any(text, _BRIEFING_PHRASES):
+        return Command(
+            intent="briefing", resource_id=_extract_resource(text, refs)
+        )
 
     if _contains_any(text, _EXPLAIN_PHRASES):
         return Command(

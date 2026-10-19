@@ -47,11 +47,12 @@ DEMO_REGION = "us-east-1"
 DEMO_DECIDED_BY = "demo-user"
 
 HELP_TEXT = (
-    "I'm a rule-based demo assistant driving the real SWS MCP server. "
+    "I'm a demo assistant driving the real SWS MCP server. "
     "Try:\n"
     "- \"Audit my AWS workspace\"\n"
-    "- \"What resources need attention?\"\n"
-    '- "Why does <resource> matter?" (e.g. orphan-lambda-no-owner)\n'
+    "- \"What's happening in my cloud?\"\n"
+    '- "Why does <resource> need attention?" (e.g. web-assets-api)\n'
+    '- "What would happen if I stopped web-assets-api?"\n'
     '- "Show my pending approvals"\n'
     '- "Approve this ticket <id>" / "Deny <id>"\n'
     "- \"help\""
@@ -113,11 +114,16 @@ def _attention(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _resource_name(snapshot: dict[str, Any], resource_id: str) -> str:
+def _resource(snapshot: dict[str, Any], resource_id: str) -> dict[str, Any]:
     for resource in snapshot.get("resources", []):
         if resource.get("resource_id") == resource_id:
-            return resource.get("name") or resource_id
-    return resource_id
+            return resource
+    return {}
+
+
+def _resource_name(snapshot: dict[str, Any], resource_id: str) -> str:
+    resource = _resource(snapshot, resource_id)
+    return resource.get("name") or resource_id
 
 
 _SNAPSHOT_ENVELOPE_KEYS = (
@@ -215,6 +221,62 @@ def _explanation_block(
     }
 
 
+def _briefing_block(
+    snapshot: dict[str, Any],
+    resource_id: str,
+    *,
+    plan: dict[str, Any],
+    decision: dict[str, Any] | None = None,
+    explanation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A structured Cloud Action Briefing card.
+
+    Every field is sourced from real tool output: the observation comes from
+    the snapshot, the policy finding from the deterministic decision, the
+    interpretive text from ``explain_resource``, and the authorization and
+    ticket from the real ``request_approval`` plan. Execution is always
+    reported as unavailable from the public demo.
+    """
+    resource = _resource(snapshot or {}, resource_id)
+    authorization = plan.get("authorization", {}) or {}
+    ticket = plan.get("ticket") or None
+    return {
+        "type": "briefing",
+        "resource_id": resource_id,
+        "name": resource.get("name") or resource_id,
+        "resource_type": resource.get("resource_type"),
+        "state": resource.get("state"),
+        "policy": (
+            {
+                "action": decision.get("recommended_action"),
+                "risk": decision.get("risk_level"),
+                "rule": decision.get("rule"),
+                "rationale": decision.get("rationale"),
+            }
+            if decision is not None
+            else None
+        ),
+        "explanation": explanation or None,
+        "proposed_action": plan.get("action"),
+        "authorization": {
+            "decision": authorization.get("decision"),
+            "requires_human_approval": bool(
+                authorization.get("requires_human_approval")
+            ),
+            "reason": authorization.get("reason"),
+        },
+        "ticket": (
+            {
+                "ticket_id": ticket.get("ticket_id"),
+                "status": ticket.get("status"),
+            }
+            if ticket
+            else None
+        ),
+        "execution": "not_available_in_public_demo",
+    }
+
+
 def _observation(payload: dict[str, Any]) -> str:
     """A bounded, forbidden-key-free view of a tool result for the model."""
     projected = strip_forbidden(payload)
@@ -292,12 +354,14 @@ class Simulator:
 
     async def chat(self, message: str, *, history: list[dict] | None = None) -> ChatResponse:
         if self._agent is not None:
-            # Explicit approve/deny demo commands stay on the deterministic
-            # path: the conversational agent is never allowed to decide a
-            # ticket (``decide_ticket`` is absent from its catalog). Every
-            # other message goes to the bounded conversational loop.
+            # Explicit approve/deny demo commands and the Cloud Action Briefing
+            # stay on the deterministic path: the conversational agent is never
+            # allowed to decide a ticket (``decide_ticket`` is absent from its
+            # catalog), and the briefing card must be reproducible rather than
+            # model-narrated. Every other message goes to the bounded
+            # conversational loop.
             explicit = route(message)
-            if explicit.intent == "decide":
+            if explicit.intent in ("decide", "briefing"):
                 try:
                     return self._finalize(await self._execute(explicit))
                 except SimulatorError as exc:
@@ -445,6 +509,8 @@ class Simulator:
             return await self._run_attention()
         if command.intent == "explain":
             return await self._run_explain(command)
+        if command.intent == "briefing":
+            return await self._run_briefing(command)
         if command.intent == "approvals":
             return await self._run_approvals()
         if command.intent == "decide":
@@ -527,6 +593,141 @@ class Simulator:
         )
         blocks = [_explanation_block(snapshot, resource_id, payload)]
         return ChatResponse(reply=reply, blocks=blocks, demo=self.demo)
+
+    async def _run_briefing(self, command: Command) -> ChatResponse:
+        """The Cloud Action Briefing: a deterministic multi-tool chain.
+
+        Runs the real read-only tools in sequence -- ``audit_workspace`` to
+        observe, the deterministic decision as the policy finding,
+        ``explain_resource`` for the interpretive 'why', and
+        ``request_approval`` to state exactly what authorization the action
+        would require. The last step opens a PENDING ticket when the gate
+        requires human approval; nothing is executed and no live mutation
+        path is ever reachable from this demo.
+        """
+        payload = await self._tool(
+            "audit_workspace", {"regions": [DEMO_REGION]}
+        )
+        snapshot = payload["snapshot"]
+        self._last_snapshot = snapshot
+        decisions = payload.get("decisions", [])
+
+        decision = None
+        if command.resource_id is not None:
+            decision = next(
+                (
+                    d
+                    for d in decisions
+                    if d.get("resource_id") == command.resource_id
+                ),
+                None,
+            )
+            if decision is None:
+                raise SimulatorError(
+                    f"resource '{command.resource_id}' is not part of the "
+                    "synthetic demo workspace"
+                )
+        else:
+            decision = next(
+                (
+                    d
+                    for d in decisions
+                    if d.get("recommended_action") == "stop_resource"
+                ),
+                None,
+            )
+            if decision is None:
+                return ChatResponse(
+                    reply=(
+                        "No EC2 instance in the demo workspace is currently "
+                        "eligible for a stop, so there is nothing to brief. "
+                        "Run an audit to see the whole workspace."
+                    ),
+                    blocks=[],
+                    demo=self.demo,
+                )
+
+        resource_id = decision["resource_id"]
+        name = _resource_name(snapshot, resource_id)
+
+        if decision.get("recommended_action") != "stop_resource":
+            explanation_payload = await self._tool(
+                "explain_resource",
+                {
+                    "snapshot": _minimal_snapshot(snapshot, resource_id),
+                    "resource_id": resource_id,
+                },
+            )
+            explanation = explanation_payload["explanation"]
+            reply = (
+                f"{name} is not eligible for a stop: deterministic policy "
+                f"recommends {decision.get('recommended_action')}"
+                f"{' (rule ' + decision.get('rule') + ')' if decision.get('rule') else ''}. "
+                "No stop plan is proposed. "
+                f"Why: {explanation.get('text') or 'see evidence'}"
+            )
+            return ChatResponse(
+                reply=reply,
+                blocks=[
+                    _explanation_block(snapshot, resource_id, explanation_payload)
+                ],
+                demo=self.demo,
+            )
+
+        explanation_payload = await self._tool(
+            "explain_resource",
+            {
+                "snapshot": _minimal_snapshot(snapshot, resource_id),
+                "resource_id": resource_id,
+            },
+        )
+        explanation = explanation_payload["explanation"]
+        plan_payload = await self._tool(
+            "request_approval",
+            {
+                "resource_id": resource_id,
+                "resource_type": _resource(snapshot, resource_id).get(
+                    "resource_type"
+                )
+                or "ec2_instance",
+                "action": "stop_resource",
+                "rationale": decision.get("rationale", ""),
+            },
+        )
+        plan = plan_payload["plan"]
+        authorization = plan.get("authorization", {}) or {}
+        ticket = plan.get("ticket") or {}
+        ticket_id = ticket.get("ticket_id")
+        state = _resource(snapshot, resource_id).get("state")
+        reply = (
+            f"Cloud Action Briefing for {name}:\n"
+            f"- Observed state: {state or 'unknown'}\n"
+            f"- Policy finding: {decision.get('recommended_action')} "
+            f"(rule {decision.get('rule')})\n"
+            f"- Why it matters: {explanation.get('text') or 'see evidence'}\n"
+            "- Proposed action: stop the instance\n"
+            f"- Authorization: {authorization.get('decision')} — human "
+            "approval required\n"
+            "- Execution: not available from the public demo\n"
+            + (
+                f"- Approval ticket opened: {ticket_id} (pending)\n"
+                if ticket_id
+                else ""
+            )
+        )
+        return ChatResponse(
+            reply=reply,
+            blocks=[
+                _briefing_block(
+                    snapshot,
+                    resource_id,
+                    plan=plan,
+                    decision=decision,
+                    explanation=explanation,
+                )
+            ],
+            demo=self.demo,
+        )
 
     async def _run_approvals(self) -> ChatResponse:
         payload = await self._tool("list_approvals", {})
@@ -645,6 +846,16 @@ class Simulator:
             elif name == "list_approvals":
                 blocks.append(
                     {"type": "tickets", "tickets": payload.get("approvals", [])}
+                )
+            elif name == "request_approval":
+                plan = payload.get("plan", {})
+                resource_id = plan.get("resource_id") or ""
+                blocks.append(
+                    _briefing_block(
+                        self._last_snapshot or {},
+                        resource_id,
+                        plan=plan,
+                    )
                 )
         return blocks
 

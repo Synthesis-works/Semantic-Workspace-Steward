@@ -394,4 +394,4 @@ def test_existing_suite_green_smoke() -> None:
     sim = Simulator(client)
     resp = _run(sim.chat("help"))
     assert sim.mode == "deterministic"
-    assert "rule-based demo assistant" in resp.reply
+    assert "demo assistant" in resp.reply

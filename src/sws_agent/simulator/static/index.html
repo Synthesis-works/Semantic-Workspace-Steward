@@ -23,6 +23,18 @@
     <section class="panel chat-panel">
       <div id="chat-log" class="chat-log" aria-live="polite"></div>
       <div id="commands" class="commands"></div>
+      <div id="voice-bar" class="voice-bar">
+        <button id="voice-toggle" class="chip" type="button" aria-pressed="false">
+          Voice input
+        </button>
+        <button id="mute-toggle" class="chip" type="button" aria-pressed="false">
+          Replies spoken
+        </button>
+        <span id="voice-status" class="voice-status">
+          Voice Mode — Alexa+ inspired simulation (browser speech; not an Alexa+
+          integration).
+        </span>
+      </div>
       <form id="chat-form" class="composer" autocomplete="off">
         <input
           id="message-input"

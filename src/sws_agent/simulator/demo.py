@@ -73,6 +73,13 @@ _FUNCTIONS: tuple[tuple[str, str, str | None, int, int], ...] = (
     ("healthcheck-pinger", "eu-west-1", "platform", 12_000_000, 28),
 )
 
+_INSTANCES: tuple[tuple[str, str, str | None, str], ...] = (
+    # (resource_id, region, owner_tag, lifecycle_state)
+    ("web-assets-api", "us-east-1", "web", "running"),
+    ("batch-worker-prod", "us-east-1", "data", "running"),
+    ("legacy-reporting-host", "us-east-1", "ops", "stopped"),
+)
+
 
 def _demo_resources() -> list[ResourceRecord]:
     resources: list[ResourceRecord] = []
@@ -101,12 +108,28 @@ def _demo_resources() -> list[ResourceRecord]:
                 },
             )
         )
+    for resource_id, region, owner, state in _INSTANCES:
+        # EC2 instances carry the observed lifecycle ``state`` rather than
+        # owner-tag-derived policy: the deterministic engine keys EC2 rules
+        # off ``state`` alone (running/pending -> STOP_RESOURCE, others ->
+        # LEAVE). The owner_tag here is illustrative only; EC2 is not an
+        # owner-tag-collected type, so policy never reads it as a finding.
+        resources.append(
+            ResourceRecord(
+                resource_id=resource_id,
+                resource_type=SWSResourceType.EC2_INSTANCE,
+                name=resource_id,
+                region=region,
+                owner_tag=owner,
+                state=state,
+            )
+        )
     resources.sort(key=lambda record: record.resource_id)
     return resources
 
 
 def build_demo_snapshot() -> WorkspaceSnapshot:
-    """The deterministic synthetic workspace used by the demo (20 resources)."""
+    """The deterministic synthetic workspace used by the demo (23 resources)."""
     resources = _demo_resources()
     now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
     return WorkspaceSnapshot(
@@ -119,11 +142,13 @@ def build_demo_snapshot() -> WorkspaceSnapshot:
         resource_types=[
             SWSResourceType.S3_BUCKET,
             SWSResourceType.LAMBDA_FUNCTION,
+            SWSResourceType.EC2_INSTANCE,
         ],
         resources=resources,
         counts={
             SWSResourceType.S3_BUCKET: len(_BUCKETS),
             SWSResourceType.LAMBDA_FUNCTION: len(_FUNCTIONS),
+            SWSResourceType.EC2_INSTANCE: len(_INSTANCES),
         },
         partial=False,
         truncated=False,
@@ -211,29 +236,6 @@ class DemoBackend:
             approval_store=self._approvals,
             execution_mode=ExecutionMode.SAFE,
         )
-        self._seed_tickets()
-
-    def _seed_tickets(self) -> None:
-        for ticket_id, resource_id, rationale in (
-            (
-                "demo-ticket-0001",
-                "ghost-bucket-no-owner",
-                "Unattributed bucket with zero observed object access. "
-                "Candidate for review; nothing executes in this demo.",
-            ),
-            (
-                "demo-ticket-0002",
-                "orphan-lambda-no-owner",
-                "Unattributed function with a very low invocation count. "
-                "Candidate for review; nothing executes in this demo.",
-            ),
-        ):
-            self._approvals.create_ticket(
-                resource_id,
-                PotentialAction.STOP_RESOURCE,
-                rationale=rationale,
-                ticket_id=ticket_id,
-            )
 
     # --- SwsBackend protocol ---
     def collect_workspace(

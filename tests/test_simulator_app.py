@@ -166,7 +166,7 @@ def test_chat_endpoint_returns_structured_conversation(app) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["demo"] is True
-    assert "rule-based demo assistant" in body["reply"]
+    assert "demo assistant" in body["reply"]
     assert body["blocks"] == []
     assert fake.calls == []
     assert body["trace"]

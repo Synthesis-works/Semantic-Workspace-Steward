@@ -25,6 +25,7 @@ import uvicorn
 from sws_agent.mcp.server import SwsMcpServer
 from sws_agent.simulator.client import LiveMcpClient
 from sws_agent.simulator.demo import DemoBackend
+from sws_agent.simulator.service import Simulator
 
 Scenario = Callable[[LiveMcpClient], Awaitable[Any]]
 
@@ -140,6 +141,8 @@ def test_audit_over_wire_returns_real_structured_snapshot(
     assert {decision["resource_id"] for decision in flagged} == {
         "ghost-bucket-no-owner",
         "orphan-lambda-no-owner",
+        "web-assets-api",
+        "batch-worker-prod",
     }
 
 
@@ -182,27 +185,57 @@ def test_explanation_over_wire_is_demo_and_interpreted(
 
 
 def test_approvals_and_decision_over_wire(live_mcp_url: str) -> None:
-    async def scenario(client: LiveMcpClient) -> tuple[list, str]:
+    async def scenario(client: LiveMcpClient) -> tuple[list, dict]:
         listed = await client.call_tool("list_approvals", {})
         before = _payload(listed)["approvals"]
+        planned = await client.call_tool(
+            "request_approval",
+            {
+                "resource_id": "web-assets-api",
+                "resource_type": "ec2_instance",
+                "action": "stop_resource",
+                "rationale": "wire test",
+            },
+        )
+        plan = _payload(planned)["plan"]
         decided = await client.call_tool(
             "decide_ticket",
             {
-                "ticket_id": "demo-ticket-0001",
+                "ticket_id": plan["ticket"]["ticket_id"],
                 "decision": "grant",
-                "decided_by": "demo-test",
-                "reason": "wire test",
+                "decided_by": "demo-user",
+                "reason": "demo decision",
             },
         )
-        ticket = _payload(decided)["ticket"]
-        return before, ticket["status"]
+        return before, _payload(decided)["ticket"]
 
-    before, status = _run_with_client(live_mcp_url, scenario)
-    assert [t["ticket_id"] for t in before] == [
-        "demo-ticket-0001",
-        "demo-ticket-0002",
-    ]
-    assert status == "granted"
+    before, ticket = _run_with_client(live_mcp_url, scenario)
+    # No tickets are seeded: an untouched demo has none, and the only ticket
+    # here came from the real request_approval path.
+    assert before == []
+    assert ticket["resource_id"] == "web-assets-api"
+    assert ticket["status"] == "granted"
+
+
+def test_briefing_over_wire_returns_card_and_opens_ticket(
+    live_mcp_url: str,
+) -> None:
+    async def scenario(client: LiveMcpClient) -> Any:
+        return await Simulator(client).chat(
+            "What would happen if I stopped web-assets-api?"
+        )
+
+    response = _run_with_client(live_mcp_url, scenario)
+    block = response.blocks[0]
+    assert block["type"] == "briefing"
+    assert block["name"] == "web-assets-api"
+    assert block["resource_type"] == "ec2_instance"
+    assert block["state"] == "running"
+    assert block["proposed_action"] == "stop_resource"
+    assert block["authorization"]["requires_human_approval"] is True
+    assert block["execution"] == "not_available_in_public_demo"
+    assert block["ticket"]["ticket_id"]
+    assert "Cloud Action Briefing" in response.reply
 
 
 def test_domain_failure_shows_as_wire_is_error(live_mcp_url: str) -> None:

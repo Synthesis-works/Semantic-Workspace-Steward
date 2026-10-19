@@ -166,6 +166,28 @@ body {
   cursor: pointer;
 }
 .chip:hover { color: var(--text); border-color: var(--accent); }
+.chip.active {
+  color: #06122a;
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+.chip:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.voice-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 0;
+}
+
+.voice-status {
+  color: var(--muted);
+  font-size: 12px;
+  flex: 1;
+  min-width: 180px;
+}
 
 .composer {
   display: flex;

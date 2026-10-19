@@ -27,12 +27,10 @@ INDEX_HTML = os.path.join(STATIC_DIR, "index.html")
 _DEMO_COMMANDS = {
     "commands": [
         "Audit my AWS workspace",
-        "What resources need attention?",
-        "Why does web-assets-cdn matter?",
-        "Explain orphan-lambda-no-owner",
+        "What's happening in my cloud?",
+        "Why does web-assets-api need attention?",
+        "What would happen if I stopped web-assets-api?",
         "Show my pending approvals",
-        "Approve this ticket demo-ticket-0001",
-        "Deny this ticket demo-ticket-0002",
         "help",
     ]
 }

@@ -225,6 +225,28 @@ class FakeMcpClient:
         self.calls.append((name, dict(arguments)))
         if name in ("audit_workspace", "collect_workspace"):
             payload = {"snapshot": self.SNAPSHOT, "decisions": self.DECISIONS}
+        elif name == "explain_resource":
+            payload = {
+                "explanation": {"text": "demo explanation", "provider": "demo"},
+                "decision": self.DECISIONS[0],
+            }
+        elif name == "request_approval":
+            payload = {
+                "plan": {
+                    "resource_id": arguments.get("resource_id"),
+                    "action": arguments.get("action"),
+                    "execution_mode": "safe",
+                    "authorization": {
+                        "decision": "pending_approval",
+                        "requires_human_approval": True,
+                    },
+                    "ticket": {
+                        "ticket_id": "demo-ticket-0001",
+                        "status": "pending",
+                    },
+                    "executed": False,
+                }
+            }
         elif name == "decide_ticket":
             payload = {
                 "ticket": {
@@ -311,6 +333,21 @@ def test_explicit_deny_uses_deterministic_path_not_the_model() -> None:
     assert client.calls[0][0] == "decide_ticket"
     assert client.calls[0][1]["decision"] == "deny"
     assert agent_fake.prompts == []
+
+
+def test_briefing_stays_deterministic_and_never_consults_the_model() -> None:
+    client = FakeMcpClient()
+    agent_fake = ScriptedAgent([])  # would raise if the model were consulted
+    sim = Simulator(client, agent=agent_fake)
+    resp = _run(
+        sim.chat("What would happen if I stopped ghost-bucket-no-owner?")
+    )
+    assert agent_fake.prompts == []
+    assert [name for name, _ in client.calls] == [
+        "audit_workspace",
+        "explain_resource",
+    ]
+    assert resp.blocks and resp.blocks[0]["type"] == "explanation"
 
 
 def test_free_form_text_reaches_the_agent_loop() -> None:

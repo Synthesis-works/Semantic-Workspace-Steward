@@ -247,6 +247,140 @@ def test_explanation_flow_calls_explain_resource() -> None:
     assert response.blocks[0]["interpreted"] is True
 
 
+EC2_SNAPSHOT = {
+    "snapshot_id": "demo-synthetic-workspace",
+    "regions": ["us-east-1"],
+    "counts": {"s3_bucket": 12, "lambda_function": 8, "ec2_instance": 3},
+    "resources": [
+        {
+            "resource_id": "web-assets-api",
+            "name": "web-assets-api",
+            "resource_type": "ec2_instance",
+            "region": "us-east-1",
+            "owner_tag": "web",
+            "state": "running",
+        },
+        {
+            "resource_id": "legacy-reporting-host",
+            "name": "legacy-reporting-host",
+            "resource_type": "ec2_instance",
+            "region": "us-east-1",
+            "owner_tag": "ops",
+            "state": "stopped",
+        },
+    ],
+}
+
+EC2_DECISIONS = [
+    {
+        "resource_id": "web-assets-api",
+        "recommended_action": "stop_resource",
+        "risk_level": "medium",
+        "rationale": "running instance; a stop is valid and reversible",
+        "rule": "ec2_stop_eligible",
+        "confidence": 1.0,
+    },
+    {
+        "resource_id": "legacy-reporting-host",
+        "recommended_action": "leave",
+        "risk_level": "none",
+        "rationale": "already stopped",
+        "rule": "ec2_stop_not_eligible",
+        "confidence": 1.0,
+    },
+]
+
+PLAN = {
+    "plan": {
+        "action_plan_id": "plan-0001",
+        "created_at": "2026-01-02T00:00:00Z",
+        "resource_id": "web-assets-api",
+        "action": "stop_resource",
+        "execution_mode": "safe",
+        "authorization": {
+            "decision": "pending_approval",
+            "requires_human_approval": True,
+            "reason": "STOP_RESOURCE requires human approval in safe mode",
+        },
+        "ticket": {
+            "ticket_id": "demo-ticket-0001",
+            "resource_id": "web-assets-api",
+            "action": "stop_resource",
+            "status": "pending",
+        },
+        "executed": False,
+    }
+}
+
+
+def test_briefing_renders_card_and_opens_approval_ticket() -> None:
+    client = ScriptedClient(
+        responses={
+            "audit_workspace": (
+                {"snapshot": EC2_SNAPSHOT, "decisions": EC2_DECISIONS}
+            ),
+            "explain_resource": {
+                "explanation": {"text": "running instance eligible for a stop"},
+                "decision": EC2_DECISIONS[0],
+            },
+            "request_approval": PLAN,
+        }
+    )
+    response = _run(
+        _simulator(client).chat(
+            "What would happen if I stopped web-assets-api?"
+        )
+    )
+    assert [name for name, _ in client.calls] == [
+        "audit_workspace",
+        "explain_resource",
+        "request_approval",
+    ]
+    assert "Cloud Action Briefing" in response.reply
+    block = response.blocks[0]
+    assert block["type"] == "briefing"
+    assert block["name"] == "web-assets-api"
+    assert block["resource_type"] == "ec2_instance"
+    assert block["state"] == "running"
+    assert block["policy"]["action"] == "stop_resource"
+    assert block["proposed_action"] == "stop_resource"
+    assert block["authorization"]["requires_human_approval"] is True
+    assert block["ticket"]["ticket_id"] == "demo-ticket-0001"
+    assert block["execution"] == "not_available_in_public_demo"
+
+
+def test_briefing_without_resource_picks_first_running_instance() -> None:
+    client = ScriptedClient(
+        responses={
+            "audit_workspace": (
+                {"snapshot": EC2_SNAPSHOT, "decisions": EC2_DECISIONS}
+            ),
+            "explain_resource": {
+                "explanation": {"text": "running instance eligible for a stop"},
+                "decision": EC2_DECISIONS[0],
+            },
+            "request_approval": PLAN,
+        }
+    )
+    _run(_simulator(client).chat("Give me a cloud action briefing"))
+    assert dict(client.calls[-2][1])["resource_id"] == "web-assets-api"
+
+
+def test_briefing_on_non_stop_resource_explains_without_plan() -> None:
+    client = ScriptedClient()
+    response = _run(
+        _simulator(client).chat(
+            "What would happen if I stopped ghost-bucket-no-owner?"
+        )
+    )
+    assert [name for name, _ in client.calls] == [
+        "audit_workspace",
+        "explain_resource",
+    ]
+    assert response.blocks[0]["type"] == "explanation"
+    assert "not eligible for a stop" in response.reply
+
+
 def test_approvals_flow_calls_list_approvals() -> None:
     client = ScriptedClient()
     response = _run(_simulator(client).chat("Show my pending approvals"))
@@ -294,7 +428,7 @@ def test_help_uses_no_tool_and_lists_commands() -> None:
     client = ScriptedClient()
     response = _run(_simulator(client).chat("help"))
     assert client.calls == []
-    assert "rule-based demo assistant" in response.reply
+    assert "demo assistant" in response.reply
 
 
 def test_malformed_mcp_response_is_visible_error_not_fabricated() -> None:

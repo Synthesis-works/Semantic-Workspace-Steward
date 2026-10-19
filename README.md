@@ -2,14 +2,21 @@
 
 Semantic governance and workspace intelligence for an **individual AWS account**.
 
-SWS answers questions like:
+SWS answers, **today**, the questions it can ground in collected facts:
 
-- What AWS resources are connected to my project?
-- Which resources appear unused or redundant?
-- What might be costing me money?
-- Why is this resource important?
-- What can I safely clean up?
-- What would happen if I stopped or changed this resource?
+- What AWS resources are connected to my project? — inventory plus derived
+  relationships
+- Which of them does deterministic policy flag? — the policy engine
+- Why does this resource matter? — interpretive explanation over real facts
+- What might this cost? — account-level Cost Explorer projections (projected,
+  never presented as a bill)
+- What would stopping this resource require? — the **Cloud Action Briefing**:
+  observed state, policy finding, and the human approval the action needs
+
+Still on the roadmap (documented as **planned**, not implemented): detecting
+"unused or redundant" resources beyond the two shipped rules (missing-owner-tag
+and EC2 lifecycle state), per-resource cost attribution, and any clean-up
+action. SWS never fabricates AWS usage, savings, or history.
 
 The product combines AWS resource inventory, deterministic metadata and
 metric collection, resource relationship analysis, semantic reasoning where
@@ -75,15 +82,67 @@ It does **not** yet:
 - run AWS collectors against a live account by default: real mode is opt-in
   (`SWS_AWS_REGION` / `SWS_AWS_PROFILE`) and has only ever been verified
   through guarded, read-only gitignored probes in `scripts/experiments/`
-- implement destructive actions or the full action engine
-- expose the simulator or MCP server on anything but local loopback
+- implement destructive actions in the product path or the full action engine
+  (the single live `StopInstances` seam lives in `src/sws_live/`, is not
+  MCP-reachable, and has run exactly once — see
+  ["What has actually run in a real AWS account"](#what-has-actually-run-in-a-real-aws-account))
+- reach AWS from the public demo: see
+  ["Public demo website"](#public-demo-website-free-external-host)
 
-Deliberately deferred (documented in `docs/reuse-decisions.md`): EC2/EBS
-inventory collectors, AWS authentication/deployment, per-resource cost
-attribution, and non-loopback deployment. S3 and Lambda inventory and
-account-level Cost Explorer collection are implemented (M2C); the M6 real AWS
-client factory is the production link that runs them against a live account.
-Nothing in this repository ever fabricates AWS usage, savings, or history.
+Deliberately deferred (documented in `docs/reuse-decisions.md`): account-wide
+EC2/EBS inventory collectors and per-resource cost attribution. S3 and Lambda
+inventory and account-level Cost Explorer collection are implemented (M2C), with
+the M6 real AWS client factory as the production link; a read-only EC2 instance
+observation provider exists (M11), but it is not a general EC2 inventory
+collector. Deployment is no longer loopback-only: the public demo runs on Render
+and the MCP endpoint is deployed on AgentCore (M17). Nothing in this repository
+ever fabricates AWS usage, savings, or history.
+
+## Hackathon: Alexa+ track
+
+This repository is a **Devpost submission for the AWS "Alexa+" hackathon
+track**. The connection is deliberate and narrow:
+
+- **Voice-first stewardship.** The demo ships an optional browser **voice
+  mode** (Web Speech API; speech in and spoken replies) so the workspace-
+  stewardship conversation can be driven by voice. The card renderer is built
+  so a spoken answer stays short and structured ("Observed state … policy
+  finding … approval required"). It is an **Alexa+-inspired simulation** built
+  on browser speech APIs — it is **not** an Alexa+ integration, uses no Alexa
+  branding, and vendors no Amazon voice SDK.
+- **Ambient "what's happening in my cloud?" framing.** The demo answers
+  natural-language attention and briefing questions ("what's happening in my
+  cloud?", "what would happen if I stopped this?") that mirror an ambient
+  assistant's job, over a **synthetic** workspace.
+
+Nothing in the voice path can widen autonomy: voice is an input/output surface
+over the exact same deterministic, read-only, approval-gated pipeline described
+below.
+
+## What has actually run in a real AWS account
+
+Honesty first: the shipped product path, the public demo, and the test suite are
+**fully synthetic** and make no AWS resource calls. The following are the only
+things that have touched a real AWS account, and each is narrow and recorded:
+
+- **Read-only collectors via guarded probes.** The M6 client factory
+  (`src/sws_agent/aws.py`) can run the S3/Lambda inventory and Cost Explorer
+  collectors against a live account, exercised through gitignored, read-only
+  probes in `scripts/experiments/` (`ListBuckets`, `GetBucketLocation`,
+  `GetBucketTagging`, `ListFunctions`, `ListTags`, `GetCostAndUsage`, optional
+  `sts:GetCallerIdentity`). No writes.
+- **Exactly one live mutation, run once.** A single EC2 `StopInstances` through
+  the fixed live entry point (`src/sws_live/`, console script `sws-live-stop`),
+  under the signed-approval gate, on 2026-10-11. It is documented in
+  `docs/decisions/0012-first-live-stop-environment-decision-record.md` and the
+  runbook `docs/runbooks/first-live-stop-instances.md`. That path is not
+  MCP-reachable and is not part of the demo.
+- **Amazon Bedrock for the conversational layer.** The public demo calls
+  `bedrock:InvokeModel` on `amazon.nova-lite-v1:0` (us-east-1) under a
+  Bedrock-only IAM identity. This is a model call, not a workspace read/write.
+
+No other AWS call has been made by this project, and no fabricated live evidence
+appears anywhere.
 
 ## Planned MVP AWS scope
 
@@ -130,7 +189,7 @@ Browser (vanilla HTML/JS)
         |
         v
 SWS web simulator (starlette, src/sws_agent/simulator/)   --POST /api/chat-->
-        |   deterministic rule-based router (no LLM)
+        |   deterministic router (default) OR optional bounded LLM loop
         v   official MCP Streamable HTTP client
 M4 MCP server (sws_agent.mcp.server.SwsMcpServer)  /mcp
         |
@@ -139,12 +198,15 @@ DemoBackend (synthetic inventory) -> REAL policy/relationships/approval core
 ```
 
 The simulator never reimplements SWS: it drives the actual M4 tool boundary.
-Its backend is a **synthetic, deterministic demo dataset** of 20 resources
-(12 S3 buckets + 8 Lambda functions) seeded through the real policy engine so
-that exactly two unattributed resources are flagged for review. Every reply,
-block, and trace entry is derived from the real MCP tool result returned over
-the wire; malformed or failed tool results are surfaced as explicit errors,
-never as fabricated success. No AWS access, no real costs, no actions execute.
+Its backend is a **synthetic, deterministic demo dataset** of 23 resources
+(12 S3 buckets + 8 Lambda functions + 3 EC2 instances), evaluated by the real
+policy engine: two unattributed resources are flagged for review and the two
+`running` EC2 instances are recommended for a stop (the third is `stopped`).
+No approval tickets are seeded: they are created only through the real
+`request_approval` path. Every reply, block, and trace entry is derived from
+the real MCP tool result returned over the wire; malformed or failed tool
+results are surfaced as explicit errors, never as fabricated success. No AWS
+resource access, no real costs, no actions execute.
 
 An **optional conversational layer** may interpret natural language and
 orchestrate the same read-only MCP tools in a bounded loop. When configured
@@ -154,8 +216,22 @@ execution/mutation tool), proposes at most one tool per step, and every proposal
 is validated by deterministic SWS code before any MCP call. Tool output and
 metadata are treated as untrusted data; the model writes prose only and is never
 given credentials or AWS SDK access. Explicit approve/deny demo commands stay on
-the deterministic path — the model can never decide a ticket. Without
-configuration the simulator stays strictly deterministic.
+the deterministic path — the model can never decide a ticket. Locally the layer
+is opt-in (absent `SWS_AGENT_MODEL` the simulator is strictly deterministic);
+the public demo runs it by default.
+
+The **Cloud Action Briefing** is the demo's centerpiece and stays deterministic
+in both modes: the router recognizes a briefing intent ("what would happen if I
+stopped `web-assets-api`?"), the backend runs `audit_workspace` →
+`explain_resource` → `request_approval` through the real MCP boundary, and the
+UI renders a structured card — **Resource / Observed state / Policy finding /
+Why it matters / Proposed action / Authorization / Approval ticket /
+Execution**. It opens a real `PENDING` approval ticket and still executes
+nothing (`ActionPlan.executed` is always `False`); "Execution: not executed (no
+live executor)". An **optional browser voice mode** (Web Speech API,
+feature-detected, muted by default) adds speech input/output in Chrome/Edge and
+degrades to text elsewhere; it is an Alexa+-inspired interaction simulation, not
+an Alexa+ integration.
 
 ### Run
 
@@ -190,12 +266,13 @@ Amazon **Nova Lite** over a **synthetic** workspace: see
 The router is deterministic (no free-form LLM) by default: same input, same command. When `SWS_AGENT_MODEL` is configured, a bounded conversational loop may interpret natural language over the same read-only MCP tool catalog (with `decide_ticket` excluded and no execution tool exposed). In all cases every MCP call is validated and executed by deterministic SWS code, facts/blocks/trace remain deterministic, and tool output is untrusted data.
 
 - `Audit my AWS workspace` — runs `audit_workspace`
-- `What resources need attention?` — evaluates and lists flagged resources
-- `Why does web-assets-cdn matter?` / `Explain orphan-lambda-no-owner` —
-  runs `explain_resource`
+- `What's happening in my cloud?` — evaluates and lists flagged resources
+- `Why does web-assets-api need attention?` — runs `explain_resource`
+- `What would happen if I stopped web-assets-api?` — the Cloud Action Briefing
+  (`explain_resource` + `request_approval`, opens a PENDING ticket)
 - `Show my pending approvals` — runs `list_approvals`
-- `Approve this ticket demo-ticket-0001` / `Deny demo-ticket-0002` —
-  runs `decide_ticket` (updates the in-memory store only)
+- `Approve this ticket <id>` / `Deny <ticket-id>` — runs `decide_ticket`
+  (updates the in-memory store only)
 - `help`, anything unrecognized — deterministic, no tool called
 
 ### M5 boundaries (what the demo is NOT)
@@ -204,10 +281,13 @@ The router is deterministic (no free-form LLM) by default: same input, same comm
   UI is labeled as such.
 - `decide_ticket` only transitions the in-memory ticket store. No AWS action
   is ever executed, and SWS does not expose any action-execution tool.
-- No auth, no TLS, no non-loopback exposure: designed to run on your own
-  machine.
-- The approval store is lost on restart (in-memory, seeded fresh each run).
-- The UI is a plain HTML/JS single page with no framework.
+- Locally the demo binds loopback with no auth or TLS. The public deployment
+  (below) is a separate, isolated Render service that reads no AWS account —
+  only Amazon Bedrock for the optional conversational layer.
+- The approval store is lost on restart (in-memory, no seeded tickets; every
+  ticket is created through `request_approval`).
+- The UI is a plain HTML/JS single page with no framework; voice mode uses the
+  browser Web Speech API when available.
 
 ### M5 tests
 
@@ -565,17 +645,30 @@ The **same M5 simulator** is published at `https://sws.sjsujalgupta.xyz` as a
 self-contained **synthetic** demo, hosted on a **Render free Web Service
 (Docker)** at **$0** — no AWS hosting, no AWS credits, and no change to the
 M17 MCP/AgentCore deployment (`https://mcp.sjsujalgupta.xyz`), which stays
-separate. The demo makes no AWS calls and needs no credentials.
+separate. The demo reads **no AWS account**: its workspace is fully synthetic,
+it holds no AWS resource credentials, and the only AWS API it can reach is
+**Amazon Bedrock inference** (`bedrock:InvokeModel`) for the optional
+conversational layer, under a **separate, Bedrock-only identity** — never the
+SWS execution role. The demo also carries the **Cloud Action Briefing** and the
+optional browser **voice mode** described above.
 
-- `deploy/web/Dockerfile` builds the existing demo unchanged, installing only the
-  `simulator` extra (starlette + the MCP SDK + uvicorn + httpx; **no boto3**),
-  binding `0.0.0.0` and honoring the host-injected `PORT`.
-- `render.yaml` is the Render Blueprint (free plan, Docker, custom domain).
+- `deploy/web/Dockerfile` builds the existing demo unchanged, installing the
+  `simulator` extra (starlette + the MCP SDK + uvicorn + httpx) plus the
+  `explanation` extra (`strands-agents` for the conversational provider; it pulls
+  boto3 transitively because Bedrock is an AWS API, but the demo never builds an
+  AWS resource client — the backend is `DemoBackend`). It binds `0.0.0.0` and
+  honors the host-injected `PORT`.
+- `render.yaml` is the Render Blueprint (free plan, Docker, custom domain). The
+  conversational provider and the Bedrock-only credential are injected at runtime
+  through Render environment/secrets, never built into the image.
 - The only production code change is `_resolve_web_port` in
   `src/sws_agent/simulator/__main__.py` (`SWS_SIM_PORT` → `PORT` → `8080`), with a
   hermetic test in `tests/test_simulator_main.py`. Local runs are unchanged.
-- Decision and rationale (incl. why not Vercel/Cloud Run/AWS) are recorded in
-  [`docs/adr/0014-public-demo-website-hosting.md`](docs/adr/0014-public-demo-website-hosting.md);
+- Decisions and rationale (hosting incl. why not Vercel/Cloud Run/AWS, and the
+  conversational layer) are recorded in
+  [`docs/adr/0014-public-demo-website-hosting.md`](docs/adr/0014-public-demo-website-hosting.md)
+  and
+  [`docs/adr/0015-public-demo-conversational-llm.md`](docs/adr/0015-public-demo-conversational-llm.md);
   the deploy steps are in
   [`docs/runbooks/deploy-public-demo-render.md`](docs/runbooks/deploy-public-demo-render.md).
 

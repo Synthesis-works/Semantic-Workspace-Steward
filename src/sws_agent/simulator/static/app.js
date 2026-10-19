@@ -10,8 +10,18 @@
   const endpointEl = document.getElementById("mcp-endpoint");
   const modeEl = document.getElementById("mode-badge");
   const footerEl = document.getElementById("demo-footer");
+  const voiceToggleEl = document.getElementById("voice-toggle");
+  const muteToggleEl = document.getElementById("mute-toggle");
+  const voiceStatusEl = document.getElementById("voice-status");
+
+  const VOICE_NOTE =
+    "Voice Mode \u2014 Alexa+ inspired simulation (browser speech; not an " +
+    "Alexa+ integration).";
 
   let history = [];
+  let recognition = null;
+  let voiceOn = false;
+  let muted = false;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -110,6 +120,43 @@
           el("div", "kv", block.name + " → " + d.recommended_action + (d.rule ? " (rule: " + d.rule + ")" : ""))
         );
         wrapper.appendChild(el("div", "kv", "explanation [" + e.provider + "]: " + (e.text || "")));
+        break;
+      case "briefing":
+        title.textContent = "Cloud Action Briefing";
+        wrapper.appendChild(title);
+        wrapper.appendChild(
+          el("div", "kv", "Resource: " + (block.name || block.resource_id || "-")
+            + (block.resource_type ? " (" + block.resource_type + ")" : ""))
+        );
+        wrapper.appendChild(el("div", "kv", "Observed state: " + (block.state || "unknown")));
+        if (block.policy) {
+          wrapper.appendChild(
+            el("div", "kv", "Policy finding: " + (block.policy.action || "-")
+              + (block.policy.rule ? " (rule " + block.policy.rule + ")" : ""))
+          );
+          if (block.policy.rationale) {
+            wrapper.appendChild(el("div", "kv", "Why it matters: " + block.policy.rationale));
+          }
+        } else if (block.explanation && block.explanation.text) {
+          wrapper.appendChild(el("div", "kv", "Why it matters: " + block.explanation.text));
+        }
+        wrapper.appendChild(
+          el("div", "kv", "Proposed action: " + (block.proposed_action || "none"))
+        );
+        const auth = block.authorization || {};
+        wrapper.appendChild(
+          el("div", "kv", "Authorization: " + (auth.decision || "not evaluated")
+            + (auth.requires_human_approval ? " — human approval required" : ""))
+        );
+        if (block.ticket && block.ticket.ticket_id) {
+          wrapper.appendChild(
+            el("div", "kv", "Approval ticket: " + block.ticket.ticket_id
+              + " (" + (block.ticket.status || "pending") + ")")
+          );
+        }
+        wrapper.appendChild(
+          el("div", "kv", "Execution: not available from the public demo")
+        );
         break;
       case "error":
         title.textContent = "Error";
@@ -215,6 +262,9 @@
       appendMessage("assistant", response.reply);
       (response.blocks || []).forEach(appendBlock);
       renderTrace(response.trace || []);
+      if (voiceOn && !muted) {
+        speak(response.reply);
+      }
     } catch (err) {
       appendMessage("assistant", "The demo could not reach the simulator: " + err);
     } finally {
@@ -222,6 +272,166 @@
       input.focus();
     }
   }
+
+  // --- Voice Mode: Alexa+ inspired simulation (browser-native only) ---------
+  // Input uses the browser's SpeechRecognition; output uses speechSynthesis.
+  // Nothing here is Alexa: it is a simulated voice experience, feature-detected
+  // with a graceful text-only fallback.
+
+  function speechRecognitionCtor() {
+    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  }
+
+  function setVoiceStatus(text) {
+    if (voiceStatusEl) voiceStatusEl.textContent = text;
+  }
+
+  function speak(text) {
+    if (!window.speechSynthesis || !text) return;
+    // Speak only the first paragraph so the demo disclaimer is not repeated.
+    const spoken = String(text).split("\n\n")[0];
+    if (!spoken) return;
+    try {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(spoken);
+      const voices = window.speechSynthesis.getVoices() || [];
+      const english = voices.filter(function (v) {
+        return /^en([-_]|$)/i.test(v.lang || "");
+      });
+      if (english.length) utterance.voice = english[0];
+      utterance.rate = 1.0;
+      window.speechSynthesis.speak(utterance);
+    } catch (_) {
+      /* speech output is best-effort */
+    }
+  }
+
+  function stopSpeaking() {
+    try {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function updateVoiceControls() {
+    if (voiceToggleEl) {
+      voiceToggleEl.classList.toggle("active", voiceOn);
+      voiceToggleEl.setAttribute("aria-pressed", voiceOn ? "true" : "false");
+      voiceToggleEl.textContent = voiceOn ? "Listening \u2014 tap to stop" : "Voice input";
+    }
+    if (muteToggleEl) {
+      muteToggleEl.classList.toggle("active", muted);
+      muteToggleEl.setAttribute("aria-pressed", muted ? "true" : "false");
+      muteToggleEl.textContent = muted ? "Replies muted" : "Replies spoken";
+    }
+  }
+
+  function setVoiceOn(on) {
+    if (on && !recognition) {
+      setVoiceStatus(
+        "Voice input is not supported in this browser (try Chrome or Edge); " +
+          "text input still works. " +
+          VOICE_NOTE
+      );
+      return;
+    }
+    voiceOn = on;
+    if (on) {
+      try {
+        recognition.start();
+      } catch (_) {
+        /* already starting */
+      }
+      setVoiceStatus("Listening\u2026 speak your request. " + VOICE_NOTE);
+    } else {
+      try {
+        recognition.stop();
+      } catch (_) {
+        /* already stopped */
+      }
+      stopSpeaking();
+      setVoiceStatus(VOICE_NOTE);
+    }
+    updateVoiceControls();
+  }
+
+  function setMuted(value) {
+    muted = value;
+    if (muted) stopSpeaking();
+    updateVoiceControls();
+  }
+
+  function initVoice() {
+    const Ctor = speechRecognitionCtor();
+    if (!Ctor) {
+      if (voiceToggleEl) {
+        voiceToggleEl.disabled = true;
+        voiceToggleEl.textContent = "Voice unavailable";
+        voiceToggleEl.title = "Speech recognition is not supported here.";
+      }
+      setVoiceStatus(
+        "Voice Mode \u2014 Alexa+ inspired simulation. Voice input is not " +
+          "supported in this browser (try Chrome or Edge); text input works."
+      );
+      updateVoiceControls();
+      return;
+    }
+    recognition = new Ctor();
+    recognition.lang = "en-US";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = function (event) {
+      let interim = "";
+      let finals = "";
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        const result = event.results[i];
+        const transcript = result[0] ? result[0].transcript : "";
+        if (result.isFinal) finals += transcript;
+        else interim += transcript;
+      }
+      if (interim) input.value = interim.trim();
+      const spoken = finals.trim();
+      if (spoken) {
+        input.value = "";
+        send(spoken);
+      }
+    };
+    recognition.onerror = function (event) {
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        setVoiceOn(false);
+        setVoiceStatus(
+          "Microphone permission was denied \u2014 you can still type. " +
+            VOICE_NOTE
+        );
+      }
+    };
+    recognition.onend = function () {
+      // Browsers stop after a pause; keep listening while toggled on.
+      if (voiceOn) {
+        try {
+          recognition.start();
+        } catch (_) {
+          /* restart is best-effort */
+        }
+      }
+    };
+    updateVoiceControls();
+    setVoiceStatus(VOICE_NOTE);
+  }
+
+  if (voiceToggleEl) {
+    voiceToggleEl.addEventListener("click", function () {
+      setVoiceOn(!voiceOn);
+    });
+  }
+  if (muteToggleEl) {
+    muteToggleEl.addEventListener("click", function () {
+      setMuted(!muted);
+    });
+  }
+  initVoice();
+  setMuted(false);
 
   form.addEventListener("submit", function (event) {
     event.preventDefault();

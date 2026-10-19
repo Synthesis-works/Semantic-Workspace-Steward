@@ -22,6 +22,10 @@
   let recognition = null;
   let voiceOn = false;
   let muted = false;
+  // TTS owns the microphone while it speaks: recognition is stopped before
+  // speech starts and transcripts arriving during that window are ignored, so
+  // the assistant never transcribes its own reply back into the composer.
+  let ttsActive = false;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -286,11 +290,43 @@
     if (voiceStatusEl) voiceStatusEl.textContent = text;
   }
 
+  function stopRecognition() {
+    if (!recognition) return;
+    try {
+      recognition.stop();
+    } catch (_) {
+      /* already stopped */
+    }
+  }
+
+  function startRecognition() {
+    // Never listen while TTS owns the microphone, and never begin listening
+    // unless the user has voice input enabled.
+    if (!recognition || !voiceOn || ttsActive) return;
+    try {
+      recognition.start();
+    } catch (_) {
+      /* already starting */
+    }
+  }
+
+  function finishSpeaking() {
+    // Idempotent: safe to call from onend, onerror, cancel, or stopSpeaking.
+    if (!ttsActive) return;
+    ttsActive = false;
+    // Resume only if the user still has voice input enabled.
+    startRecognition();
+  }
+
   function speak(text) {
     if (!window.speechSynthesis || !text) return;
     // Speak only the first paragraph so the demo disclaimer is not repeated.
     const spoken = String(text).split("\n\n")[0];
     if (!spoken) return;
+    // Take ownership of the microphone BEFORE speaking so the recognition
+    // engine can never hear (and transcribe) the assistant's own reply.
+    ttsActive = true;
+    stopRecognition();
     try {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(spoken);
@@ -300,9 +336,12 @@
       });
       if (english.length) utterance.voice = english[0];
       utterance.rate = 1.0;
+      utterance.onend = finishSpeaking;
+      utterance.onerror = finishSpeaking;
       window.speechSynthesis.speak(utterance);
     } catch (_) {
-      /* speech output is best-effort */
+      // Speech output is best-effort; release the microphone immediately.
+      finishSpeaking();
     }
   }
 
@@ -312,6 +351,7 @@
     } catch (_) {
       /* ignore */
     }
+    finishSpeaking();
   }
 
   function updateVoiceControls() {
@@ -338,18 +378,10 @@
     }
     voiceOn = on;
     if (on) {
-      try {
-        recognition.start();
-      } catch (_) {
-        /* already starting */
-      }
+      startRecognition();
       setVoiceStatus("Listening\u2026 speak your request. " + VOICE_NOTE);
     } else {
-      try {
-        recognition.stop();
-      } catch (_) {
-        /* already stopped */
-      }
+      stopRecognition();
       stopSpeaking();
       setVoiceStatus(VOICE_NOTE);
     }
@@ -382,6 +414,10 @@
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.onresult = function (event) {
+      // While TTS owns the microphone, discard any transcripts. This is the
+      // guard that prevents the assistant's own spoken reply from being fed
+      // back into the composer as a user message.
+      if (ttsActive) return;
       let interim = "";
       let finals = "";
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
@@ -407,14 +443,11 @@
       }
     };
     recognition.onend = function () {
-      // Browsers stop after a pause; keep listening while toggled on.
-      if (voiceOn) {
-        try {
-          recognition.start();
-        } catch (_) {
-          /* restart is best-effort */
-        }
-      }
+      // If TTS owns the microphone, do NOT restart here: `finishSpeaking`
+      // resumes recognition after speech ends. Otherwise browsers stop after a
+      // pause, so keep listening while the user has voice input toggled on.
+      if (ttsActive) return;
+      if (voiceOn) startRecognition();
     };
     updateVoiceControls();
     setVoiceStatus(VOICE_NOTE);

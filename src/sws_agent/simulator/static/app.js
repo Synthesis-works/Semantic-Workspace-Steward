@@ -13,6 +13,11 @@
   const voiceToggleEl = document.getElementById("voice-toggle");
   const muteToggleEl = document.getElementById("mute-toggle");
   const voiceStatusEl = document.getElementById("voice-status");
+  // Phase 1 shell additions. Optional on purpose: the browser harness and any
+  // cached page may not have them, so every use below is guarded.
+  const statusLineEl = document.getElementById("status-line");
+  const activityPanelEl = document.getElementById("activity-panel");
+  const activityToggleEl = document.getElementById("activity-toggle");
 
   const VOICE_NOTE =
     "Voice Mode \u2014 Alexa+ inspired simulation (browser speech; not an " +
@@ -32,6 +37,12 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+
+  function setStatus(text, state) {
+    if (!statusLineEl) return;
+    statusLineEl.textContent = text;
+    if (state) statusLineEl.dataset.state = state;
   }
 
   function appendMessage(kind, text) {
@@ -253,6 +264,7 @@
   async function send(message) {
     appendMessage("user", message);
     input.disabled = true;
+    setStatus("Analyzing workspace\u2026", "processing");
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -266,11 +278,17 @@
       appendMessage("assistant", response.reply);
       (response.blocks || []).forEach(appendBlock);
       renderTrace(response.trace || []);
+      setStatus("Ready", "ready");
       if (voiceOn && !muted) {
         speak(response.reply);
       }
     } catch (err) {
       appendMessage("assistant", "The demo could not reach the simulator: " + err);
+      setStatus("Something went wrong", "error");
+      // Never leave the user staring at an empty box: put their message back
+      // so it can be retried. The input is disabled during the request, so it
+      // is empty here unless the user has typed something new.
+      if (!input.value.trim()) input.value = message;
     } finally {
       input.disabled = false;
       input.focus();
@@ -461,6 +479,15 @@
   if (muteToggleEl) {
     muteToggleEl.addEventListener("click", function () {
       setMuted(!muted);
+    });
+  }
+  // Narrow screens collapse the MCP activity panel behind a toggle (the
+  // show/hide itself is CSS-driven; this only keeps aria-expanded honest).
+  if (activityToggleEl && activityPanelEl) {
+    activityToggleEl.addEventListener("click", function () {
+      const open = activityPanelEl.classList.toggle("is-open");
+      activityToggleEl.setAttribute("aria-expanded", open ? "true" : "false");
+      activityToggleEl.textContent = open ? "Hide" : "Show";
     });
   }
   initVoice();

@@ -9,20 +9,30 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="brand-name">SWS</span>
-      <span class="brand-sub">conversational demo · synthetic environment · no AWS resource access</span>
-    </div>
-      <div class="meta">
-        <span id="demo-badge" class="badge">demo</span>
-        <span id="mode-badge" class="badge" title="conversational provider">connecting…</span>
-        <span id="mcp-endpoint" class="muted"></span>
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div class="brand-text">
+        <span class="brand-name">SWS</span>
+        <span class="brand-sub">Semantic Workspace Steward — conversational demo · synthetic environment · no AWS resource access</span>
       </div>
+    </div>
+    <div class="meta">
+      <span id="demo-badge" class="badge">demo</span>
+      <span id="mode-badge" class="badge" title="conversational provider">connecting…</span>
+      <span id="mcp-endpoint" class="muted"></span>
+    </div>
   </header>
 
   <main class="layout">
-    <section class="panel chat-panel">
+    <section class="panel chat-panel" aria-label="Conversation">
+      <div class="panel-head">
+        <h1 class="panel-title">Conversation</h1>
+        <div id="status-line" class="status-line" role="status" data-state="ready">Ready</div>
+      </div>
+
       <div id="chat-log" class="chat-log" aria-live="polite"></div>
-      <div id="commands" class="commands"></div>
+
+      <div id="commands" class="commands" role="group" aria-label="Suggested prompts"></div>
+
       <div id="voice-bar" class="voice-bar">
         <button id="voice-toggle" class="chip" type="button" aria-pressed="false">
           Voice input
@@ -35,23 +45,39 @@
           integration).
         </span>
       </div>
+
       <form id="chat-form" class="composer" autocomplete="off">
+        <label class="sr-only" for="message-input">Ask SWS about your workspace</label>
         <input
           id="message-input"
           type="text"
-          placeholder="Try: Audit my AWS workspace"
+          placeholder="Ask SWS about your workspace…"
           aria-label="Message"
+          autocomplete="off"
         />
-        <button type="submit">Send</button>
+        <button id="send-button" type="submit">Send</button>
       </form>
     </section>
 
-    <aside class="panel trace-panel">
-      <h2>MCP activity trace</h2>
-      <p class="hint">Every entry is a real tool call on the Streamable HTTP MCP server.</p>
-      <ul id="trace" class="trace-list"></ul>
-      <h2>Tools exposed</h2>
-      <ul id="tools" class="tools-list"></ul>
+    <aside class="panel trace-panel" id="activity-panel" aria-label="MCP activity trace">
+      <div class="panel-head trace-head">
+        <h2 class="panel-title">Activity</h2>
+        <button
+          id="activity-toggle"
+          class="chip activity-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="activity-body"
+        >
+          Show
+        </button>
+      </div>
+      <div class="trace-body" id="activity-body">
+        <p class="hint">Every entry is a real tool call on the Streamable HTTP MCP server.</p>
+        <ul id="trace" class="trace-list"></ul>
+        <h2>Tools exposed</h2>
+        <ul id="tools" class="tools-list"></ul>
+      </div>
     </aside>
   </main>
 

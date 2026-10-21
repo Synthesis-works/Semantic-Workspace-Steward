@@ -18,6 +18,7 @@
   const statusLineEl = document.getElementById("status-line");
   const activityPanelEl = document.getElementById("activity-panel");
   const activityToggleEl = document.getElementById("activity-toggle");
+  const sendButtonEl = document.getElementById("send-button");
 
   const VOICE_NOTE =
     "Voice Mode \u2014 Alexa+ inspired simulation (browser speech; not an " +
@@ -27,6 +28,10 @@
   let recognition = null;
   let voiceOn = false;
   let muted = false;
+  // At most one /api/chat request in flight. Guards the submit handler, the
+  // suggested-prompt chips (which refill the composer mid-request), and the
+  // voice path, so a second request can never race the first.
+  let sending = false;
   // TTS owns the microphone while it speaks: recognition is stopped before
   // speech starts and transcripts arriving during that window are ignored, so
   // the assistant never transcribes its own reply back into the composer.
@@ -45,6 +50,18 @@
     if (state) statusLineEl.dataset.state = state;
   }
 
+  function setBusy(busy) {
+    // Single source of truth for the in-flight affordance across the composer
+    // and the suggested-prompt chips.
+    if (input) input.disabled = busy;
+    if (sendButtonEl) sendButtonEl.disabled = busy;
+    if (commandsEl) {
+      Array.prototype.forEach.call(commandsEl.children, function (chip) {
+        if (chip && "disabled" in chip) chip.disabled = busy;
+      });
+    }
+  }
+
   function appendMessage(kind, text) {
     logEl.appendChild(el("div", "msg " + kind, text));
     logEl.scrollTop = logEl.scrollHeight;
@@ -52,7 +69,7 @@
 
   function appendBlock(block) {
     const wrapper = el("div", "block " + (block.type || ""));
-    const title = el("h3");
+    const title = el("h2");
     switch (block.type) {
       case "summary":
         title.textContent = "Workspace audit";
@@ -251,6 +268,9 @@
       (data.commands || []).forEach(function (command) {
         const chip = el("button", "chip", command);
         chip.addEventListener("click", function () {
+          // A chip picked while a request is in flight must not silently
+          // overwrite what the user typed, nor start a second request.
+          if (sending) return;
           input.value = command;
           form.requestSubmit();
         });
@@ -262,8 +282,10 @@
   }
 
   async function send(message) {
+    if (sending) return;
+    sending = true;
     appendMessage("user", message);
-    input.disabled = true;
+    setBusy(true);
     setStatus("Analyzing workspace\u2026", "processing");
     try {
       const response = await fetch("/api/chat", {
@@ -290,7 +312,8 @@
       // is empty here unless the user has typed something new.
       if (!input.value.trim()) input.value = message;
     } finally {
-      input.disabled = false;
+      sending = false;
+      setBusy(false);
       input.focus();
     }
   }

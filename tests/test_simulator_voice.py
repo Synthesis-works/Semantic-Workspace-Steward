@@ -42,10 +42,34 @@ function makeNode(tag) {
     scrollTop: 0,
     scrollHeight: 0,
     children: [],
+    parent: null,
     _handlers: {},
     classList: { toggle() {}, add() {}, remove() {} },
     setAttribute() {},
-    appendChild(child) { this.children.push(child); return child; },
+    appendChild(child) {
+      child.parent = this;
+      this.children.push(child);
+      return child;
+    },
+    remove() {
+      if (!this.parent) return;
+      const i = this.parent.children.indexOf(this);
+      if (i !== -1) this.parent.children.splice(i, 1);
+      this.parent = null;
+    },
+    querySelector(selector) {
+      const cls = selector.replace(/^\./, "");
+      function walk(node) {
+        for (let i = 0; i < node.children.length; i += 1) {
+          const c = node.children[i];
+          if ((" " + c.className + " ").indexOf(" " + cls + " ") !== -1) return c;
+          const deeper = walk(c);
+          if (deeper) return deeper;
+        }
+        return null;
+      }
+      return walk(this);
+    },
     addEventListener(type, fn) {
       (this._handlers[type] = this._handlers[type] || []).push(fn);
     },

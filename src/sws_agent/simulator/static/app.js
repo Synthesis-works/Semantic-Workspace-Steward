@@ -62,12 +62,33 @@
     }
   }
 
+  // Empty-state placeholder. It is a dedicated element (not an implicit
+  // "chat-log has no children" rule) so it is never counted as a message and
+  // cannot be resurrected by a later renderer refactor.
+  function ensureEmptyState() {
+    if (!logEl || logEl.querySelector(".chat-empty-state")) return;
+    const empty = el("p", "chat-empty-state",
+      "Ask SWS about your workspace \u2014 try one of the suggestions below.");
+    logEl.appendChild(empty);
+  }
+
+  function dismissEmptyState() {
+    if (!logEl) return;
+    const empty = logEl.querySelector(".chat-empty-state");
+    if (empty) empty.remove();
+  }
+
   function appendMessage(kind, text) {
-    logEl.appendChild(el("div", "msg " + kind, text));
+    dismissEmptyState();
+    const node = el("div", "msg " + kind);
+    node.appendChild(el("span", "msg-meta", kind === "user" ? "You" : "SWS"));
+    node.appendChild(el("span", "msg-text", text));
+    logEl.appendChild(node);
     logEl.scrollTop = logEl.scrollHeight;
   }
 
   function appendBlock(block) {
+    dismissEmptyState();
     const wrapper = el("div", "block " + (block.type || ""));
     const title = el("h2");
     switch (block.type) {
@@ -515,6 +536,7 @@
   }
   initVoice();
   setMuted(false);
+  ensureEmptyState();
 
   form.addEventListener("submit", function (event) {
     event.preventDefault();

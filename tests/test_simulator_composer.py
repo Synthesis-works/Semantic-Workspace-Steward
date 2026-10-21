@@ -37,6 +37,7 @@ function makeNode(tag) {
     scrollHeight: 0,
     children: [],
     parent: null,
+    dataset: {},
     _handlers: {},
     classList: { toggle() {}, add() {}, remove() {} },
     setAttribute() {},
@@ -80,12 +81,31 @@ function makeNode(tag) {
 const elements = {};
 ["chat-log", "trace", "tools", "chat-form", "message-input", "commands",
  "mcp-endpoint", "mode-badge", "demo-footer", "voice-toggle", "mute-toggle",
- "voice-status", "send-button"].forEach(function (id) { elements[id] = makeNode(); });
+ "voice-status", "send-button", "activity-body", "status-line",
+ "activity-panel", "activity-toggle"].forEach(function (id) { elements[id] = makeNode(); });
 elements["send-button"].tag = "button";
+
+// Mirror the static markup relationships the app relies on: #trace and #tools
+// live inside two distinct .trace-section blocks within #activity-body. The
+// harness has no HTML parser, so wire these by hand (they never change at
+// runtime) purely so structural assertions can inspect them.
+["trace", "tools"].forEach(function (id) {
+  const section = makeNode("section");
+  section.className = "trace-section";
+  elements["activity-body"].appendChild(section);
+  section.appendChild(elements[id]);
+});
+elements["trace"].className = "trace-list";
+elements["tools"].className = "tools-list";
 
 const documentStub = {
   getElementById(id) { return elements[id] || null; },
   createElement(tag) { return makeNode(tag); },
+  createTextNode(text) {
+    const n = makeNode("#text");
+    n.textContent = text;
+    return n;
+  },
 };
 
 let chatCalls = 0;
@@ -104,13 +124,32 @@ function fetchStub(url) {
       });
     }
     if (mode === "fail") return Promise.reject(new Error("connection refused"));
+    if (mode === "trace") {
+      return Promise.resolve({
+        json: function () {
+          return Promise.resolve({
+            reply: "ok",
+            blocks: [],
+            trace: [
+              { tool: "collect_workspace", state: "success", summary: "Workspace collected" },
+              { tool: "audit_workspace", state: "running", summary: "calling audit_workspace" },
+              { tool: "evaluate_workspace", state: "error", summary: "evaluate_workspace failed: boom" },
+            ],
+          });
+        },
+      });
+    }
     return Promise.resolve({
       json: function () { return Promise.resolve({ reply: "ok", blocks: [], trace: [] }); },
     });
   }
   const body = {
     "/api/meta": {},
-    "/api/tools": { tools: [] },
+    "/api/tools": {
+      tools: mode === "trace"
+        ? [{ name: "audit_workspace" }, { name: "collect_workspace" }]
+        : [],
+    },
     "/api/commands": {
       commands: mode === "dup" ? ["audit my workspace"] : [],
     },
@@ -177,6 +216,26 @@ function childTexts() {
   }
   return chatLog.children.map(collect);
 }
+// Aggregate a node's full visible text the way a browser would.
+function textOf(node) {
+  let out = String(node.textContent || "");
+  node.children.forEach(function (c) { out += textOf(c); });
+  return out;
+}
+function classHas(node, cls) {
+  return (" " + node.className + " ").indexOf(" " + cls + " ") !== -1;
+}
+function findByClass(root, cls) {
+  return root.querySelector("." + cls);
+}
+function findAll(root, cls, out) {
+  out = out || [];
+  root.children.forEach(function (c) {
+    if (classHas(c, cls)) out.push(c);
+    findAll(c, cls, out);
+  });
+  return out;
+}
 // Empty state exists at start and is never counted as a message.
 function assertEmptyStatePresent() {
   assert(findEmptyState() !== null, "empty-state placeholder is present before any message");
@@ -191,6 +250,68 @@ function assertEmptyStateGone() {
 
   // Initial state: the empty-state placeholder is present and is NOT a message.
   assertEmptyStatePresent();
+
+  if (mode === "trace") {
+    const traceEl = elements["trace"];
+    const toolsEl = elements["tools"];
+
+    // B5: both sections show a deliberate empty state before any data arrives.
+    assert(findByClass(traceEl, "trace-empty-state") !== null,
+      "trace shows an empty-state placeholder before any events");
+    assert(findByClass(toolsEl, "tools-empty-state") !== null,
+      "tools list shows an empty-state placeholder before tools load");
+
+    await settle(); // let loadMeta render the tool catalog
+
+    // B5: tools placeholder dismissed once the catalog renders.
+    assert(findByClass(toolsEl, "tools-empty-state") === null,
+      "tools empty-state is gone once tools are rendered");
+    const toolItems = toolsEl.children.filter(function (c) { return c.tag === "li"; });
+    assert(toolItems.length === 2, "one list item per exposed tool");
+    assert(textOf(toolItems[0]) === "audit_workspace", "tool name is rendered verbatim");
+
+    submitWith(message);
+    await settle();
+
+    // B5: trace placeholder dismissed once events render.
+    assert(findByClass(traceEl, "trace-empty-state") === null,
+      "trace empty-state is gone once events are rendered");
+
+    // B2: structure is spans, but the VISIBLE TEXT is byte-identical to the
+    // pre-3B renderer: marker + tool + " \u2014 " + summary.
+    const events = traceEl.children.filter(function (c) { return c.tag === "li"; });
+    assert(events.length === 3, "one list item per trace event");
+    assert(textOf(events[0]) === "\u2713 collect_workspace \u2014 Workspace collected",
+      "success entry visible text is byte-identical (with the \u2713 marker)");
+    assert(textOf(events[1]) === "audit_workspace \u2014 calling audit_workspace",
+      "running entry keeps the existing EMPTY marker (no invented glyph)");
+    assert(textOf(events[2]) === "\u2717 evaluate_workspace \u2014 evaluate_workspace failed: boom",
+      "error entry visible text is byte-identical (with the \u2717 marker)");
+    // State classes are preserved exactly.
+    assert(classHas(events[0], "success"), "first event keeps its success class");
+    assert(classHas(events[1], "running"), "second event keeps its running class");
+    assert(classHas(events[2], "error"), "third event keeps its error class");
+    // The tool/summary spans exist for styling but add no text of their own.
+    assert(findByClass(events[0], "trace-tool") !== null, "entry has a trace-tool span");
+    assert(findByClass(events[0], "trace-summary") !== null, "entry has a trace-summary span");
+    assert(textOf(findByClass(events[0], "trace-tool")) === "collect_workspace",
+      "trace-tool span holds exactly the tool name");
+    assert(textOf(findByClass(events[0], "trace-summary")) === "Workspace collected",
+      "trace-summary span holds exactly the summary");
+
+    // B3: the two sections are distinct, addressable regions.
+    const sections = findAll(elements["activity-body"], "trace-section");
+    assert(sections.length === 2, "activity body has two distinct sections");
+
+    // `#trace` and `#tools` identities are unchanged (still the same elements).
+    assert(elements["trace"].className.indexOf("trace-list") !== -1,
+      "#trace keeps its trace-list class");
+    assert(elements["tools"].className.indexOf("tools-list") !== -1,
+      "#tools keeps its tools-list class");
+
+    console.log("OK");
+    process.exit(0);
+  }
 
   if (mode === "dup") {
     await settle(); // let loadCommands render the chips
@@ -310,5 +431,12 @@ def test_successful_send_still_clears_the_composer(tmp_path: Path) -> None:
 @_requires_node
 def test_rapid_resubmission_never_launches_duplicate_requests(tmp_path: Path) -> None:
     result = _run("dup", tmp_path)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip().endswith("OK")
+
+
+@_requires_node
+def test_activity_trace_structure_and_empty_states(tmp_path: Path) -> None:
+    result = _run("trace", tmp_path)
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout.strip().endswith("OK")

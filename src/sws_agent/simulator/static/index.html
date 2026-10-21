@@ -73,9 +73,14 @@
       </div>
       <div class="trace-body" id="activity-body">
         <p class="hint">Every entry is a real tool call on the Streamable HTTP MCP server.</p>
-        <ul id="trace" class="trace-list"></ul>
-        <h2>Tools exposed</h2>
-        <ul id="tools" class="tools-list"></ul>
+        <section class="trace-section trace-section--trace" aria-label="Execution trace">
+          <h2 class="trace-title">This request</h2>
+          <ul id="trace" class="trace-list"></ul>
+        </section>
+        <section class="trace-section trace-section--catalog" aria-label="Tools exposed">
+          <h2 class="trace-title">Tools exposed</h2>
+          <ul id="tools" class="tools-list"></ul>
+        </section>
       </div>
     </aside>
   </main>

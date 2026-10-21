@@ -491,6 +491,21 @@ body {
   padding: 14px 16px;
 }
 
+/* B1/B3: two peer sections under the Activity head — an execution trace and
+   the tool catalog — visually distinct so "what happened" vs "what exists"
+   never blur together. */
+.trace-section { margin: 0 0 18px; }
+.trace-section:last-child { margin-bottom: 0; }
+
+.trace-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
 .trace-body h2 {
   font-size: 11.5px;
   text-transform: uppercase;
@@ -500,8 +515,6 @@ body {
 }
 
 .trace-body h2:first-of-type { margin-top: 0; }
-
-.trace-list + h2 { margin-top: 16px; }
 
 .hint {
   color: var(--muted);
@@ -528,6 +541,11 @@ body {
   background: rgba(255, 255, 255, 0.02);
 }
 
+/* B2: styling hooks only — the rendered wording never changes. */
+.trace-tool { color: var(--text); font-weight: 600; }
+.trace-state { margin-right: 0; }
+.trace-summary { color: var(--muted); }
+
 .trace-list li.running {
   border-left-color: var(--accent);
   color: var(--text);
@@ -538,6 +556,22 @@ body {
   border-left-color: var(--bad);
   color: var(--bad);
   background: var(--bad-soft);
+}
+
+/* B5: deliberate idle states rather than an empty, broken-looking list. */
+.trace-empty-state,
+.tools-empty-state {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+.trace-list li.trace-empty-state {
+  border-left-color: var(--border);
+  background: transparent;
+  font-style: italic;
 }
 
 .tools-list {
@@ -553,6 +587,28 @@ body {
   padding: 5px 0;
   border-bottom: 1px dotted var(--border);
   overflow-wrap: anywhere;
+}
+
+/* B3: the catalog reads as reference material (chips), not a log line. */
+.trace-section--catalog .tools-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.trace-section--catalog .tools-list li {
+  border-bottom: none;
+  padding: 3px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--panel-2);
+}
+
+.trace-section--catalog .tools-list li.tools-empty-state {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-style: italic;
 }
 
 /* --- footer ------------------------------------------------------------- */
@@ -617,7 +673,24 @@ body {
   .composer { padding: 12px; gap: 8px; }
 
   /* Activity collapses into a single toggleable section. */
-  .activity-toggle { display: inline-flex; align-items: center; }
+  .activity-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* B4: a chevron affordance, purely visual. The text/aria-expanded wiring is
+     unchanged; the glyph flips with the panel's .is-open state. */
+  .activity-toggle::after {
+    content: "\25BE"; /* ▾ */
+    font-size: 10px;
+    line-height: 1;
+    transition: transform var(--t);
+  }
+
+  .trace-panel.is-open .activity-toggle::after {
+    transform: rotate(180deg);
+  }
 
   .trace-panel:not(.is-open) .trace-body {
     display: none;

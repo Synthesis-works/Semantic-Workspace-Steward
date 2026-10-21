@@ -222,16 +222,52 @@
     logEl.scrollTop = logEl.scrollHeight;
   }
 
+  // Activity empty states (3B): dedicated elements, guarded and idempotent,
+  // so an idle panel never looks broken. They are never counted as data rows.
+  function ensureTraceEmptyState() {
+    if (!traceEl || traceEl.querySelector(".trace-empty-state")) return;
+    traceEl.appendChild(
+      el("li", "trace-empty-state", "No tool calls yet \u2014 ask a question to see the MCP trace.")
+    );
+  }
+
+  function dismissTraceEmptyState() {
+    if (!traceEl) return;
+    const empty = traceEl.querySelector(".trace-empty-state");
+    if (empty) empty.remove();
+  }
+
+  function ensureToolsEmptyState() {
+    if (!toolsEl || toolsEl.querySelector(".tools-empty-state")) return;
+    toolsEl.appendChild(
+      el("li", "tools-empty-state", "Loading exposed tools\u2026")
+    );
+  }
+
+  function dismissToolsEmptyState() {
+    if (!toolsEl) return;
+    const empty = toolsEl.querySelector(".tools-empty-state");
+    if (empty) empty.remove();
+  }
+
   function renderTrace(trace) {
+    dismissTraceEmptyState();
     trace.forEach(function (event) {
-      const label = event.state === "success" ? "✓ " : event.state === "error" ? "✗ " : "";
-      const item = el("li", event.state || "", label + event.tool + " — " + event.summary);
+      const label = event.state === "success" ? "\u2713 " : event.state === "error" ? "\u2717 " : "";
+      const item = el("li", event.state || "");
+      // Spans exist only for styling; the visible text is unchanged from the
+      // pre-3B renderer: marker + tool + " \u2014 " + summary.
+      if (label) item.appendChild(el("span", "trace-state", label));
+      item.appendChild(el("span", "trace-tool", event.tool));
+      item.appendChild(document.createTextNode(" \u2014 "));
+      item.appendChild(el("span", "trace-summary", event.summary));
       traceEl.appendChild(item);
     });
     traceEl.scrollTop = traceEl.scrollHeight;
   }
 
   function renderTools(tools) {
+    dismissToolsEmptyState();
     tools.forEach(function (tool) {
       toolsEl.appendChild(el("li", "", tool.name));
     });
@@ -537,6 +573,8 @@
   initVoice();
   setMuted(false);
   ensureEmptyState();
+  ensureTraceEmptyState();
+  ensureToolsEmptyState();
 
   form.addEventListener("submit", function (event) {
     event.preventDefault();

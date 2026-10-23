@@ -150,7 +150,9 @@ appears anywhere.
 2. EC2/EBS **or** Lambda (second resource type)
 3. AWS Cost Explorer
 
-## Interfaces
+## Architecture
+
+![SWS Architecture](docs/assets/sws-architecture.svg)
 
 SWS is built around an MCP server as a primary interface:
 
@@ -181,6 +183,8 @@ The real Streamable HTTP server is wired (M4) and validated over the official
 MCP SDK client, so the server-side transport claim is genuine and tested.
 
 ## M5: interactive demo simulator
+
+![SWS Interactive Demo (M5)](docs/assets/SWS-interactive-demo-M5.png)
 
 A local, browser-based demo on top of the **real** M4 MCP server.
 

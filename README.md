@@ -154,29 +154,7 @@ appears anywhere.
 
 ![SWS Architecture](docs/assets/sws-architecture.svg)
 
-SWS is built around an MCP server as a primary interface:
-
-```
-Web simulator/client
-        |
-        v
-MCP server (Streamable HTTP)   <- thin adapter, real and tested
-        |
-        v
-SWS orchestration layer
-        |
-        v
-AWS inventory and analysis
-        |
-        v
-Deterministic policy engine
-        |
-        v
-Authorization and human approval
-        |
-        v
-Action engine -> AWS APIs -> Verification and audit
-```
+SWS is built around an MCP server as a primary interface: the demo/client calls the MCP server, which routes to the SWS orchestration layer, policy engine, and authorization boundary. The LLM (Strands → Bedrock) operates only over a bounded, validated read-only MCP tool set with no direct AWS access; cloud authority flows only through deterministic tools and the separate signed approval → execution gate → verification/audit path.
 
 The MCP layer (see `src/sws_agent/mcp/`) remains separate from business logic.
 The real Streamable HTTP server is wired (M4) and validated over the official
